@@ -335,6 +335,7 @@ public final class FfxUpscaleContext implements AutoCloseable {
 	public static final int USAGE_DEPTHTARGET = 1 << 2;
 
 	// FfxApiDispatchFsrUpscaleFlags
+	public static final int DISPATCH_FLAG_DRAW_DEBUG_VIEW = 1 << 0;
 	public static final int DISPATCH_FLAG_NON_LINEAR_COLOR_SRGB = 1 << 1;
 
 	private static final long TYPE_DISPATCH_UPSCALE = 0x00010001L;

@@ -42,11 +42,8 @@ public final class WorldRenderScaler {
 	private GpuTextureView lowResColorView;
 	private GpuTexture lowResDepth;
 	private GpuTextureView lowResDepthView;
-	private GpuTexture sceneDepth;
-	private GpuTextureView sceneDepthView;
 	private int lowResWidth = -1;
 	private int lowResHeight = -1;
-	private boolean sceneDepthValid;
 
 	// native textures stashed during the level-render window
 	private GpuTexture savedColor;
@@ -101,7 +98,6 @@ public final class WorldRenderScaler {
 		mainTarget.width = renderWidth;
 		mainTarget.height = renderHeight;
 		this.active = true;
-		this.sceneDepthValid = false;
 
 		if (!this.loggedActivation) {
 			this.loggedActivation = true;
@@ -111,22 +107,14 @@ public final class WorldRenderScaler {
 	}
 
 	/**
-	 * Vanilla clears the main depth buffer before drawing the first-person hand.
-	 * Since the main target is currently swapped to our low-res textures, preserve
-	 * world depth here so FSR does not receive a depth buffer containing only hand
-	 * pixels.
+	 * Restore native textures and upscale the low-res world into them.
+	 *
+	 * <p>Called from GameRendererMixin <em>before</em> vanilla's pre-hand depth
+	 * clear: the hand, screen effects and 3D crosshair then render at native
+	 * resolution on top of the upscaled image. This keeps the hand sharp and
+	 * ghost-free by construction — it is screen-fixed, so the camera-reprojection
+	 * motion vectors would be exactly wrong for it.
 	 */
-	public void captureSceneDepthBeforeHand() {
-		if (!this.active || this.lowResDepth == null || this.sceneDepth == null) {
-			return;
-		}
-
-		RenderSystem.getDevice().createCommandEncoder().copyTextureToTexture(
-				this.lowResDepth, this.sceneDepth, 0, 0, 0, 0, 0, this.lowResWidth, this.lowResHeight);
-		this.sceneDepthValid = true;
-	}
-
-	/** Restore native textures and upscale the low-res world into them. Call before GUI rendering. */
 	public void end(RenderTarget mainTarget) {
 		if (!this.active) {
 			return;
@@ -146,10 +134,10 @@ public final class WorldRenderScaler {
 		this.savedDepthView = null;
 
 		// Preferred path: FSR 3.1 temporal upscale low-res color/depth -> native color.
-		GpuTexture fsrDepth = this.sceneDepthValid ? this.sceneDepth : this.lowResDepth;
-		GpuTextureView fsrDepthView = this.sceneDepthValid ? this.sceneDepthView : this.lowResDepthView;
+		// The seam sits before the pre-hand depth clear, so lowResDepth holds pure
+		// world depth here — no snapshot needed.
 		boolean fsrDone = FsrPipeline.INSTANCE.dispatch(
-				this.lowResColor, fsrDepth, fsrDepthView, this.lowResWidth, this.lowResHeight,
+				this.lowResColor, this.lowResDepth, this.lowResDepthView, this.lowResWidth, this.lowResHeight,
 				mainTarget.getColorTexture(), this.savedWidth, this.savedHeight);
 		if (fsrDone) {
 			return;
@@ -183,11 +171,8 @@ public final class WorldRenderScaler {
 		this.lowResColorView = device.createTextureView(this.lowResColor);
 		this.lowResDepth = device.createTexture(() -> "Upscaler world / Depth", 15, GpuFormat.D32_FLOAT, width, height, 1, 1);
 		this.lowResDepthView = device.createTextureView(this.lowResDepth);
-		this.sceneDepth = device.createTexture(() -> "Upscaler scene depth snapshot", 15, GpuFormat.D32_FLOAT, width, height, 1, 1);
-		this.sceneDepthView = device.createTextureView(this.sceneDepth);
 		this.lowResWidth = width;
 		this.lowResHeight = height;
-		this.sceneDepthValid = false;
 	}
 
 	private void destroyLowResTargets() {
@@ -207,16 +192,7 @@ public final class WorldRenderScaler {
 			this.lowResDepth.close();
 			this.lowResDepth = null;
 		}
-		if (this.sceneDepthView != null) {
-			this.sceneDepthView.close();
-			this.sceneDepthView = null;
-		}
-		if (this.sceneDepth != null) {
-			this.sceneDepth.close();
-			this.sceneDepth = null;
-		}
 		this.lowResWidth = -1;
 		this.lowResHeight = -1;
-		this.sceneDepthValid = false;
 	}
 }

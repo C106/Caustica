@@ -35,9 +35,9 @@ public abstract class GameRendererMixin {
 		WorldRenderScaler.INSTANCE.begin(this.mainRenderTarget);
 	}
 
-	// After fogRenderer.endFrame() and *before* the pre-GUI depth clear's arguments
-	// are evaluated (injecting at the clearDepthTexture INVOKE itself would be too
-	// late: the depth texture argument is fetched while low-res is still swapped in).
+	// Safety net only: the primary end-of-window is upscaler$endWorldScaleBeforeHand
+	// inside renderLevel. This catches any path where renderLevel bailed early
+	// (end() no-ops when the window is already closed).
 	@Inject(method = "render(Lnet/minecraft/client/DeltaTracker;Z)V",
 			at = @At(value = "INVOKE",
 					target = "Lnet/minecraft/client/renderer/fog/FogRenderer;endFrame()V",
@@ -74,13 +74,19 @@ public abstract class GameRendererMixin {
 		return new Matrix4f().translation(jx, jy, 0.0f).mul(projection);
 	}
 
+	// Primary end-of-window: right after the 3D-HUD projection is set and *before*
+	// vanilla's pre-hand depth clear. The world (incl. entity outline targets and
+	// translucency compositing) has fully rendered at low res by this point; the
+	// upscale runs here, then the hand, screen effects and 3D crosshair draw at
+	// native resolution on top — keeping the screen-fixed hand out of the FSR
+	// inputs entirely (camera-reprojection MVs would be exactly wrong for it).
 	@Inject(method = "renderLevel(Lnet/minecraft/client/DeltaTracker;)V",
 			at = @At(value = "INVOKE",
 					target = "Lcom/mojang/blaze3d/systems/RenderSystem;setProjectionMatrix(Lcom/mojang/blaze3d/buffers/GpuBufferSlice;Lcom/mojang/blaze3d/ProjectionType;)V",
 					ordinal = 1,
 					shift = At.Shift.AFTER))
-	private void upscaler$captureSceneDepthBeforeHand(DeltaTracker deltaTracker, CallbackInfo ci) {
-		WorldRenderScaler.INSTANCE.captureSceneDepthBeforeHand();
+	private void upscaler$endWorldScaleBeforeHand(DeltaTracker deltaTracker, CallbackInfo ci) {
+		WorldRenderScaler.INSTANCE.end(this.mainRenderTarget);
 	}
 
 	@Shadow

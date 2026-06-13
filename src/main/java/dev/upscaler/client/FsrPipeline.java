@@ -85,9 +85,17 @@ public final class FsrPipeline {
 	private float jitterNdcX;
 	private float jitterNdcY;
 
-	// M4: camera reprojection motion vectors
-	private final float mvSignX = Float.parseFloat(System.getProperty("upscaler.mvSignX", "1"));
-	private final float mvSignY = Float.parseFloat(System.getProperty("upscaler.mvSignY", "1"));
+	// M4: camera reprojection motion vectors.
+	// The MV texture holds NDC-span deltas (current -> previous; NDC spans 2 units
+	// across the screen), so converting to FSR's render-res texel units needs a
+	// factor of dimension/2. The texel-row reasoning makes both signs positive:
+	// the MV pass and FSR address the texture through the same texCoord mapping,
+	// so any screen-orientation flip cancels.
+	private final float mvScaleX = Float.parseFloat(System.getProperty("upscaler.mvScaleX", "0.5"));
+	private final float mvScaleY = Float.parseFloat(System.getProperty("upscaler.mvScaleY", "0.5"));
+	// FSR's built-in debug overlay (MV arrows, disocclusion/reactive masks) —
+	// in-viewport alternative to Nsight for validating MV units and signs
+	private final boolean fsrDebugView = Boolean.getBoolean("upscaler.fsrDebugView");
 	private final org.joml.Matrix4f prevViewProj = new org.joml.Matrix4f();
 	private final org.joml.Matrix4f reprojectMatrix = new org.joml.Matrix4f();
 	private float cameraNear = 1000.0f; // FSR naming under reversed-Z: far distance
@@ -217,6 +225,8 @@ public final class FsrPipeline {
 			recordDispatch(device, lowResColor, lowResDepth, renderWidth, renderHeight, nativeColor, upscaleWidth, upscaleHeight, mvValid);
 			if (!this.loggedActive) {
 				this.loggedActive = true;
+				UpscalerMod.LOGGER.info("FSR config: mvScale=({}, {}) x renderDim, jitterSign=({}, {}), debugView={}",
+						this.mvScaleX, this.mvScaleY, this.jitterSignX, this.jitterSignY, this.fsrDebugView);
 				UpscalerMod.LOGGER.info("FSR upscaling active: {}x{} -> {}x{}", renderWidth, renderHeight, upscaleWidth, upscaleHeight);
 			}
 			return true;
@@ -376,17 +386,17 @@ public final class FsrPipeline {
 					new FfxUpscaleContext.Resource(this.outputImage, FfxUpscaleContext.FORMAT_R8G8B8A8_UNORM,
 							upscaleWidth, upscaleHeight, FfxUpscaleContext.USAGE_UAV, FfxUpscaleContext.STATE_UNORDERED_ACCESS),
 					this.jitterPixelsX, this.jitterPixelsY,
-					// MV texture holds NDC-space deltas (current -> previous). FSR's
-					// host API expects full render dimensions as the NDC scale.
-					mvValid ? renderWidth * this.mvSignX : 1.0f,
-					mvValid ? renderHeight * this.mvSignY : 1.0f,
+					// NDC-delta (span 2) -> render-res texels: dimension/2 (see mvScaleX docs)
+					mvValid ? renderWidth * this.mvScaleX : 1.0f,
+					mvValid ? renderHeight * this.mvScaleY : 1.0f,
 					renderWidth, renderHeight,
 					upscaleWidth, upscaleHeight,
 					frameTimeMs, this.resetNextDispatch,
 					// reversed-Z (DEPTH_INVERTED): FFX expects cameraNear > cameraFar,
 					// i.e. near carries the far-plane distance and vice versa
 					this.cameraNear, this.cameraFar, this.cameraFovY,
-					FfxUpscaleContext.DISPATCH_FLAG_NON_LINEAR_COLOR_SRGB));
+					FfxUpscaleContext.DISPATCH_FLAG_NON_LINEAR_COLOR_SRGB
+							| (this.fsrDebugView ? FfxUpscaleContext.DISPATCH_FLAG_DRAW_DEBUG_VIEW : 0)));
 			this.resetNextDispatch = false;
 
 			// FSR's compute writes -> copy
