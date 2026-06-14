@@ -1,25 +1,39 @@
 package dev.upscaler.rt;
 
+import com.mojang.blaze3d.vertex.QuadInstance;
 import dev.upscaler.UpscalerMod;
 import it.unimi.dsi.fastutil.floats.FloatArrayList;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.client.renderer.block.BlockAndTintGetter;
+import net.minecraft.client.renderer.block.BlockQuadOutput;
+import net.minecraft.client.renderer.block.BlockStateModelSet;
+import net.minecraft.client.renderer.block.ModelBlockRenderer;
+import net.minecraft.client.renderer.block.dispatch.BlockStateModel;
+import net.minecraft.client.resources.model.geometry.BakedQuad;
 import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.CardinalLighting;
+import net.minecraft.world.level.ColorResolver;
+import net.minecraft.world.level.block.RenderShape;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.lighting.LevelLightEngine;
+import net.minecraft.world.level.material.FluidState;
+import org.joml.Vector3fc;
 import org.lwjgl.system.MemoryUtil;
 
 import java.util.List;
 
 /**
- * P1 step 1: a one-shot full-cube extraction of the blocks around the player into an RT-native
- * position/index buffer pair, a BLAS, and a single-instance TLAS. Crude on purpose — every
- * non-air block is a unit cube, faces are emitted only where the neighbor is air (basic cull),
- * no model shapes / fluids / tint / lighting yet. The goal here is to prove world iteration +
- * extraction + AS build from real geometry; correct meshing (via Sodium) and shading come next.
+ * P1 step 4a: extract real block-model geometry around the player. Each non-air MODEL block is
+ * tessellated through vanilla's {@link ModelBlockRenderer} into a capturing {@link BlockQuadOutput},
+ * giving correct shapes and neighbour-culled faces without touching the (refactored) model API
+ * directly. Positions are rebased to the player's block.
  *
- * <p>Geometry is rebased to the player's block position ({@code (blockX,blockY,blockZ)}) so
- * coordinates stay small (camera-relative precision); the trace will offset rays by the
- * camera's position relative to that origin.
+ * <p>Per-vertex stream: position (BLAS). Per-primitive stream ({@code material}, indexed by
+ * gl_PrimitiveID): geometric normal + albedo. Albedo is white for now — biome tint + atlas UV
+ * textures come in step 4b.
  */
 public final class RtTerrain {
     public static final boolean ENABLED = Boolean.parseBoolean(System.getProperty("upscaler.rt.terrain", "true"));
@@ -29,18 +43,17 @@ public final class RtTerrain {
 
     private final RtBuffer positions;
     private final RtBuffer indices;
-    private final RtBuffer normals;
+    private final RtBuffer material; // per-primitive: {vec4 normal, vec4 albedo}
     private final RtAccel blas;
     private final RtAccel tlas;
-    /** World block coordinates of the rebase origin (geometry is stored relative to this). */
     public final int blockX;
     public final int blockY;
     public final int blockZ;
 
-    private RtTerrain(RtBuffer positions, RtBuffer indices, RtBuffer normals, RtAccel blas, RtAccel tlas, int bx, int by, int bz) {
+    private RtTerrain(RtBuffer positions, RtBuffer indices, RtBuffer material, RtAccel blas, RtAccel tlas, int bx, int by, int bz) {
         this.positions = positions;
         this.indices = indices;
-        this.normals = normals;
+        this.material = material;
         this.blas = blas;
         this.tlas = tlas;
         this.blockX = bx;
@@ -56,12 +69,11 @@ public final class RtTerrain {
         return tlas.handle;
     }
 
-    /** Device address of the per-primitive normal buffer (one vec4 per triangle), for the hit shader. */
-    public long normalAddress() {
-        return normals.deviceAddress;
+    /** Device address of the per-primitive material buffer ({vec4 normal, vec4 albedo} per triangle). */
+    public long primAddress() {
+        return material.deviceAddress;
     }
 
-    /** Extract once the player is in a world. Returns true on success (then it's a no-op until rebuilt). */
     public static boolean extractAroundPlayer(RtContext ctx) {
         if (!ENABLED) {
             return false;
@@ -76,58 +88,51 @@ public final class RtTerrain {
         int cy = center.getY();
         int cz = center.getZ();
 
-        FloatArrayList verts = new FloatArrayList();
-        IntArrayList idx = new IntArrayList();
-        FloatArrayList normalList = new FloatArrayList();
+        BlockStateModelSet modelSet = mc.getModelManager().getBlockStateModelSet();
+        ModelBlockRenderer renderer = new ModelBlockRenderer(false, true, mc.getBlockColors());
+        BlockAndTintGetter view = new LevelView(level);
+
+        QuadCapture capture = new QuadCapture();
         BlockPos.MutableBlockPos m = new BlockPos.MutableBlockPos();
-        int faces = 0;
+        int blocks = 0;
 
         for (int dx = -RADIUS; dx <= RADIUS; dx++) {
             for (int dy = -RADIUS; dy <= RADIUS; dy++) {
                 for (int dz = -RADIUS; dz <= RADIUS; dz++) {
                     m.set(cx + dx, cy + dy, cz + dz);
-                    if (level.getBlockState(m).isAir()) {
+                    BlockState state = level.getBlockState(m);
+                    if (state.isAir() || state.getRenderShape() != RenderShape.MODEL) {
                         continue;
                     }
-                    for (int axis = 0; axis < 3; axis++) {
-                        for (int val = 0; val < 2; val++) {
-                            int nx = cx + dx;
-                            int ny = cy + dy;
-                            int nz = cz + dz;
-                            int step = val == 1 ? 1 : -1;
-                            if (axis == 0) {
-                                nx += step;
-                            } else if (axis == 1) {
-                                ny += step;
-                            } else {
-                                nz += step;
-                            }
-                            m.set(nx, ny, nz);
-                            if (level.getBlockState(m).isAir()) {
-                                emitFace(verts, idx, normalList, dx, dy, dz, axis, val);
-                                faces++;
-                            }
-                        }
+                    BlockStateModel model = modelSet.get(state);
+                    if (model == null) {
+                        continue;
+                    }
+                    try {
+                        renderer.tesselateBlock(capture, dx, dy, dz, view, m, state, model, state.getSeed(m));
+                        blocks++;
+                    } catch (Throwable t) {
+                        // skip a block whose model rendering throws rather than failing the whole snapshot
                     }
                 }
             }
         }
 
-        if (idx.isEmpty()) {
-            UpscalerMod.LOGGER.info("RT terrain: no solid geometry around ({},{},{}) — skipping", cx, cy, cz);
+        if (capture.idx.isEmpty()) {
+            UpscalerMod.LOGGER.info("RT terrain: no model geometry around ({},{},{}) — skipping", cx, cy, cz);
             return false;
         }
 
-        int vertCount = verts.size() / 3;
-        int idxCount = idx.size();
+        int vertCount = capture.verts.size() / 3;
+        int idxCount = capture.idx.size();
         int asInput = org.lwjgl.vulkan.KHRAccelerationStructure.VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
-        RtBuffer positions = ctx.createBuffer((long) verts.size() * Float.BYTES, asInput, true);
-        RtBuffer indices = ctx.createBuffer((long) idx.size() * Integer.BYTES, asInput, true);
-        RtBuffer normalBuffer = ctx.createBuffer((long) normalList.size() * Float.BYTES,
+        RtBuffer positions = ctx.createBuffer((long) capture.verts.size() * Float.BYTES, asInput, true);
+        RtBuffer indices = ctx.createBuffer((long) capture.idx.size() * Integer.BYTES, asInput, true);
+        RtBuffer material = ctx.createBuffer((long) capture.prim.size() * Float.BYTES,
                 org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
-        MemoryUtil.memFloatBuffer(positions.mapped, verts.size()).put(verts.elements(), 0, verts.size());
-        MemoryUtil.memIntBuffer(indices.mapped, idx.size()).put(idx.elements(), 0, idx.size());
-        MemoryUtil.memFloatBuffer(normalBuffer.mapped, normalList.size()).put(normalList.elements(), 0, normalList.size());
+        MemoryUtil.memFloatBuffer(positions.mapped, capture.verts.size()).put(capture.verts.elements(), 0, capture.verts.size());
+        MemoryUtil.memIntBuffer(indices.mapped, capture.idx.size()).put(capture.idx.elements(), 0, capture.idx.size());
+        MemoryUtil.memFloatBuffer(material.mapped, capture.prim.size()).put(capture.prim.elements(), 0, capture.prim.size());
 
         RtAccel blas = RtAccel.buildTrianglesBlas(ctx, positions, vertCount, indices, idxCount);
         float[] identity = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
@@ -136,56 +141,117 @@ public final class RtTerrain {
         if (instance != null) {
             instance.destroy();
         }
-        instance = new RtTerrain(positions, indices, normalBuffer, blas, tlas, cx, cy, cz);
-        UpscalerMod.LOGGER.info("RT terrain: extracted {} faces ({} verts / {} indices) from {}^3 blocks around ({},{},{}); BLAS+TLAS built",
-                faces, vertCount, idxCount, 2 * RADIUS + 1, cx, cy, cz);
+        instance = new RtTerrain(positions, indices, material, blas, tlas, cx, cy, cz);
+        UpscalerMod.LOGGER.info("RT terrain: {} blocks -> {} triangles ({} verts) around ({},{},{}); BLAS+TLAS built",
+                blocks, idxCount / 3, vertCount, cx, cy, cz);
         return true;
-    }
-
-    /** Emit one unit-cube face at block-local origin (bx,by,bz) on the given axis (0=x,1=y,2=z) at val (0 or 1). */
-    private static void emitFace(FloatArrayList verts, IntArrayList idx, FloatArrayList normals, int bx, int by, int bz, int axis, int val) {
-        int base = verts.size() / 3;
-        int a = (axis + 1) % 3;
-        int b = (axis + 2) % 3;
-        for (int i = 0; i < 4; i++) {
-            int va = (i == 1 || i == 2) ? 1 : 0;
-            int vb = (i >= 2) ? 1 : 0;
-            float[] c = new float[3];
-            c[axis] = val;
-            c[a] = va;
-            c[b] = vb;
-            verts.add(bx + c[0]);
-            verts.add(by + c[1]);
-            verts.add(bz + c[2]);
-        }
-        idx.add(base);
-        idx.add(base + 1);
-        idx.add(base + 2);
-        idx.add(base);
-        idx.add(base + 2);
-        idx.add(base + 3);
-
-        // Per-primitive (per-triangle) face normal, indexed by gl_PrimitiveID. Two triangles/face.
-        float s = val == 1 ? 1f : -1f;
-        float nx = axis == 0 ? s : 0f;
-        float ny = axis == 1 ? s : 0f;
-        float nz = axis == 2 ? s : 0f;
-        for (int t = 0; t < 2; t++) {
-            normals.add(nx);
-            normals.add(ny);
-            normals.add(nz);
-            normals.add(0f);
-        }
     }
 
     public void destroy() {
         tlas.destroy();
         blas.destroy();
-        normals.destroy();
+        material.destroy();
         indices.destroy();
         positions.destroy();
         if (instance == this) {
             instance = null;
+        }
+    }
+
+    /** Captures the quads vanilla's model renderer emits into RT position/index/material streams. */
+    private static final class QuadCapture implements BlockQuadOutput {
+        final FloatArrayList verts = new FloatArrayList();
+        final IntArrayList idx = new IntArrayList();
+        final FloatArrayList prim = new FloatArrayList(); // 8 floats/triangle: normal.xyz0, albedo.rgb0
+
+        @Override
+        public void put(float x, float y, float z, BakedQuad quad, QuadInstance instance) {
+            int base = verts.size() / 3;
+            Vector3fc p0 = quad.position(0);
+            Vector3fc p1 = quad.position(1);
+            Vector3fc p2 = quad.position(2);
+            Vector3fc p3 = quad.position(3);
+            addVertex(p0, x, y, z);
+            addVertex(p1, x, y, z);
+            addVertex(p2, x, y, z);
+            addVertex(p3, x, y, z);
+            idx.add(base);
+            idx.add(base + 1);
+            idx.add(base + 2);
+            idx.add(base);
+            idx.add(base + 2);
+            idx.add(base + 3);
+
+            float ex1 = p1.x() - p0.x(), ey1 = p1.y() - p0.y(), ez1 = p1.z() - p0.z();
+            float ex2 = p2.x() - p0.x(), ey2 = p2.y() - p0.y(), ez2 = p2.z() - p0.z();
+            float nx = ey1 * ez2 - ez1 * ey2;
+            float ny = ez1 * ex2 - ex1 * ez2;
+            float nz = ex1 * ey2 - ey1 * ex2;
+            float len = (float) Math.sqrt(nx * nx + ny * ny + nz * nz);
+            if (len > 1.0e-6f) {
+                nx /= len;
+                ny /= len;
+                nz /= len;
+            }
+            for (int t = 0; t < 2; t++) { // one {normal, albedo} record per triangle
+                prim.add(nx);
+                prim.add(ny);
+                prim.add(nz);
+                prim.add(0f);
+                prim.add(1f);
+                prim.add(1f);
+                prim.add(1f);
+                prim.add(0f);
+            }
+        }
+
+        private void addVertex(Vector3fc p, float x, float y, float z) {
+            verts.add(p.x() + x);
+            verts.add(p.y() + y);
+            verts.add(p.z() + z);
+        }
+    }
+
+    /** Minimal {@link BlockAndTintGetter} over the client level so the model renderer can cull + tint. */
+    private record LevelView(ClientLevel level) implements BlockAndTintGetter {
+        @Override
+        public CardinalLighting cardinalLighting() {
+            return CardinalLighting.DEFAULT;
+        }
+
+        @Override
+        public int getBlockTint(BlockPos pos, ColorResolver color) {
+            return level.getBlockTint(pos, color);
+        }
+
+        @Override
+        public LevelLightEngine getLightEngine() {
+            return level.getLightEngine();
+        }
+
+        @Override
+        public BlockEntity getBlockEntity(BlockPos pos) {
+            return level.getBlockEntity(pos);
+        }
+
+        @Override
+        public BlockState getBlockState(BlockPos pos) {
+            return level.getBlockState(pos);
+        }
+
+        @Override
+        public FluidState getFluidState(BlockPos pos) {
+            return level.getFluidState(pos);
+        }
+
+        @Override
+        public int getHeight() {
+            return level.getHeight();
+        }
+
+        @Override
+        public int getMinY() {
+            return level.getMinY();
         }
     }
 }

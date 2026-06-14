@@ -169,7 +169,7 @@ public final class RtComposite {
                 push.putFloat(64, (float) (camX - terrain.blockX));
                 push.putFloat(68, (float) (camY - terrain.blockY));
                 push.putFloat(72, (float) (camZ - terrain.blockZ));
-                push.putLong(80, terrain.normalAddress());
+                push.putLong(80, terrain.primAddress());
                 active.trace(cmd, width, height, push);
             } else {
                 active.trace(cmd, width, height);

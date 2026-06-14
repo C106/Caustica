@@ -14,6 +14,7 @@ import org.lwjgl.vulkan.VkPhysicalDeviceAccelerationStructurePropertiesKHR;
 import org.lwjgl.vulkan.VkPhysicalDeviceProperties2;
 import org.lwjgl.vulkan.VkPhysicalDeviceRayTracingPipelineFeaturesKHR;
 import org.lwjgl.vulkan.VkPhysicalDeviceRayTracingPipelinePropertiesKHR;
+import org.lwjgl.vulkan.VkPhysicalDeviceFeatures;
 import org.lwjgl.vulkan.VkPhysicalDeviceVulkan12Features;
 import org.spongepowered.asm.mixin.injection.invoke.arg.Args;
 
@@ -124,6 +125,9 @@ public final class RtDeviceBringup {
         // bufferDeviceAddress merges into vanilla's existing Vulkan12Features struct.
         features.add(new VulkanFeature(VulkanBackend.VK12_FEATURES_STRUCT, "bufferDeviceAddress",
                 VkPhysicalDeviceVulkan12Features.BUFFERDEVICEADDRESS));
+        // shaderInt64: the world hit shader uses uint64_t buffer-reference addresses (Int64 capability).
+        features.add(new VulkanFeature(VulkanBackend.VK10_FEATURES_STRUCT, "shaderInt64",
+                VkPhysicalDeviceFeatures.SHADERINT64));
         features.add(new VulkanFeature(asStruct, "accelerationStructure",
                 VkPhysicalDeviceAccelerationStructureFeaturesKHR.ACCELERATIONSTRUCTURE));
         features.add(new VulkanFeature(rtStruct, "rayTracingPipeline",
