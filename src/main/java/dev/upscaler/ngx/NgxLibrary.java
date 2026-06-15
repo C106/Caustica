@@ -26,6 +26,9 @@ public final class NgxLibrary {
 	private final MethodHandle queryOptimal;
 	private final MethodHandle createDlss;
 	private final MethodHandle evaluate;
+	private final MethodHandle dlssdAvailable;
+	private final MethodHandle createDlssd;
+	private final MethodHandle evaluateDlssd;
 	private final MethodHandle release;
 	private final MethodHandle shutdown;
 	private final MethodHandle lastResult;
@@ -53,6 +56,27 @@ public final class NgxLibrary {
 		this.evaluate = handle(lookup, "ngxshim_evaluate",
 				FunctionDescriptor.of(ValueLayout.JAVA_INT,
 						ValueLayout.JAVA_LONG, ValueLayout.ADDRESS,
+						ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT,
+						ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT,
+						ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT,
+						ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT,
+						ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT,
+						ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT,
+						ValueLayout.JAVA_INT, ValueLayout.JAVA_FLOAT));
+		// DLSS Ray Reconstruction (DLSSD) — same create ABI as DLSS-SR; evaluate adds the diffuse
+		// albedo / specular albedo / normals guide buffers (roughness is packed in normals.w).
+		this.dlssdAvailable = handle(lookup, "ngxshim_dlssd_available",
+				FunctionDescriptor.of(ValueLayout.JAVA_INT));
+		this.createDlssd = handle(lookup, "ngxshim_create_dlssd",
+				FunctionDescriptor.of(ValueLayout.ADDRESS, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT,
+						ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT));
+		// int ngxshim_evaluate_dlssd(cmd, feature, [color/depth/mv/diffAlbedo/specAlbedo/normals/out: view,img,fmt]*7, rw,rh,dw,dh, jx,jy,mvsx,mvsy, reset, frameMs)
+		this.evaluateDlssd = handle(lookup, "ngxshim_evaluate_dlssd",
+				FunctionDescriptor.of(ValueLayout.JAVA_INT,
+						ValueLayout.JAVA_LONG, ValueLayout.ADDRESS,
+						ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT,
+						ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT,
+						ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT,
 						ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT,
 						ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT,
 						ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT,
@@ -142,6 +166,51 @@ public final class NgxLibrary {
 					jitterX, jitterY, mvScaleX, mvScaleY, reset, frameTimeMs);
 		} catch (Throwable t) {
 			throw new RuntimeException("ngxshim_evaluate failed", t);
+		}
+	}
+
+	public boolean dlssdAvailable() {
+		try {
+			return ((int) this.dlssdAvailable.invokeExact()) != 0;
+		} catch (Throwable t) {
+			throw new RuntimeException("ngxshim_dlssd_available failed", t);
+		}
+	}
+
+	public MemorySegment createDlssd(long cmd, int renderWidth, int renderHeight, int displayWidth, int displayHeight,
+	                                 int quality, int featureFlags, int renderPreset) {
+		try {
+			return (MemorySegment) this.createDlssd.invokeExact(cmd, renderWidth, renderHeight, displayWidth, displayHeight,
+					quality, featureFlags, renderPreset);
+		} catch (Throwable t) {
+			throw new RuntimeException("ngxshim_create_dlssd failed", t);
+		}
+	}
+
+	public int evaluateDlssd(long cmd, MemorySegment feature,
+	                         long colorView, long colorImage, int colorFormat,
+	                         long depthView, long depthImage, int depthFormat,
+	                         long mvView, long mvImage, int mvFormat,
+	                         long diffuseAlbedoView, long diffuseAlbedoImage, int diffuseAlbedoFormat,
+	                         long specularAlbedoView, long specularAlbedoImage, int specularAlbedoFormat,
+	                         long normalsView, long normalsImage, int normalsFormat,
+	                         long outputView, long outputImage, int outputFormat,
+	                         int renderWidth, int renderHeight, int displayWidth, int displayHeight,
+	                         float jitterX, float jitterY, float mvScaleX, float mvScaleY,
+	                         int reset, float frameTimeMs) {
+		try {
+			return (int) this.evaluateDlssd.invokeExact(cmd, feature,
+					colorView, colorImage, colorFormat,
+					depthView, depthImage, depthFormat,
+					mvView, mvImage, mvFormat,
+					diffuseAlbedoView, diffuseAlbedoImage, diffuseAlbedoFormat,
+					specularAlbedoView, specularAlbedoImage, specularAlbedoFormat,
+					normalsView, normalsImage, normalsFormat,
+					outputView, outputImage, outputFormat,
+					renderWidth, renderHeight, displayWidth, displayHeight,
+					jitterX, jitterY, mvScaleX, mvScaleY, reset, frameTimeMs);
+		} catch (Throwable t) {
+			throw new RuntimeException("ngxshim_evaluate_dlssd failed", t);
 		}
 	}
 

@@ -13,6 +13,8 @@
 #include "nvsdk_ngx_vk.h"
 #include "nvsdk_ngx_helpers.h"
 #include "nvsdk_ngx_helpers_vk.h"
+#include "nvsdk_ngx_helpers_dlssd.h"
+#include "nvsdk_ngx_helpers_dlssd_vk.h"
 
 #include <cstring>
 #include <cstdlib>
@@ -227,6 +229,119 @@ NGX_SHIM_EXPORT int ngxshim_evaluate(VkCommandBuffer cmd, void* feature,
     eval.InFrameTimeDeltaInMsec = frameTimeMs;
 
     NVSDK_NGX_Result r = NGX_VULKAN_EVALUATE_DLSS_EXT(cmd, f->handle, f->params, &eval);
+    g_lastResult = (int) r;
+    return (int) r;
+}
+
+// 1 if DLSS Ray Reconstruction (denoising) is available on this system, else 0.
+NGX_SHIM_EXPORT int ngxshim_dlssd_available() {
+    if (!g_capabilityParams) {
+        return 0;
+    }
+    int available = 0;
+    NVSDK_NGX_Parameter_GetI(g_capabilityParams, NVSDK_NGX_Parameter_SuperSamplingDenoising_Available, &available);
+    return available;
+}
+
+// Creates a DLSS Ray Reconstruction (DLSSD) feature. Configured for our path tracer: DL-unified
+// denoise, roughness packed into normals.w, and linear depth (we feed view-distance, not HW depth).
+// renderPreset is an NVSDK_NGX_RayReconstruction_Hint_Render_Preset value (0 = DLL default).
+NGX_SHIM_EXPORT void* ngxshim_create_dlssd(VkCommandBuffer cmd,
+                                           unsigned int renderWidth, unsigned int renderHeight,
+                                           unsigned int displayWidth, unsigned int displayHeight,
+                                           int quality, int featureFlags, int renderPreset) {
+    NVSDK_NGX_Parameter* params = nullptr;
+    NVSDK_NGX_Result r = NVSDK_NGX_VULKAN_AllocateParameters(&params);
+    g_lastResult = (int) r;
+    if (NVSDK_NGX_FAILED(r)) {
+        return nullptr;
+    }
+
+    if (renderPreset != 0) {
+        unsigned int preset = (unsigned int) renderPreset;
+        NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_DLAA, preset);
+        NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Quality, preset);
+        NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Balanced, preset);
+        NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Performance, preset);
+        NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraPerformance, preset);
+        NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraQuality, preset);
+    }
+
+    NVSDK_NGX_DLSSD_Create_Params createParams;
+    std::memset(&createParams, 0, sizeof(createParams));
+    createParams.InDenoiseMode = NVSDK_NGX_DLSS_Denoise_Mode_DLUnified;
+    createParams.InRoughnessMode = NVSDK_NGX_DLSS_Roughness_Mode_Packed; // roughness from normals.w
+    createParams.InUseHWDepth = NVSDK_NGX_DLSS_Depth_Type_Linear;        // we feed linear view depth
+    createParams.InWidth = renderWidth;
+    createParams.InHeight = renderHeight;
+    createParams.InTargetWidth = displayWidth;
+    createParams.InTargetHeight = displayHeight;
+    createParams.InPerfQualityValue = (NVSDK_NGX_PerfQuality_Value) quality;
+    createParams.InFeatureCreateFlags = featureFlags;
+
+    NVSDK_NGX_Handle* handle = nullptr;
+    r = NGX_VULKAN_CREATE_DLSSD_EXT1(g_device, cmd, 1, 1, &handle, params, &createParams);
+    g_lastResult = (int) r;
+    if (NVSDK_NGX_FAILED(r)) {
+        NVSDK_NGX_VULKAN_DestroyParameters(params);
+        return nullptr;
+    }
+
+    DlssFeature* feature = (DlssFeature*) std::malloc(sizeof(DlssFeature));
+    feature->handle = handle;
+    feature->params = params;
+    return feature;
+}
+
+// Records a DLSS Ray Reconstruction evaluation. Guide buffers: HDR color, linear depth, motion
+// vectors, diffuse albedo, specular albedo, world-space normals (roughness packed in normals.w).
+// Output is the only read-write (storage) resource. All non-output images use the color aspect;
+// depth is a linear value carried in a color image, not a depth-aspect attachment.
+NGX_SHIM_EXPORT int ngxshim_evaluate_dlssd(VkCommandBuffer cmd, void* feature,
+                                           VkImageView colorView, VkImage colorImage, int colorFormat,
+                                           VkImageView depthView, VkImage depthImage, int depthFormat,
+                                           VkImageView mvView, VkImage mvImage, int mvFormat,
+                                           VkImageView diffuseAlbedoView, VkImage diffuseAlbedoImage, int diffuseAlbedoFormat,
+                                           VkImageView specularAlbedoView, VkImage specularAlbedoImage, int specularAlbedoFormat,
+                                           VkImageView normalsView, VkImage normalsImage, int normalsFormat,
+                                           VkImageView outputView, VkImage outputImage, int outputFormat,
+                                           unsigned int renderWidth, unsigned int renderHeight,
+                                           unsigned int displayWidth, unsigned int displayHeight,
+                                           float jitterX, float jitterY, float mvScaleX, float mvScaleY,
+                                           int reset, float frameTimeMs) {
+    DlssFeature* f = (DlssFeature*) feature;
+    if (!f) {
+        return -1;
+    }
+
+    NVSDK_NGX_Resource_VK color = makeImageResource(colorView, colorImage, colorFormat, renderWidth, renderHeight, VK_IMAGE_ASPECT_COLOR_BIT, false);
+    NVSDK_NGX_Resource_VK depth = makeImageResource(depthView, depthImage, depthFormat, renderWidth, renderHeight, VK_IMAGE_ASPECT_COLOR_BIT, false);
+    NVSDK_NGX_Resource_VK mv = makeImageResource(mvView, mvImage, mvFormat, renderWidth, renderHeight, VK_IMAGE_ASPECT_COLOR_BIT, false);
+    NVSDK_NGX_Resource_VK diffuseAlbedo = makeImageResource(diffuseAlbedoView, diffuseAlbedoImage, diffuseAlbedoFormat, renderWidth, renderHeight, VK_IMAGE_ASPECT_COLOR_BIT, false);
+    NVSDK_NGX_Resource_VK specularAlbedo = makeImageResource(specularAlbedoView, specularAlbedoImage, specularAlbedoFormat, renderWidth, renderHeight, VK_IMAGE_ASPECT_COLOR_BIT, false);
+    NVSDK_NGX_Resource_VK normals = makeImageResource(normalsView, normalsImage, normalsFormat, renderWidth, renderHeight, VK_IMAGE_ASPECT_COLOR_BIT, false);
+    NVSDK_NGX_Resource_VK output = makeImageResource(outputView, outputImage, outputFormat, displayWidth, displayHeight, VK_IMAGE_ASPECT_COLOR_BIT, true);
+
+    NVSDK_NGX_VK_DLSSD_Eval_Params eval;
+    std::memset(&eval, 0, sizeof(eval));
+    eval.pInColor = &color;
+    eval.pInOutput = &output;
+    eval.pInDepth = &depth;
+    eval.pInMotionVectors = &mv;
+    eval.pInDiffuseAlbedo = &diffuseAlbedo;
+    eval.pInSpecularAlbedo = &specularAlbedo;
+    eval.pInNormals = &normals;
+    // pInRoughness left null: InRoughnessMode_Packed reads roughness from normals.w.
+    eval.InJitterOffsetX = jitterX;
+    eval.InJitterOffsetY = jitterY;
+    eval.InMVScaleX = mvScaleX;
+    eval.InMVScaleY = mvScaleY;
+    eval.InReset = reset;
+    eval.InRenderSubrectDimensions.Width = renderWidth;
+    eval.InRenderSubrectDimensions.Height = renderHeight;
+    eval.InFrameTimeDeltaInMsec = frameTimeMs;
+
+    NVSDK_NGX_Result r = NGX_VULKAN_EVALUATE_DLSSD_EXT(cmd, f->handle, f->params, &eval);
     g_lastResult = (int) r;
     return (int) r;
 }
