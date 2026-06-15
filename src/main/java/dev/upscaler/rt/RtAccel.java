@@ -63,25 +63,52 @@ public final class RtAccel {
     }
 
     /**
-     * Build a bottom-level AS over an indexed triangle mesh (position-only vertex stream).
-     * {@code opaque} marks the geometry {@code OPAQUE} (no any-hit, fastest) for solid meshes;
-     * pass {@code false} for alpha-tested cutout geometry so the pipeline's any-hit shader runs
-     * (flagged {@code NO_DUPLICATE_ANY_HIT_INVOCATION} so each primitive's any-hit fires at most once).
+     * Build a single bottom-level AS over an indexed triangle mesh. Convenience wrapper around
+     * {@link #prepareTrianglesBlas} + {@link #buildPrepared} for one-off builds (e.g. the triangle
+     * spike). For per-frame terrain, prepare many and {@link #buildPrepared} them in one submission.
      */
     public static RtAccel buildTrianglesBlas(RtContext ctx, RtBuffer positions, int vertexCount,
                                              RtBuffer indices, int indexCount, boolean opaque) {
+        PreparedBlas prepared = prepareTrianglesBlas(ctx, positions, vertexCount, indices, indexCount, opaque);
+        buildPrepared(ctx, java.util.List.of(prepared));
+        return prepared.accel;
+    }
+
+    /**
+     * A BLAS whose AS + backing buffer are allocated but whose build command is recorded later, so
+     * many sections' builds can be batched into one submission — one {@code vkQueueSubmit} + fence
+     * wait per tick instead of one per section (each submit drains the graphics queue, so per-section
+     * submits were the dominant terrain-streaming stall).
+     * {@code opaque} marks geometry {@code OPAQUE} (solid, no any-hit) vs
+     * {@code NO_DUPLICATE_ANY_HIT_INVOCATION} for alpha-tested cutout.
+     */
+    public static final class PreparedBlas {
+        public final RtAccel accel;
+        private final RtBuffer scratch;
+        private final long vertexAddr;
+        private final long indexAddr;
+        private final int maxVertex;
+        private final int triangleCount;
+        private final boolean opaque;
+
+        private PreparedBlas(RtAccel accel, RtBuffer scratch, long vertexAddr, long indexAddr, int maxVertex, int triangleCount, boolean opaque) {
+            this.accel = accel;
+            this.scratch = scratch;
+            this.vertexAddr = vertexAddr;
+            this.indexAddr = indexAddr;
+            this.maxVertex = maxVertex;
+            this.triangleCount = triangleCount;
+            this.opaque = opaque;
+        }
+    }
+
+    /** Allocate a BLAS (AS + backing + scratch) and query sizes, but defer the build to {@link #buildPrepared}. */
+    public static PreparedBlas prepareTrianglesBlas(RtContext ctx, RtBuffer positions, int vertexCount,
+                                                    RtBuffer indices, int indexCount, boolean opaque) {
         VkDevice vk = ctx.vk();
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            VkAccelerationStructureGeometryKHR.Buffer geom = VkAccelerationStructureGeometryKHR.calloc(1, stack);
-            geom.sType$Default().geometryType(VK_GEOMETRY_TYPE_TRIANGLES_KHR)
-                    .flags(opaque ? VK_GEOMETRY_OPAQUE_BIT_KHR : VK_GEOMETRY_NO_DUPLICATE_ANY_HIT_INVOCATION_BIT_KHR);
-            var tri = geom.geometry().triangles();
-            tri.sType$Default()
-                    .vertexFormat(VK10.VK_FORMAT_R32G32B32_SFLOAT).vertexStride(3L * Float.BYTES)
-                    .maxVertex(vertexCount - 1).indexType(VK10.VK_INDEX_TYPE_UINT32);
-            tri.vertexData().deviceAddress(positions.deviceAddress);
-            tri.indexData().deviceAddress(indices.deviceAddress);
-
+            VkAccelerationStructureGeometryKHR.Buffer geom = triangleGeometry(stack, positions.deviceAddress,
+                    indices.deviceAddress, vertexCount, opaque);
             VkAccelerationStructureBuildGeometryInfoKHR.Buffer build = VkAccelerationStructureBuildGeometryInfoKHR.calloc(1, stack);
             build.sType$Default().type(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR)
                     .flags(VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR)
@@ -91,10 +118,61 @@ public final class RtAccel {
             vkGetAccelerationStructureBuildSizesKHR(vk, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
                     build.get(0), stack.ints(indexCount / 3), sizes);
 
-            RtAccel accel = createAndBuild(ctx, build, sizes, VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
-                    indexCount / 3, stack);
-            return accel;
+            RtBuffer backing = ctx.createBuffer(sizes.accelerationStructureSize(), VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR, false);
+            VkAccelerationStructureCreateInfoKHR ci = VkAccelerationStructureCreateInfoKHR.calloc(stack).sType$Default()
+                    .buffer(backing.handle).offset(0).size(sizes.accelerationStructureSize()).type(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR);
+            java.nio.LongBuffer pAs = stack.mallocLong(1);
+            RtContext.check(vkCreateAccelerationStructureKHR(vk, ci, null, pAs), "vkCreateAccelerationStructureKHR");
+            long handle = pAs.get(0);
+            RtBuffer scratch = ctx.createBuffer(sizes.buildScratchSize(), VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false);
+            VkAccelerationStructureDeviceAddressInfoKHR addrInfo = VkAccelerationStructureDeviceAddressInfoKHR.calloc(stack)
+                    .sType$Default().accelerationStructure(handle);
+            long deviceAddress = vkGetAccelerationStructureDeviceAddressKHR(vk, addrInfo);
+            RtAccel accel = new RtAccel(vk, handle, deviceAddress, backing);
+            return new PreparedBlas(accel, scratch, positions.deviceAddress, indices.deviceAddress, vertexCount - 1, indexCount / 3, opaque);
         }
+    }
+
+    /** Record every prepared BLAS build into one command buffer and submit once, then free scratch. */
+    public static void buildPrepared(RtContext ctx, List<PreparedBlas> prepared) {
+        if (prepared.isEmpty()) {
+            return;
+        }
+        ctx.submitSync(cmd -> {
+            for (PreparedBlas b : prepared) {
+                // Per-iteration stack frame: hundreds of builds on one frame would overflow the 64 KB stack.
+                try (MemoryStack stack = MemoryStack.stackPush()) {
+                    VkAccelerationStructureGeometryKHR.Buffer geom = triangleGeometry(stack, b.vertexAddr, b.indexAddr, b.maxVertex + 1, b.opaque);
+                    VkAccelerationStructureBuildGeometryInfoKHR.Buffer build = VkAccelerationStructureBuildGeometryInfoKHR.calloc(1, stack);
+                    build.sType$Default().type(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR)
+                            .flags(VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR)
+                            .mode(VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR).geometryCount(1).pGeometries(geom)
+                            .dstAccelerationStructure(b.accel.handle);
+                    build.get(0).scratchData().deviceAddress(b.scratch.deviceAddress);
+                    VkAccelerationStructureBuildRangeInfoKHR.Buffer range = VkAccelerationStructureBuildRangeInfoKHR.calloc(1, stack);
+                    range.get(0).primitiveCount(b.triangleCount).primitiveOffset(0).firstVertex(0).transformOffset(0);
+                    PointerBuffer ppRange = stack.mallocPointer(1).put(0, range.address());
+                    // Builds are independent (own dst AS + scratch), so no barriers needed between them.
+                    vkCmdBuildAccelerationStructuresKHR(cmd, build, ppRange);
+                }
+            }
+        });
+        for (PreparedBlas b : prepared) {
+            b.scratch.destroy();
+        }
+    }
+
+    private static VkAccelerationStructureGeometryKHR.Buffer triangleGeometry(MemoryStack stack, long vertexAddr, long indexAddr, int vertexCount, boolean opaque) {
+        VkAccelerationStructureGeometryKHR.Buffer geom = VkAccelerationStructureGeometryKHR.calloc(1, stack);
+        geom.sType$Default().geometryType(VK_GEOMETRY_TYPE_TRIANGLES_KHR)
+                .flags(opaque ? VK_GEOMETRY_OPAQUE_BIT_KHR : VK_GEOMETRY_NO_DUPLICATE_ANY_HIT_INVOCATION_BIT_KHR);
+        var tri = geom.geometry().triangles();
+        tri.sType$Default()
+                .vertexFormat(VK10.VK_FORMAT_R32G32B32_SFLOAT).vertexStride(3L * Float.BYTES)
+                .maxVertex(vertexCount - 1).indexType(VK10.VK_INDEX_TYPE_UINT32);
+        tri.vertexData().deviceAddress(vertexAddr);
+        tri.indexData().deviceAddress(indexAddr);
+        return geom;
     }
 
     /** A TLAS instance: a 3x4 row-major transform and the device address of its BLAS. */

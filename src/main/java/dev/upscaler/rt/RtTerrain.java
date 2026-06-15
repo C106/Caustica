@@ -193,19 +193,31 @@ public final class RtTerrain {
             capture.view = view;
             BlockPos.MutableBlockPos m = new BlockPos.MutableBlockPos();
             int budget = SECTIONS_PER_TICK;
+            List<PreparedSection> prepared = new ArrayList<>();
             for (int[] s : missing) {
                 if (budget <= 0) {
                     break;
                 }
                 budget--;
                 long key = sectionKey(s[0], s[1], s[2]);
-                SectionGeom g = buildSection(ctx, level, modelSet, renderer, view, capture, m, s[0], s[1], s[2]);
-                if (g != null) {
-                    resident.put(key, g);
-                    changed = true;
+                PreparedSection ps = prepareSection(ctx, level, modelSet, renderer, view, capture, m, key, s[0], s[1], s[2]);
+                if (ps != null) {
+                    prepared.add(ps);
                 } else {
                     empty.add(key);
                 }
+            }
+            if (!prepared.isEmpty()) {
+                // Batch all this tick's BLAS builds into one submission (one queue drain instead of one per section).
+                List<RtAccel.PreparedBlas> builds = new ArrayList<>(prepared.size());
+                for (PreparedSection ps : prepared) {
+                    builds.add(ps.blas());
+                }
+                RtAccel.buildPrepared(ctx, builds);
+                for (PreparedSection ps : prepared) {
+                    resident.put(ps.key(), new SectionGeom(ps.positions(), ps.indices(), ps.uvs(), ps.material(), ps.blas().accel, ps.sx(), ps.sy(), ps.sz()));
+                }
+                changed = true;
             }
         }
 
@@ -224,10 +236,10 @@ public final class RtTerrain {
         return dx * dx + dy * dy + dz * dz;
     }
 
-    /** Tessellate one section's blocks (section-local) and build its buffers + BLAS; null if empty. */
-    private SectionGeom buildSection(RtContext ctx, ClientLevel level, BlockStateModelSet modelSet,
-                                     ModelBlockRenderer renderer, BlockAndTintGetter view, QuadCapture capture,
-                                     BlockPos.MutableBlockPos m, int scx, int scy, int scz) {
+    /** Tessellate one section (section-local), upload its buffers, and prepare (not yet build) its BLAS; null if empty. */
+    private PreparedSection prepareSection(RtContext ctx, ClientLevel level, BlockStateModelSet modelSet,
+                                           ModelBlockRenderer renderer, BlockAndTintGetter view, QuadCapture capture,
+                                           BlockPos.MutableBlockPos m, long key, int scx, int scy, int scz) {
         int sox = scx << 4, soy = scy << 4, soz = scz << 4;
         SectionMesh mesh = new SectionMesh();
         capture.cur = mesh;
@@ -272,8 +284,14 @@ public final class RtTerrain {
         MemoryUtil.memFloatBuffer(material.mapped, mesh.prim.size()).put(mesh.prim.elements(), 0, mesh.prim.size());
 
         // Cutout geometry: non-opaque so the any-hit shader alpha-tests the atlas (foliage/glass).
-        RtAccel blas = RtAccel.buildTrianglesBlas(ctx, positions, vertCount, indices, idxCount, false);
-        return new SectionGeom(positions, indices, uvs, material, blas, sox, soy, soz);
+        // The BLAS build is deferred — the caller batches all sections' builds into one submission.
+        RtAccel.PreparedBlas blas = RtAccel.prepareTrianglesBlas(ctx, positions, vertCount, indices, idxCount, false);
+        return new PreparedSection(key, positions, indices, uvs, material, blas, sox, soy, soz);
+    }
+
+    /** A section tessellated + uploaded with a prepared (not-yet-built) BLAS, pending the batch build. */
+    private record PreparedSection(long key, RtBuffer positions, RtBuffer indices, RtBuffer uvs, RtBuffer material,
+                                   RtAccel.PreparedBlas blas, int sx, int sy, int sz) {
     }
 
     /** Rebuild the section table + TLAS from the current resident set; free old + removed sections. */
@@ -311,7 +329,10 @@ public final class RtTerrain {
         }
         RtAccel newTlas = RtAccel.buildTlas(ctx, instances);
 
-        ctx.waitIdle(); // a previous frame may still read the old TLAS/table/removed buffers
+        // No explicit waitIdle: buildTlas's submitSync is queued after any in-flight frame on the
+        // graphics queue and waits on its fence, so by here those frames have completed and the old
+        // TLAS/table/removed buffers are safe to free. (The empty-set branch above still needs its
+        // own waitIdle since it does no build.)
         if (sectionTable != null) {
             sectionTable.destroy();
         }
