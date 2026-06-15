@@ -60,12 +60,17 @@ public final class RtTerrain {
     private static final int VIEW_SECTIONS_V = Integer.getInteger("upscaler.rt.viewSectionsV", 6);
     private static final int SECTIONS_PER_TICK = Integer.getInteger("upscaler.rt.sectionsPerTick", 24);
     private static final int SECTION_ENTRY_BYTES = 24; // {u64 primAddr, u64 idxAddr, u64 uvAddr}
+    // Frames a retired resource must outlive before it's freed (> frames-in-flight). The frame counter
+    // advances per composite; old TLAS/table/sections are freed this many frames after the swap.
+    private static final int KEEP_FRAMES = 4;
 
     private static final RtTerrain INSTANCE = new RtTerrain();
 
     private final Map<Long, SectionGeom> resident = new HashMap<>();
     private final Set<Long> empty = new HashSet<>(); // loaded, in-window sections with no geometry
     private final Set<Long> dirty = java.util.concurrent.ConcurrentHashMap.newKeySet(); // edited sections to re-extract
+    private final List<Deferred> deferred = new ArrayList<>(); // frames-in-flight-safe frees
+    private Pending pending; // in-flight async geometry build, or null
     private RtBuffer sectionTable;
     private RtAccel tlas;
     private boolean ready;
@@ -120,10 +125,21 @@ public final class RtTerrain {
     }
 
     private void tick(RtContext ctx) {
+        processDeferredFrees();
+
         Minecraft mc = Minecraft.getInstance();
         ClientLevel level = mc.level;
         if (level == null || mc.player == null) {
-            clear(ctx); // left the world — drop all geometry
+            clear(ctx); // left the world — drop all geometry (drains + frees, incl. any in-flight build)
+            return;
+        }
+
+        // One build in flight at a time: finalize it when the GPU finishes, and don't start another
+        // until then. The old geometry stays live and traceable throughout, so there's no stall.
+        if (pending != null) {
+            if (ctx.isAsyncDone(pending.op)) {
+                finalizePending(ctx);
+            }
             return;
         }
 
@@ -209,7 +225,7 @@ public final class RtTerrain {
         }
 
         if (!removed.isEmpty() || !prepared.isEmpty()) {
-            rebuild(ctx, prepared, removed, pb.getX(), pb.getY(), pb.getZ());
+            startBuild(ctx, prepared, removed, pb.getX(), pb.getY(), pb.getZ());
         }
     }
 
@@ -281,30 +297,32 @@ public final class RtTerrain {
                                    RtAccel.PreparedBlas blas, int sx, int sy, int sz) {
     }
 
+    /** A deferred free: run {@code free} once the frame counter reaches {@code freeFrame}. */
+    private record Deferred(long freeFrame, Runnable free) {
+    }
+
+    /** An in-flight async geometry build: the swap (new TLAS/table) lands when {@code op} completes. */
+    private record Pending(RtContext.AsyncSubmit op, RtAccel.PreparedBatch batch, RtBuffer newTable,
+                           List<SectionGeom> removed, int rbx, int rby, int rbz) {
+    }
+
     /**
-     * Commit a tick's changes: add the newly prepared sections, then build their BLAS + a fresh TLAS
-     * over the whole resident set in one batched submission, and free the old TLAS/table + removed
-     * sections. {@code rbx/rby/rbz} is the new rebase origin (player block).
+     * Start an async geometry build. The new sections are added to residency and the new TLAS/table
+     * are built off the render thread; the old TLAS stays bound and traceable until {@link
+     * #finalizePending} swaps the result in. {@code rbx/rby/rbz} is the new rebase origin.
      */
-    private void rebuild(RtContext ctx, List<PreparedSection> prepared, List<SectionGeom> removed, int rbx, int rby, int rbz) {
+    private void startBuild(RtContext ctx, List<PreparedSection> prepared, List<SectionGeom> removed, int rbx, int rby, int rbz) {
         for (PreparedSection ps : prepared) {
             resident.put(ps.key(), new SectionGeom(ps.positions(), ps.indices(), ps.uvs(), ps.material(), ps.blas().accel, ps.sx(), ps.sy(), ps.sz()));
         }
 
         List<SectionGeom> ordered = new ArrayList<>(resident.values());
         if (ordered.isEmpty()) {
-            ctx.waitIdle();
-            if (sectionTable != null) {
-                sectionTable.destroy();
-                sectionTable = null;
-            }
-            if (tlas != null) {
-                tlas.destroy();
-                tlas = null;
-            }
-            for (SectionGeom g : removed) {
-                g.destroy();
-            }
+            // Everything left the window: retire the current TLAS/table + removed sections, go not-ready.
+            long freeAt = RtComposite.frameCounter() + KEEP_FRAMES;
+            retire(freeAt, tlas, sectionTable, removed);
+            tlas = null;
+            sectionTable = null;
             ready = false;
             return;
         }
@@ -318,45 +336,85 @@ public final class RtTerrain {
             MemoryUtil.memPutLong(base, g.material.deviceAddress);
             MemoryUtil.memPutLong(base + 8, g.indices.deviceAddress);
             MemoryUtil.memPutLong(base + 16, g.uvs.deviceAddress);
-            // instanceCustomIndex == table index i (buildBatch assigns it from the list order).
+            // instanceCustomIndex == table index i (prepareTlas assigns it from the list order).
             float[] xform = {1, 0, 0, g.sx - rbx, 0, 1, 0, g.sy - rby, 0, 0, 1, g.sz - rbz};
             instances.add(new RtAccel.Instance(xform, g.blas.deviceAddress));
         }
 
-        // One submission: build this tick's new BLAS, barrier, then the TLAS over the whole set.
         List<RtAccel.PreparedBlas> blasBuilds = new ArrayList<>(prepared.size());
         for (PreparedSection ps : prepared) {
             blasBuilds.add(ps.blas());
         }
-        RtAccel newTlas = RtAccel.buildBatch(ctx, blasBuilds, instances);
+        RtAccel.PreparedBatch batch = RtAccel.prepareBatch(ctx, blasBuilds, instances);
+        RtContext.AsyncSubmit op = ctx.submitAsync(cmd -> RtAccel.recordBatch(cmd, batch));
+        pending = new Pending(op, batch, newTable, removed, rbx, rby, rbz);
+    }
 
-        // No explicit waitIdle: buildBatch's submitSync is queued after any in-flight frame on the
-        // graphics queue and waits on its fence, so by here those frames have completed and the old
-        // TLAS/table/removed buffers are safe to free. (The empty-set branch above still needs its
-        // own waitIdle since it does no build.)
-        if (sectionTable != null) {
-            sectionTable.destroy();
-        }
-        if (tlas != null) {
-            tlas.destroy();
-        }
-        for (SectionGeom g : removed) {
-            g.destroy();
-        }
-        sectionTable = newTable;
-        tlas = newTlas;
-        blockX = rbx;
-        blockY = rby;
-        blockZ = rbz;
+    /** Swap a completed async build in: retire old TLAS/table + removed sections, publish the new ones. */
+    private void finalizePending(RtContext ctx) {
+        Pending p = pending;
+        pending = null;
+        ctx.freeAsync(p.op());
+        RtAccel.freeBatchScratch(p.batch()); // build done -> scratch + instance buffers safe to free
+        long freeAt = RtComposite.frameCounter() + KEEP_FRAMES;
+        retire(freeAt, tlas, sectionTable, p.removed());
+        sectionTable = p.newTable();
+        tlas = p.batch().tlas;
+        blockX = p.rbx();
+        blockY = p.rby();
+        blockZ = p.rbz();
         ready = true;
     }
 
+    /** Queue old GPU resources for a frames-in-flight-safe free at {@code freeFrame}. */
+    private void retire(long freeFrame, RtAccel oldTlas, RtBuffer oldTable, List<SectionGeom> removed) {
+        if (oldTlas != null) {
+            deferred.add(new Deferred(freeFrame, oldTlas::destroy));
+        }
+        if (oldTable != null) {
+            deferred.add(new Deferred(freeFrame, oldTable::destroy));
+        }
+        for (SectionGeom g : removed) {
+            deferred.add(new Deferred(freeFrame, g::destroy));
+        }
+    }
+
+    private void processDeferredFrees() {
+        if (deferred.isEmpty()) {
+            return;
+        }
+        long now = RtComposite.frameCounter();
+        Iterator<Deferred> it = deferred.iterator();
+        while (it.hasNext()) {
+            Deferred d = it.next();
+            if (d.freeFrame() <= now) {
+                d.free().run();
+                it.remove();
+            }
+        }
+    }
+
+    /** Full teardown (world exit / shutdown): drain the GPU, then free everything incl. an in-flight build. */
     private void clear(RtContext ctx) {
-        if (resident.isEmpty() && tlas == null && sectionTable == null) {
+        if (pending == null && resident.isEmpty() && tlas == null && sectionTable == null && deferred.isEmpty()) {
             empty.clear();
             return;
         }
         ctx.waitIdle();
+        if (pending != null) {
+            ctx.freeAsync(pending.op());
+            RtAccel.freeBatchScratch(pending.batch());
+            pending.newTable().destroy();
+            pending.batch().tlas.destroy();
+            for (SectionGeom g : pending.removed()) {
+                g.destroy();
+            }
+            pending = null;
+        }
+        for (Deferred d : deferred) {
+            d.free().run();
+        }
+        deferred.clear();
         if (tlas != null) {
             tlas.destroy();
             tlas = null;

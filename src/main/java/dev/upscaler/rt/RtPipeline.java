@@ -52,11 +52,16 @@ import static org.lwjgl.vulkan.KHRRayTracingPipeline.vkGetRayTracingShaderGroupH
  */
 public final class RtPipeline {
     private static final String SHADER_DIR = "/upscaler/rt/";
+    // A small ring of descriptor sets: setTlas writes the next slot (long-unused) rather than mutating
+    // the slot in-flight frames are still reading, so the TLAS can be swapped without a device drain.
+    // Swaps are many frames apart (one per async build), so even 2 would do; 3 is margin.
+    private static final int RING = 3;
 
     private final RtContext ctx;
     private final long descriptorSetLayout;
     private final long descriptorPool;
-    private final long descriptorSet;
+    private final long[] descriptorSets;
+    private int currentSet;
     private final long pipelineLayout;
     private final long pipeline;
     private final RtBuffer sbt;
@@ -66,11 +71,12 @@ public final class RtPipeline {
     private final int pushConstantStages;
     private boolean destroyed;
 
-    private RtPipeline(RtContext ctx, long dsl, long pool, long set, long layout, long pipeline, RtBuffer sbt, long stride, int missCount, int pushConstantSize, int pushConstantStages) {
+    private RtPipeline(RtContext ctx, long dsl, long pool, long[] sets, long layout, long pipeline, RtBuffer sbt, long stride, int missCount, int pushConstantSize, int pushConstantStages) {
         this.ctx = ctx;
         this.descriptorSetLayout = dsl;
         this.descriptorPool = pool;
-        this.descriptorSet = set;
+        this.descriptorSets = sets;
+        this.currentSet = 0;
         this.pipelineLayout = layout;
         this.pipeline = pipeline;
         this.sbt = sbt;
@@ -123,19 +129,24 @@ public final class RtPipeline {
             long dsl = p.get(0);
 
             VkDescriptorPoolSize.Buffer poolSizes = VkDescriptorPoolSize.calloc(bindingCount, stack);
-            poolSizes.get(0).type(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR).descriptorCount(1);
-            poolSizes.get(1).type(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(1);
+            poolSizes.get(0).type(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR).descriptorCount(RING);
+            poolSizes.get(1).type(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(RING);
             if (withAtlasSampler) {
-                poolSizes.get(2).type(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(1);
+                poolSizes.get(2).type(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(RING);
             }
-            VkDescriptorPoolCreateInfo dpci = VkDescriptorPoolCreateInfo.calloc(stack).sType$Default().maxSets(1).pPoolSizes(poolSizes);
+            VkDescriptorPoolCreateInfo dpci = VkDescriptorPoolCreateInfo.calloc(stack).sType$Default().maxSets(RING).pPoolSizes(poolSizes);
             check(VK10.vkCreateDescriptorPool(vk, dpci, null, p), "vkCreateDescriptorPool");
             long pool = p.get(0);
+            LongBuffer layouts = stack.mallocLong(RING);
+            for (int i = 0; i < RING; i++) {
+                layouts.put(i, dsl);
+            }
             VkDescriptorSetAllocateInfo dsai = VkDescriptorSetAllocateInfo.calloc(stack).sType$Default()
-                    .descriptorPool(pool).pSetLayouts(stack.longs(dsl));
-            LongBuffer pSet = stack.mallocLong(1);
+                    .descriptorPool(pool).pSetLayouts(layouts);
+            LongBuffer pSet = stack.mallocLong(RING);
             check(VK10.vkAllocateDescriptorSets(vk, dsai, pSet), "vkAllocateDescriptorSets");
-            long set = pSet.get(0);
+            long[] sets = new long[RING];
+            pSet.get(sets);
 
             VkPipelineLayoutCreateInfo plci = VkPipelineLayoutCreateInfo.calloc(stack).sType$Default().pSetLayouts(stack.longs(dsl));
             // Push constants are visible to raygen + closest-hit (+ any-hit when present). vkCmdPushConstants
@@ -217,40 +228,50 @@ public final class RtPipeline {
             for (int g = 0; g < groupCount; g++) {
                 MemoryUtil.memCopy(MemoryUtil.memAddress(handles) + (long) g * handleSize, sbt.mapped + g * stride, handleSize);
             }
-            return new RtPipeline(ctx, dsl, pool, set, layout, pipeline, sbt, stride, missCount, pushConstantSize, pcStages);
+            return new RtPipeline(ctx, dsl, pool, sets, layout, pipeline, sbt, stride, missCount, pushConstantSize, pcStages);
         }
     }
 
+    /**
+     * Bind a new TLAS into the next ring slot (which in-flight frames are no longer reading, since
+     * swaps are many frames apart) and make it current, so the binding can change without a drain.
+     */
     public void setTlas(long tlas) {
+        currentSet = (currentSet + 1) % RING;
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkWriteDescriptorSetAccelerationStructureKHR asWrite = VkWriteDescriptorSetAccelerationStructureKHR.calloc(stack)
                     .sType(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR).pAccelerationStructures(stack.longs(tlas));
             VkWriteDescriptorSet.Buffer write = VkWriteDescriptorSet.calloc(1, stack);
-            write.get(0).sType$Default().pNext(asWrite.address()).dstSet(descriptorSet).dstBinding(0)
+            write.get(0).sType$Default().pNext(asWrite.address()).dstSet(descriptorSets[currentSet]).dstBinding(0)
                     .descriptorCount(1).descriptorType(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR);
             VK10.vkUpdateDescriptorSets(ctx.vk(), write, null);
         }
     }
 
+    /** Write the storage image into every ring slot (set once at init / on resize, when idle). */
     public void setStorageImage(long imageView) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkDescriptorImageInfo.Buffer imgInfo = VkDescriptorImageInfo.calloc(1, stack);
             imgInfo.get(0).imageView(imageView).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
-            VkWriteDescriptorSet.Buffer write = VkWriteDescriptorSet.calloc(1, stack);
-            write.get(0).sType$Default().dstSet(descriptorSet).dstBinding(1)
-                    .descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).pImageInfo(imgInfo);
+            VkWriteDescriptorSet.Buffer write = VkWriteDescriptorSet.calloc(RING, stack);
+            for (int i = 0; i < RING; i++) {
+                write.get(i).sType$Default().dstSet(descriptorSets[i]).dstBinding(1)
+                        .descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).pImageInfo(imgInfo);
+            }
             VK10.vkUpdateDescriptorSets(ctx.vk(), write, null);
         }
     }
 
-    /** Bind the block atlas (combined image sampler) at binding 2 — only valid if created withAtlasSampler. */
+    /** Bind the block atlas (combined image sampler) into every ring slot — only valid if created withAtlasSampler. */
     public void setAtlasSampler(long imageView, long sampler) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkDescriptorImageInfo.Buffer info = VkDescriptorImageInfo.calloc(1, stack);
             info.get(0).sampler(sampler).imageView(imageView).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
-            VkWriteDescriptorSet.Buffer write = VkWriteDescriptorSet.calloc(1, stack);
-            write.get(0).sType$Default().dstSet(descriptorSet).dstBinding(2)
-                    .descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).pImageInfo(info);
+            VkWriteDescriptorSet.Buffer write = VkWriteDescriptorSet.calloc(RING, stack);
+            for (int i = 0; i < RING; i++) {
+                write.get(i).sType$Default().dstSet(descriptorSets[i]).dstBinding(2)
+                        .descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).pImageInfo(info);
+            }
             VK10.vkUpdateDescriptorSets(ctx.vk(), write, null);
         }
     }
@@ -263,7 +284,7 @@ public final class RtPipeline {
     public void trace(VkCommandBuffer cmd, int width, int height, java.nio.ByteBuffer pushConstants) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VK10.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipeline);
-            VK10.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipelineLayout, 0, stack.longs(descriptorSet), null);
+            VK10.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipelineLayout, 0, stack.longs(descriptorSets[currentSet]), null);
             if (pushConstants != null && pushConstantSize > 0) {
                 VK10.vkCmdPushConstants(cmd, pipelineLayout, pushConstantStages, 0, pushConstants);
             }

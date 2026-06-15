@@ -47,6 +47,13 @@ public final class RtComposite {
         }
     }
 
+    // Monotonic per-composite frame counter, used by RtTerrain to time frames-in-flight-safe frees.
+    private static volatile long frameCounter;
+
+    public static long frameCounter() {
+        return frameCounter;
+    }
+
     private RtPipeline trianglePipeline;
     private RtPipeline worldPipeline;
     private RtBlendPipeline blendPipeline;
@@ -80,6 +87,7 @@ public final class RtComposite {
     }
 
     public boolean composite(GpuTexture nativeColor, int width, int height) {
+        frameCounter++; // advances once per frame; RtTerrain retires resources relative to it
         if (failed) {
             return false;
         }

@@ -227,6 +227,54 @@ public final class RtContext {
         }
     }
 
+    /** An async submission: the command buffer + its fence, owned until {@link #freeAsync}. */
+    public record AsyncSubmit(VkCommandBuffer cmd, long fence) {
+    }
+
+    /**
+     * Record + submit a one-shot command buffer <b>without waiting</b>; poll with {@link #isAsyncDone}
+     * and release with {@link #freeAsync} once done. For per-frame geometry builds that must not stall
+     * the render thread (unlike {@link #submitSync}). The command buffer + fence stay alive until freed.
+     */
+    public synchronized AsyncSubmit submitAsync(Consumer<VkCommandBuffer> record) {
+        ensurePool();
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkCommandBufferAllocateInfo ai = VkCommandBufferAllocateInfo.calloc(stack).sType$Default()
+                    .commandPool(commandPool).level(VK10.VK_COMMAND_BUFFER_LEVEL_PRIMARY).commandBufferCount(1);
+            PointerBuffer pCmd = stack.mallocPointer(1);
+            check(VK10.vkAllocateCommandBuffers(vk, ai, pCmd), "vkAllocateCommandBuffers(async)");
+            VkCommandBuffer cmd = new VkCommandBuffer(pCmd.get(0), vk);
+
+            VkCommandBufferBeginInfo bi = VkCommandBufferBeginInfo.calloc(stack).sType$Default()
+                    .flags(VK10.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
+            check(VK10.vkBeginCommandBuffer(cmd, bi), "vkBeginCommandBuffer(async)");
+            record.accept(cmd);
+            check(VK10.vkEndCommandBuffer(cmd), "vkEndCommandBuffer(async)");
+
+            VkFenceCreateInfo fci = VkFenceCreateInfo.calloc(stack).sType$Default();
+            LongBuffer pFence = stack.mallocLong(1);
+            check(VK10.vkCreateFence(vk, fci, null, pFence), "vkCreateFence(async)");
+            long fence = pFence.get(0);
+
+            VkSubmitInfo si = VkSubmitInfo.calloc(stack).sType$Default().pCommandBuffers(stack.pointers(cmd));
+            check(VK10.vkQueueSubmit(graphicsQueue.vkQueue(), si, fence), "vkQueueSubmit(async)");
+            return new AsyncSubmit(cmd, fence);
+        }
+    }
+
+    /** True once the async submission's GPU work has completed. */
+    public boolean isAsyncDone(AsyncSubmit op) {
+        return VK10.vkGetFenceStatus(vk, op.fence()) == VK10.VK_SUCCESS;
+    }
+
+    /** Free an async submission's fence + command buffer; only after {@link #isAsyncDone} is true. */
+    public synchronized void freeAsync(AsyncSubmit op) {
+        VK10.vkDestroyFence(vk, op.fence(), null);
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VK10.vkFreeCommandBuffers(vk, commandPool, stack.pointers(op.cmd()));
+        }
+    }
+
     public void waitIdle() {
         VK10.vkDeviceWaitIdle(vk);
     }

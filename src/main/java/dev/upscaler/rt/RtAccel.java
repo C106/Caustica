@@ -247,43 +247,71 @@ public final class RtAccel {
         return buildBatch(ctx, List.of(), instances);
     }
 
+    /** A batched geometry update (new BLAS + a TLAS), allocated and ready to record into a command buffer. */
+    public static final class PreparedBatch {
+        public final RtAccel tlas;
+        private final List<PreparedBlas> blas;
+        private final PreparedTlas preparedTlas;
+
+        private PreparedBatch(List<PreparedBlas> blas, PreparedTlas preparedTlas) {
+            this.tlas = preparedTlas.accel;
+            this.blas = blas;
+            this.preparedTlas = preparedTlas;
+        }
+    }
+
+    /** Allocate a batch: prepare the TLAS (the BLAS are already prepared); records/builds happen later. */
+    public static PreparedBatch prepareBatch(RtContext ctx, List<PreparedBlas> blasToBuild, List<Instance> instances) {
+        return new PreparedBatch(blasToBuild, prepareTlas(ctx, instances));
+    }
+
     /**
-     * Build (in one submission) every prepared BLAS and a TLAS over {@code instances}. The BLAS builds
-     * are separated from the TLAS build by an acceleration-structure barrier (the TLAS reads the BLAS
-     * the build just wrote). One {@code submitSync} → one queue drain for the whole tick's geometry
-     * update. Scratch + instance buffers are freed afterwards; the returned TLAS is the caller's to own.
+     * Record a batch into a command buffer: every BLAS build, an acceleration-structure barrier
+     * (the TLAS reads the BLAS the builds just wrote), then the TLAS build.
      */
-    public static RtAccel buildBatch(RtContext ctx, List<PreparedBlas> blasToBuild, List<Instance> instances) {
-        PreparedTlas tlas = prepareTlas(ctx, instances);
-        ctx.submitSync(cmd -> {
-            for (PreparedBlas b : blasToBuild) {
-                try (MemoryStack stack = MemoryStack.stackPush()) { // per-iteration: avoid 64 KB stack overflow
-                    recordBlasBuild(cmd, stack, b);
-                }
+    public static void recordBatch(VkCommandBuffer cmd, PreparedBatch batch) {
+        for (PreparedBlas b : batch.blas) {
+            try (MemoryStack stack = MemoryStack.stackPush()) { // per-iteration: avoid 64 KB stack overflow
+                recordBlasBuild(cmd, stack, b);
             }
-            try (MemoryStack stack = MemoryStack.stackPush()) {
-                if (!blasToBuild.isEmpty()) {
-                    VkMemoryBarrier.Buffer bar = VkMemoryBarrier.calloc(1, stack).sType$Default()
-                            .srcAccessMask(VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR)
-                            .dstAccessMask(VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);
-                    VK10.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-                            VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, 0, bar, null, null);
-                }
-                VkAccelerationStructureBuildGeometryInfoKHR.Buffer build = tlasBuildInfo(stack, tlas.instanceBuffer.deviceAddress);
-                build.get(0).dstAccelerationStructure(tlas.accel.handle);
-                build.get(0).scratchData().deviceAddress(tlas.scratch.deviceAddress);
-                VkAccelerationStructureBuildRangeInfoKHR.Buffer range = VkAccelerationStructureBuildRangeInfoKHR.calloc(1, stack);
-                range.get(0).primitiveCount(tlas.instanceCount).primitiveOffset(0).firstVertex(0).transformOffset(0);
-                PointerBuffer ppRange = stack.mallocPointer(1).put(0, range.address());
-                vkCmdBuildAccelerationStructuresKHR(cmd, build, ppRange);
+        }
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            if (!batch.blas.isEmpty()) {
+                VkMemoryBarrier.Buffer bar = VkMemoryBarrier.calloc(1, stack).sType$Default()
+                        .srcAccessMask(VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR)
+                        .dstAccessMask(VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);
+                VK10.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, 0, bar, null, null);
             }
-        });
-        for (PreparedBlas b : blasToBuild) {
+            PreparedTlas tlas = batch.preparedTlas;
+            VkAccelerationStructureBuildGeometryInfoKHR.Buffer build = tlasBuildInfo(stack, tlas.instanceBuffer.deviceAddress);
+            build.get(0).dstAccelerationStructure(tlas.accel.handle);
+            build.get(0).scratchData().deviceAddress(tlas.scratch.deviceAddress);
+            VkAccelerationStructureBuildRangeInfoKHR.Buffer range = VkAccelerationStructureBuildRangeInfoKHR.calloc(1, stack);
+            range.get(0).primitiveCount(tlas.instanceCount).primitiveOffset(0).firstVertex(0).transformOffset(0);
+            PointerBuffer ppRange = stack.mallocPointer(1).put(0, range.address());
+            vkCmdBuildAccelerationStructuresKHR(cmd, build, ppRange);
+        }
+    }
+
+    /** Free a batch's transient scratch + instance buffers (only after the build has completed). */
+    public static void freeBatchScratch(PreparedBatch batch) {
+        for (PreparedBlas b : batch.blas) {
             b.scratch.destroy();
         }
-        tlas.scratch.destroy();
-        tlas.instanceBuffer.destroy();
-        return tlas.accel;
+        batch.preparedTlas.scratch.destroy();
+        batch.preparedTlas.instanceBuffer.destroy();
+    }
+
+    /**
+     * Build a batch synchronously (one {@code submitSync} → one queue drain). The async path uses
+     * {@link #prepareBatch} + {@link #recordBatch} + {@link #freeBatchScratch} via {@code submitAsync}.
+     */
+    public static RtAccel buildBatch(RtContext ctx, List<PreparedBlas> blasToBuild, List<Instance> instances) {
+        PreparedBatch batch = prepareBatch(ctx, blasToBuild, instances);
+        ctx.submitSync(cmd -> recordBatch(cmd, batch));
+        freeBatchScratch(batch);
+        return batch.tlas;
     }
 
     private static void recordBlasBuild(VkCommandBuffer cmd, MemoryStack stack, PreparedBlas b) {
