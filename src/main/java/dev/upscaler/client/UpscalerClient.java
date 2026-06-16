@@ -3,10 +3,8 @@ package dev.upscaler.client;
 import dev.upscaler.UpscalerMod;
 import dev.upscaler.rt.RtContext;
 import dev.upscaler.rt.RtDeviceBringup;
-import dev.upscaler.rt.RtSelfTest;
 import dev.upscaler.rt.RtComposite;
 import dev.upscaler.rt.RtTerrain;
-import dev.upscaler.rt.RtTriangleScene;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
@@ -21,14 +19,10 @@ public final class UpscalerClient implements ClientModInitializer {
 		// The GpuDevice exists well before the first tick, so a one-shot at tick start
 		// runs on the render thread with the device idle between frames.
 		ClientTickEvents.START_CLIENT_TICK.register(client -> {
-			// Build the RT triangle scene once (also what RtComposite traces); self-test the path.
+			// Bring up the RT device/context once; terrain residency + the composite follow below.
 			if (!rtInitDone && RtDeviceBringup.rtRequested()) {
 				RtContext ctx = RtContext.get();
 				if (ctx != null) {
-					RtTriangleScene scene = RtTriangleScene.get(ctx);
-					if (RtSelfTest.ENABLED) {
-						RtSelfTest.run(ctx, scene.tlas());
-					}
 					rtInitDone = true;
 				}
 			}
@@ -52,10 +46,6 @@ public final class UpscalerClient implements ClientModInitializer {
 				RtTerrain.shutdown(ctx);
 			}
 			RtComposite.INSTANCE.destroy();
-			RtTriangleScene scene = RtTriangleScene.currentOrNull();
-			if (scene != null) {
-				scene.destroy();
-			}
 			if (ctx != null) {
 				ctx.destroy();
 			}

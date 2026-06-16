@@ -35,9 +35,9 @@ import java.nio.LongBuffer;
  * display-res image. With RR disabled the trace runs at 1:1 and a linear blit stands in for the
  * upscale (a raw, noisy reference). The vanilla world is rendered at full res (see WorldRenderScaler).
  *
- * <p>When {@link RtTerrain} has been extracted (P1), traces real terrain with perspective camera
- * rays (camera matrices captured each frame via {@link #captureFrame}); otherwise falls back to
- * the P0 triangle. Pipelines/SBT/descriptors are built once; sized images rebuilt on resize.
+ * <p>Traces the extracted {@link RtTerrain} with perspective camera rays (camera matrices captured
+ * each frame via {@link #captureFrame}); composites nothing until terrain is available.
+ * Pipelines/SBT/descriptors are built once; sized images rebuilt on resize.
  */
 public final class RtComposite {
     public static final RtComposite INSTANCE = new RtComposite();
@@ -88,7 +88,6 @@ public final class RtComposite {
         return frameCounter;
     }
 
-    private RtPipeline trianglePipeline;
     private RtPipeline worldPipeline;
     private RtBlendPipeline blendPipeline;
     private RtImage output;
@@ -121,7 +120,6 @@ public final class RtComposite {
     private float mvCamDeltaY;
     private float mvCamDeltaZ;
     private boolean mvHasPrev;
-    private long boundTriangleTlas;
     private long boundWorldTlas;
     private long atlasSampler;
     private boolean failed;
@@ -157,24 +155,21 @@ public final class RtComposite {
         if (ctx == null) {
             return false;
         }
-        boolean useWorld = RtTerrain.currentOrNull() != null && frameCaptured;
-        if (!useWorld && RtTriangleScene.currentOrNull() == null) {
-            return false; // nothing to trace yet
+        if (RtTerrain.currentOrNull() == null || !frameCaptured) {
+            return false; // no terrain extracted yet
         }
         try {
             if (blendPipeline == null) {
                 blendPipeline = RtBlendPipeline.create(ctx);
             }
             ensureOutput(ctx, width, height);
-            RtPipeline active = useWorld ? ensureWorld(ctx) : ensureTriangle(ctx);
-            if (useWorld) {
-                updateMotion();
-            }
-            recordFrame(active, useWorld, nativeColor);
+            RtPipeline active = ensureWorld(ctx);
+            updateMotion();
+            recordFrame(active, nativeColor);
             if (!loggedActive) {
                 loggedActive = true;
-                UpscalerMod.LOGGER.info("RT composite active ({}): {}x{}, RT blended at {} over the world target",
-                        useWorld ? "terrain" : "triangle", width, height, BLEND);
+                UpscalerMod.LOGGER.info("RT composite active (terrain): {}x{}, RT blended at {} over the world target",
+                        width, height, BLEND);
             }
             return true;
         } catch (Throwable t) {
@@ -201,21 +196,6 @@ public final class RtComposite {
             boundWorldTlas = tlas;
         }
         return worldPipeline;
-    }
-
-    private RtPipeline ensureTriangle(RtContext ctx) {
-        if (trianglePipeline == null) {
-            trianglePipeline = RtPipeline.create(ctx, "triangle.rgen.spv", "triangle.rmiss.spv", "triangle.rchit.spv");
-            if (output != null) {
-                trianglePipeline.setStorageImage(output.view);
-            }
-        }
-        long tlas = RtTriangleScene.currentOrNull().tlas();
-        if (boundTriangleTlas != tlas) {
-            trianglePipeline.setTlas(tlas);
-            boundTriangleTlas = tlas;
-        }
-        return trianglePipeline;
     }
 
     /** Bind the three guide buffers into the world pipeline's extra storage-image slots (0..2). */
@@ -293,9 +273,6 @@ public final class RtComposite {
         rrOutput = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT);
 
         mvHasPrev = false; // recreated images -> first MV frame is zero
-        if (trianglePipeline != null) {
-            trianglePipeline.setStorageImage(output.view);
-        }
         if (worldPipeline != null) {
             worldPipeline.setStorageImage(output.view);
             bindGuideImages();
@@ -328,14 +305,14 @@ public final class RtComposite {
         mvHasPrev = true;
     }
 
-    private void recordFrame(RtPipeline active, boolean useWorld, GpuTexture nativeColor) {
+    private void recordFrame(RtPipeline active, GpuTexture nativeColor) {
         long dstImage = vkImage(nativeColor);
         var encoder = (VulkanCommandEncoder) ((CommandEncoderAccessor) RenderSystem.getDevice().createCommandEncoder()).upscaler$getBackend();
         VkCommandBuffer cmd = encoder.allocateAndBeginTransientCommandBuffer();
         try (MemoryStack stack = MemoryStack.stackPush()) {
             // RR drives the upscale: trace + jitter at render res, DLSS-RR denoises+upscales to display.
             // Jitter is suppressed for the no-RR reference and for the debug guide views (raw inspection).
-            boolean rrPath = useWorld && RtDlssRr.ENABLED && DEBUG_VIEW == 0;
+            boolean rrPath = RtDlssRr.ENABLED && DEBUG_VIEW == 0;
             float jitterX = 0f;
             float jitterY = 0f;
             if (rrPath) {
@@ -345,41 +322,33 @@ public final class RtComposite {
             }
 
             boolean rrDone = false;
-            if (useWorld) {
-                RtTerrain terrain = RtTerrain.currentOrNull();
-                ByteBuffer push = stack.malloc(WORLD_PUSH_SIZE);
-                new Matrix4f(frameProjection).mul(frameViewRotation).invert().get(0, push);
-                push.putFloat(64, (float) (camX - terrain.blockX));
-                push.putFloat(68, (float) (camY - terrain.blockY));
-                push.putFloat(72, (float) (camZ - terrain.blockZ));
-                push.putLong(80, terrain.tableAddress());
-                push.putInt(88, DEBUG_VIEW);
-                push.putInt(92, (int) frameCounter); // per-frame RNG variation for the denoiser
-                mvPushMatrix.get(96, push);
-                push.putFloat(160, mvCamDeltaX);
-                push.putFloat(164, mvCamDeltaY);
-                push.putFloat(168, mvCamDeltaZ);
-                push.putInt(172, SPP);
-                push.putFloat(176, jitterX);
-                push.putFloat(180, jitterY);
-                active.trace(cmd, renderW, renderH, push);
-                // P4.2b: DLSS-RR denoise + upscale. The RT pass wrote noisy color (render res) + guides;
-                // RR reads them and writes the display-res denoised result straight into rrOutput, which
-                // the blend reads. No copy-back: render and display sizes now differ.
-                if (rrPath && RtDlssRr.INSTANCE.ensureFeature(cmd.address(), renderW, renderH, displayW, displayH)) {
-                    VulkanCommandEncoder.memoryBarrier(cmd, stack); // RT writes visible to DLSS reads
-                    // Jitter sign convention. The DLSS guide (3.7.2/3.7.3) defines InJitterOffset as the
-                    // jitter added to the PROJECTION MATRIX and treats its sign as engine-dependent (hence
-                    // the F9 "negate" debug hotkey). We don't jitter the projection — we offset the
-                    // primary-ray sample (jndc = uv + jitter/size), which is equivalent to a projection
-                    // jitter of -jitter, so we report -jitter. Not stated in the doc; derived, and matched
-                    // to the mcvr reference, which uses the identical sample-offset mechanism and reports
-                    // -cameraJitter. The shader push above uses +jitter; report -jitter here.
-                    rrDone = RtDlssRr.INSTANCE.evaluate(cmd.address(), output, gDepth, gMotion, gAlbedo,
-                            gSpecAlbedo, gNormal, rrOutput, renderW, renderH, displayW, displayH, -jitterX, -jitterY);
-                }
-            } else {
-                active.trace(cmd, renderW, renderH);
+            RtTerrain terrain = RtTerrain.currentOrNull();
+            ByteBuffer push = stack.malloc(WORLD_PUSH_SIZE);
+            new Matrix4f(frameProjection).mul(frameViewRotation).invert().get(0, push);
+            push.putFloat(64, (float) (camX - terrain.blockX));
+            push.putFloat(68, (float) (camY - terrain.blockY));
+            push.putFloat(72, (float) (camZ - terrain.blockZ));
+            push.putLong(80, terrain.tableAddress());
+            push.putInt(88, DEBUG_VIEW);
+            push.putInt(92, (int) frameCounter); // per-frame RNG variation for the denoiser
+            mvPushMatrix.get(96, push);
+            push.putFloat(160, mvCamDeltaX);
+            push.putFloat(164, mvCamDeltaY);
+            push.putFloat(168, mvCamDeltaZ);
+            push.putInt(172, SPP);
+            push.putFloat(176, jitterX);
+            push.putFloat(180, jitterY);
+            active.trace(cmd, renderW, renderH, push);
+            // P4.2b: DLSS-RR denoise + upscale. The RT pass wrote noisy color (render res) + guides;
+            // RR reads them and writes the display-res denoised result straight into rrOutput, which
+            // the blend reads. No copy-back: render and display sizes now differ.
+            if (rrPath && RtDlssRr.INSTANCE.ensureFeature(cmd.address(), renderW, renderH, displayW, displayH)) {
+                VulkanCommandEncoder.memoryBarrier(cmd, stack); // RT writes visible to DLSS reads
+                // DLSS expects the reported jitter to be the NEGATION of what was added to the
+                // primary ray (pixelCenter += jitter), matching the mcvr reference (apply +J, report
+                // -J). The shader push above uses +jitter; report -jitter here.
+                rrDone = RtDlssRr.INSTANCE.evaluate(cmd.address(), output, gDepth, gMotion, gAlbedo,
+                        gSpecAlbedo, gNormal, rrOutput, renderW, renderH, displayW, displayH, -jitterX, -jitterY);
             }
 
             // When DLSS-RR did not produce the display-res image (disabled, debug view, or a runtime
@@ -429,10 +398,6 @@ public final class RtComposite {
             worldPipeline.destroy();
             worldPipeline = null;
         }
-        if (trianglePipeline != null) {
-            trianglePipeline.destroy();
-            trianglePipeline = null;
-        }
         if (atlasSampler != 0L) {
             RtContext ctx = RtContext.currentOrNull();
             if (ctx != null) {
@@ -440,7 +405,6 @@ public final class RtComposite {
             }
             atlasSampler = 0L;
         }
-        boundTriangleTlas = 0L;
         boundWorldTlas = 0L;
     }
 
