@@ -59,7 +59,10 @@ layout(push_constant) uniform Push {
 vec3 gv_normal;
 vec3 gv_albedo;
 float gv_rough;
-float gv_depth;     // linear hit distance; < 0 on a primary-ray sky miss
+// Linear VIEW-SPACE depth (perpendicular distance from the camera plane), computed in main() from
+// gv_hitCamRel · camForward — this is what DLSS-RR's Depth_Type_Linear wants, not the slant ray
+// length. Always >= 0; sky resolves to a large far value (no negative sentinel).
+float gv_depth;
 vec3 gv_hitCamRel;  // hit position relative to the current camera (for motion-vector reprojection)
 
 struct Payload {
@@ -134,8 +137,7 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed) {
                 gv_normal = vec3(0.0);
                 gv_albedo = payload.albedo;
                 gv_rough = 1.0;
-                gv_depth = -1.0;
-                gv_hitCamRel = rd * 1.0e6; // sky at infinity: only rotation parallax
+                gv_hitCamRel = rd * 1.0e6; // sky at infinity: only rotation parallax (-> large far depth)
             }
             L += throughput * payload.albedo * SKY_GAIN; // escaped to sky
             break;
@@ -149,7 +151,6 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed) {
             gv_normal = n;
             gv_albedo = albedo;
             gv_rough = 1.0; // Lambertian for now (PBR roughness arrives in P6)
-            gv_depth = payload.hitT;
             gv_hitCamRel = ro + rd * payload.hitT - pc.camOffset; // camera-relative hit position
         }
 
@@ -205,6 +206,13 @@ void main() {
     vec3 origin = nearP + pc.camOffset;
     vec3 dir = normalize(farP - nearP);
 
+    // Camera forward (unit view direction at the unjittered screen centre). Used below to convert the
+    // slant ray distance into linear view-space depth (perpendicular distance from the camera plane),
+    // which is what DLSS-RR's Depth_Type_Linear expects.
+    vec4 cFarH = pc.invViewProj * vec4(0.0, 0.0, 0.0, 1.0);
+    vec4 cNearH = pc.invViewProj * vec4(0.0, 0.0, 1.0, 1.0);
+    vec3 camForward = normalize(cFarH.xyz / cFarH.w - cNearH.xyz / cNearH.w);
+
     uint seed = (uint(pix.x) * 1973u + uint(pix.y) * 9277u + 26699u) ^ (pc.frameIndex * 2654435761u);
 
     uint spp = max(pc.spp, 1u);
@@ -215,6 +223,11 @@ void main() {
     }
     frameRadiance /= float(spp);
 
+    // Linear view-space depth for DLSS-RR (P4.3): perpendicular distance from the camera plane to the
+    // first hit = camera-relative hit projected onto the view direction. Non-inverted (near 0, far
+    // large), so DLSS feature flag DepthInverted stays unset. Sky's far gv_hitCamRel -> large depth.
+    gv_depth = dot(gv_hitCamRel, camForward);
+
     // P4.0a guide buffers: first-hit attributes for the denoiser / DLSS-RR (written every frame).
     imageStore(gNormal, pix, vec4(gv_normal, gv_rough));
     imageStore(gAlbedo, pix, vec4(gv_albedo, 1.0));
@@ -222,10 +235,13 @@ void main() {
     imageStore(gSpecAlbedo, pix, vec4(0.0)); // diffuse-only path tracer: no specular albedo
 
     // P4.0b motion vector: reproject this surface point through the previous frame's view-projection.
-    // curNdc is the pixel centre (the ray was cast through it), so MV is just prevNdc - curNdc, scaled
-    // from NDC into render-pixel space.
+    // The primary ray was cast through the JITTERED ndc (jndc), so this hit's current screen position is
+    // jndc, NOT the pixel centre. Subtract jndc so the MV is jitter-free (= 0 when static), which is what
+    // DLSS expects with MVJittered unset. (Subtracting the unjittered centre leaked the per-frame jitter
+    // into the MV as a constant screen-wide offset = pc.jitter.) Matches mcvr's computeCameraMotionVector,
+    // which subtracts the jittered pixelCenter. Scaled from NDC into render-pixel space.
     vec4 prevClip = pc.prevViewProj * vec4(gv_hitCamRel + pc.camDelta, 1.0);
-    vec2 motion = (prevClip.xy / prevClip.w - ndc) * 0.5 * size;
+    vec2 motion = (prevClip.xy / prevClip.w - jndc) * 0.5 * size;
     imageStore(gMotion, pix, vec4(motion, 0.0, 0.0));
 
     // Debug guide-buffer visualization: bypass accumulation and show a guide directly.
@@ -236,7 +252,7 @@ void main() {
         } else if (pc.debugView == 2u) {
             dbg = gv_albedo;                        // diffuse albedo
         } else if (pc.debugView == 3u) {
-            dbg = vec3(gv_depth < 0.0 ? 0.0 : gv_depth / 64.0); // linear depth, 64-block normalize
+            dbg = vec3(min(gv_depth / 64.0, 1.0)); // linear view depth, 64-block normalize (sky -> white)
         } else if (pc.debugView == 4u) {
             dbg = vec3(gv_rough);                   // roughness
         } else {

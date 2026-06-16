@@ -75,9 +75,9 @@ public final class RtComposite {
 
     private static float parseRenderScale() {
         try {
-            return Math.clamp(Float.parseFloat(System.getProperty("upscaler.rt.renderScale", "0.6667")), 0.25f, 1f);
+            return Math.clamp(Float.parseFloat(System.getProperty("upscaler.rt.renderScale", "0.5")), 0.25f, 1f);
         } catch (NumberFormatException e) {
-            return 0.6667f;
+            return 0.5f;
         }
     }
 
@@ -368,8 +368,15 @@ public final class RtComposite {
                 // the blend reads. No copy-back: render and display sizes now differ.
                 if (rrPath && RtDlssRr.INSTANCE.ensureFeature(cmd.address(), renderW, renderH, displayW, displayH)) {
                     VulkanCommandEncoder.memoryBarrier(cmd, stack); // RT writes visible to DLSS reads
+                    // Jitter sign convention. The DLSS guide (3.7.2/3.7.3) defines InJitterOffset as the
+                    // jitter added to the PROJECTION MATRIX and treats its sign as engine-dependent (hence
+                    // the F9 "negate" debug hotkey). We don't jitter the projection — we offset the
+                    // primary-ray sample (jndc = uv + jitter/size), which is equivalent to a projection
+                    // jitter of -jitter, so we report -jitter. Not stated in the doc; derived, and matched
+                    // to the mcvr reference, which uses the identical sample-offset mechanism and reports
+                    // -cameraJitter. The shader push above uses +jitter; report -jitter here.
                     rrDone = RtDlssRr.INSTANCE.evaluate(cmd.address(), output, gDepth, gMotion, gAlbedo,
-                            gSpecAlbedo, gNormal, rrOutput, renderW, renderH, displayW, displayH, jitterX, jitterY);
+                            gSpecAlbedo, gNormal, rrOutput, renderW, renderH, displayW, displayH, -jitterX, -jitterY);
                 }
             } else {
                 active.trace(cmd, renderW, renderH);
