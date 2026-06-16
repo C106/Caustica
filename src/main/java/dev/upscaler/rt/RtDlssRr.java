@@ -18,10 +18,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 
 /**
- * DLSS Ray Reconstruction backend for the RT renderer. Where {@link dev.upscaler.client.DlssPipeline}
- * runs DLSS Super Resolution over the rasterizer, this runs the DLSSD (Ray Reconstruction) feature
+ * DLSS Ray Reconstruction backend for the RT renderer. Runs the DLSSD (Ray Reconstruction) feature
  * over our path-traced color + guide buffers (normals/roughness, diffuse/specular albedo, depth,
- * motion vectors), denoising and (later, P4.2b) upscaling in one pass.
+ * motion vectors), denoising and upscaling (render res -> display res) in one pass.
  *
  * <p>P4.2a wired NGX init, the RR-available gate, and feature creation. P4.2b adds the render-res
  * split (trace render res &lt; display res, RR upscales to display) and sub-pixel camera jitter.

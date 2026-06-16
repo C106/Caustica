@@ -1,31 +1,18 @@
 package dev.upscaler.client;
 
 /**
- * Backend-independent sub-pixel camera jitter.
+ * Sub-pixel camera jitter for DLSS Ray Reconstruction.
  *
- * <p>Both FSR and DLSS need the projection jittered each frame with a low-discrepancy
- * sequence, the same offset reported back to the upscaler. Previously this lived
- * inside the FSR pipeline and was sourced from the FFX runtime — which meant that
- * with DLSS active (and no FFX context created) the jitter silently fell back to
- * zero, leaving DLSS with no sub-pixel information and shaky/aliased edges.
- *
- * <p>This provider generates the same Halton(2,3) sequence FFX uses internally,
- * with the same phase-count rule {@code ceil(8 * (display/render)^2)}, independent
- * of any native upscaler context.
+ * <p>Generates a Halton(2,3) low-discrepancy sequence in render-pixel space, with the phase-count rule
+ * {@code ceil(8 * (display/render)^2)}. {@link dev.upscaler.rt.RtComposite} reads the per-frame offset,
+ * applies it to the primary ray in the path-tracing shader, and reports it to DLSS-RR's evaluate.
  */
 public final class UpscalerJitter {
 	public static final UpscalerJitter INSTANCE = new UpscalerJitter();
 
-	// Sign of the clip-space jitter applied to the projection. Validated for FSR
-	// as (+1, -1) (Vulkan Y-down). The reported pixel offset is sign-independent.
-	private final float signX = Float.parseFloat(System.getProperty("upscaler.jitterSignX", "1"));
-	private final float signY = Float.parseFloat(System.getProperty("upscaler.jitterSignY", "-1"));
-
 	private int frameIndex;
 	private float pixelsX;
 	private float pixelsY;
-	private float ndcX;
-	private float ndcY;
 
 	private UpscalerJitter() {
 	}
@@ -34,31 +21,17 @@ public final class UpscalerJitter {
 	public void prepare(int renderWidth, int renderHeight, int displayWidth) {
 		int phaseCount = jitterPhaseCount(renderWidth, displayWidth);
 		int index = (this.frameIndex++ % phaseCount) + 1; // Halton(0) is degenerate
-		float ox = halton(index, 2) - 0.5f;
-		float oy = halton(index, 3) - 0.5f;
-
-		this.pixelsX = ox;
-		this.pixelsY = oy;
-		this.ndcX = this.signX * 2.0f * ox / renderWidth;
-		this.ndcY = this.signY * 2.0f * oy / renderHeight;
+		this.pixelsX = halton(index, 2) - 0.5f;
+		this.pixelsY = halton(index, 3) - 0.5f;
 	}
 
-	/** Jitter offset in render-pixel space, as reported to the upscaler's evaluate. */
+	/** Jitter offset in render-pixel space, applied to the primary ray and reported to RR evaluate. */
 	public float jitterPixelsX() {
 		return this.pixelsX;
 	}
 
 	public float jitterPixelsY() {
 		return this.pixelsY;
-	}
-
-	/** Clip-space jitter translation applied to the level projection matrix. */
-	public float jitterNdcX() {
-		return this.ndcX;
-	}
-
-	public float jitterNdcY() {
-		return this.ndcY;
 	}
 
 	private static int jitterPhaseCount(int renderWidth, int displayWidth) {

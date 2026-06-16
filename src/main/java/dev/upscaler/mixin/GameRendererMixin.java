@@ -1,9 +1,6 @@
 package dev.upscaler.mixin;
 
 import com.mojang.blaze3d.pipeline.RenderTarget;
-import dev.upscaler.client.DlssPipeline;
-import dev.upscaler.client.FsrPipeline;
-import dev.upscaler.client.UpscalerJitter;
 import dev.upscaler.client.WorldRenderScaler;
 import dev.upscaler.rt.RtComposite;
 import net.minecraft.client.DeltaTracker;
@@ -48,38 +45,18 @@ public abstract class GameRendererMixin {
 		WorldRenderScaler.INSTANCE.end(this.mainRenderTarget);
 	}
 
-	// Sub-pixel camera jitter (M3): premultiply a clip-space translation onto the
-	// level projection matrix as it is uploaded. Only the Matrix4f getBuffer
-	// overload is the level projection (the 3D-HUD call uses the Projection
-	// overload); the frustum-culling matrices are built elsewhere from the
-	// unmodified cameraState matrix and stay unjittered.
+	// Capture the frame's camera for the RT composite at the exact point the level projection is built
+	// (this projection already includes view bobbing, exactly as rendered). The RT path jitters the
+	// primary ray in the shader, so the projection matrix itself is left unmodified — we only read it.
 	@ModifyArg(method = "renderLevel(Lnet/minecraft/client/DeltaTracker;)V",
 			at = @At(value = "INVOKE",
 					target = "Lnet/minecraft/client/renderer/ProjectionMatrixBuffer;getBuffer(Lorg/joml/Matrix4f;)Lcom/mojang/blaze3d/buffers/GpuBufferSlice;"),
 			index = 0)
-	private Matrix4f upscaler$jitterLevelProjection(Matrix4f projection) {
-		if (!WorldRenderScaler.INSTANCE.isEnabled()) {
-			return projection;
-		}
-
-		// Capture the unjittered frame matrices for the MV reprojection pass
-		// (this projection already includes view bobbing, exactly as rendered).
+	private Matrix4f upscaler$captureLevelProjection(Matrix4f projection) {
 		var cameraState = this.gameRenderState().levelRenderState.cameraRenderState;
-		FsrPipeline.INSTANCE.captureFrame(projection, cameraState.viewRotationMatrix, cameraState.pos, cameraState.depthFar);
-		DlssPipeline.INSTANCE.captureFrame(projection, cameraState.viewRotationMatrix, cameraState.pos);
 		RtComposite.INSTANCE.captureFrame(projection, cameraState.viewRotationMatrix,
 				cameraState.pos.x, cameraState.pos.y, cameraState.pos.z);
-		if (RtComposite.ENABLED) {
-			// RT compare: skip jitter so the ray-traced terrain aligns pixel-perfectly with vanilla.
-			return projection;
-		}
-
-		float jx = UpscalerJitter.INSTANCE.jitterNdcX();
-		float jy = UpscalerJitter.INSTANCE.jitterNdcY();
-		if (jx == 0.0f && jy == 0.0f) {
-			return projection;
-		}
-		return new Matrix4f().translation(jx, jy, 0.0f).mul(projection);
+		return projection;
 	}
 
 	// Primary end-of-window: right after the 3D-HUD projection is set and *before*

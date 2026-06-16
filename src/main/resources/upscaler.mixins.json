@@ -8,7 +8,6 @@
 		"GameRendererMixin",
 		"GpuDeviceAccessor",
 		"LevelExtractorMixin",
-		"RenderTargetAccessor",
 		"VulkanBackendMixin",
 		"VulkanGpuTextureAccessor"
 	],

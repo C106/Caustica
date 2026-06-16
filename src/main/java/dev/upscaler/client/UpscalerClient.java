@@ -12,7 +12,6 @@ import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 
 public final class UpscalerClient implements ClientModInitializer {
-	private static boolean smokeTestDone = false;
 	private static boolean rtInitDone = false;
 
 	@Override
@@ -22,11 +21,6 @@ public final class UpscalerClient implements ClientModInitializer {
 		// The GpuDevice exists well before the first tick, so a one-shot at tick start
 		// runs on the render thread with the device idle between frames.
 		ClientTickEvents.START_CLIENT_TICK.register(client -> {
-			if (!smokeTestDone) {
-				FsrSmokeTest.run();
-				DlssSmokeTest.run();
-				smokeTestDone = true;
-			}
 			// Build the RT triangle scene once (also what RtComposite traces); self-test the path.
 			if (!rtInitDone && RtDeviceBringup.rtRequested()) {
 				RtContext ctx = RtContext.get();
@@ -50,8 +44,6 @@ public final class UpscalerClient implements ClientModInitializer {
 		});
 
 		ClientLifecycleEvents.CLIENT_STOPPING.register(client -> {
-			DlssPipeline.INSTANCE.destroy();
-			FsrPipeline.INSTANCE.destroy();
 			WorldRenderScaler.INSTANCE.destroy();
 
 			RtContext ctx = RtContext.currentOrNull();

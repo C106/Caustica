@@ -3,7 +3,7 @@
 	"id": "upscaler",
 	"version": "${version}",
 	"name": "Sodium Upscaler",
-	"description": "Temporal upscaling (FSR, later DLSS) for the Minecraft Vulkan backend.",
+	"description": "Hardware-ray-traced renderer with DLSS Ray Reconstruction for the Minecraft Vulkan backend.",
 	"authors": [
 		"i"
 	],
