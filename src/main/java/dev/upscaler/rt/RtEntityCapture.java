@@ -25,6 +25,10 @@ public final class RtEntityCapture implements VertexConsumer {
     // Probe stats (step 1): captured bounds + a flag, reset per entity.
     float minX, minY, minZ, maxX, maxY, maxZ;
     boolean any;
+    // P5.1b-2b: the bindless texture slot for the geometry currently being submitted (set by the
+    // collector per submitModel, so body + feature layers get their own texture). Stored per-prim in
+    // tint.w; the hit shader samples entityTex[texSlot].
+    int currentTexSlot;
 
     private int n; // quad vertex accumulator (0..3)
     private final float[] qx = new float[4], qy = new float[4], qz = new float[4];
@@ -40,6 +44,7 @@ public final class RtEntityCapture implements VertexConsumer {
         prim.clear();
         n = 0;
         any = false;
+        currentTexSlot = 0;
         minX = minY = minZ = Float.MAX_VALUE;
         maxX = maxY = maxZ = -Float.MAX_VALUE;
     }
@@ -109,7 +114,7 @@ public final class RtEntityCapture implements VertexConsumer {
             prim.add(tr);
             prim.add(tg);
             prim.add(tb);
-            prim.add(0f);
+            prim.add((float) currentTexSlot); // tint.w = bindless texture slot (P5.1b-2b)
         }
         any = true;
     }

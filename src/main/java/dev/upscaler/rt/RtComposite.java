@@ -195,12 +195,16 @@ public final class RtComposite {
         if (worldPipeline == null) {
             worldPipeline = RtPipeline.create(ctx, "world.rgen.spv",
                     new String[]{"world.rmiss.spv", "shadow.rmiss.spv"}, "world.rchit.spv", "world.rahit.spv",
-                    WORLD_PUSH_SIZE, true, GUIDE_COUNT);
+                    WORLD_PUSH_SIZE, true, GUIDE_COUNT, RtEntityTextures.MAX_TEXTURES);
             if (output != null) {
                 worldPipeline.setStorageImage(output.view);
                 bindGuideImages();
             }
             worldPipeline.setAtlasSampler(blockAtlasView(), atlasSampler(ctx));
+            // Bindless slot 0 = fallback texture (the block atlas) so an entity whose texture can't be
+            // resolved samples something defined rather than an unbound (partially-bound) descriptor.
+            RtEntityTextures.INSTANCE.reset();
+            worldPipeline.setBindlessTexture(0, blockAtlasView(), atlasSampler(ctx));
         }
         // The TLAS is no longer bound here — it's rebuilt and bound per frame in recordFrame (P5.1a),
         // since dynamic content (entities, P5.1b) animates the instance set every frame.
@@ -362,6 +366,8 @@ public final class RtComposite {
             RtEntities.FrameEntities fe = RtEntities.INSTANCE.beginFrame(ctx, terrain.staticInstances(),
                     terrain.blockX, terrain.blockY, terrain.blockZ, camX, camY, camZ, frameProjection, frameViewRotation);
             push.putLong(184, fe.geomTableAddr());
+            // Upload any entity textures registered this frame into the bindless set before the trace.
+            RtEntityTextures.INSTANCE.uploadPending(active, atlasSampler(ctx));
             // Build the entity BLAS this frame, then the TLAS that references them (+ the already-built
             // terrain BLAS), then the trace — each separated by a barrier. The frame TLAS is retired
             // KEEP_FRAMES later (entity meshes/BLAS are retired by RtEntities on the same horizon).

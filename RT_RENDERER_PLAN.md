@@ -305,8 +305,17 @@ to fill our own buffers — we do not consume its packed/culled render output.)
     geometry table `{primAddr, idxAddr, uvAddr, disp}` (48-byte ring) so `world.rchit` reads real
     per-triangle normals + vertex-colour tint + the per-object MV (the CUBE_N box path is removed);
     captured rebase-relative → identity instance transform. Per-frame BLAS/buffer churn is heavy (cap
-    `-Dupscaler.rt.maxEntities`; pooling/refit deferred). **P5.1b-2b:** entity textures (per-type files →
-    bindless/texture-array; captured UVs stored; flat vertex-colour until then).
+    `-Dupscaler.rt.maxEntities`; pooling/refit deferred).
+  - **P5.1b-2b — bindless entity textures.** Entities use per-type texture files (not the block atlas),
+    so each `RenderType`'s texture (resolved via the public `RenderType.prepare().textures()`) gets a
+    slot in a **bindless `sampler2D[]`** (descriptor set 1, partially-bound + update-after-bind; needs
+    the VK12 descriptor-indexing features, enabled in `RtDeviceBringup`). The capture stamps a per-prim
+    texture slot into the free `tint.w`; the hit shader interpolates the entity UV and samples
+    `entityTex[nonuniformEXT(slot)] × tint`. **Step b1 (done; commit pending): texture resolution
+    (`RtEntityTextures`) + probe — verified handles non-zero/distinct per type.** **Step b2 (in working
+    tree; compiles + shaders validate; needs a full restart for the device features):** the
+    descriptor-indexing features + bindless set + per-prim slot + UV sampling. Multi-texture layers
+    (armor/eyes) handled per-prim; held items still uncaptured.
 - **P6 — PBR materials.** LabPBR resource-pack ingestion (normal/roughness/metallic/
   emissive/SSS) + proper BRDF. Heuristic fallback when no PBR pack.
 - **P7 — Perf & polish.** AS compaction, SER tuning, texture-LOD via ray cones,

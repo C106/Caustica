@@ -125,6 +125,17 @@ public final class RtDeviceBringup {
         // bufferDeviceAddress merges into vanilla's existing Vulkan12Features struct.
         features.add(new VulkanFeature(VulkanBackend.VK12_FEATURES_STRUCT, "bufferDeviceAddress",
                 VkPhysicalDeviceVulkan12Features.BUFFERDEVICEADDRESS));
+        // P5.1b-2b bindless entity textures: a runtime-sized sampler2D[] indexed non-uniformly in the
+        // hit shader, with partially-bound + update-after-bind slots (a growing per-RenderType registry).
+        // Core on the VK 1.4 device; just needs enabling alongside bufferDeviceAddress on the same struct.
+        features.add(new VulkanFeature(VulkanBackend.VK12_FEATURES_STRUCT, "runtimeDescriptorArray",
+                VkPhysicalDeviceVulkan12Features.RUNTIMEDESCRIPTORARRAY));
+        features.add(new VulkanFeature(VulkanBackend.VK12_FEATURES_STRUCT, "shaderSampledImageArrayNonUniformIndexing",
+                VkPhysicalDeviceVulkan12Features.SHADERSAMPLEDIMAGEARRAYNONUNIFORMINDEXING));
+        features.add(new VulkanFeature(VulkanBackend.VK12_FEATURES_STRUCT, "descriptorBindingPartiallyBound",
+                VkPhysicalDeviceVulkan12Features.DESCRIPTORBINDINGPARTIALLYBOUND));
+        features.add(new VulkanFeature(VulkanBackend.VK12_FEATURES_STRUCT, "descriptorBindingSampledImageUpdateAfterBind",
+                VkPhysicalDeviceVulkan12Features.DESCRIPTORBINDINGSAMPLEDIMAGEUPDATEAFTERBIND));
         // shaderInt64: the world hit shader uses uint64_t buffer-reference addresses (Int64 capability).
         features.add(new VulkanFeature(VulkanBackend.VK10_FEATURES_STRUCT, "shaderInt64",
                 VkPhysicalDeviceFeatures.SHADERINT64));

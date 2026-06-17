@@ -38,10 +38,17 @@ import java.util.List;
  */
 public final class RtEntityCollector implements SubmitNodeCollector {
     private RtEntityCapture capture;
+    private RenderType firstRenderType; // P5.1b-2b: the entity's primary (body) render type → texture
 
     /** Point the collector at the capture buffer for the next {@code dispatcher.submit}. */
     public void begin(RtEntityCapture capture) {
         this.capture = capture;
+        this.firstRenderType = null;
+    }
+
+    /** The first render type submitted this capture (the body), used to resolve the entity texture. */
+    public RenderType firstRenderType() {
+        return firstRenderType;
     }
 
     @Override
@@ -51,6 +58,12 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         if (capture == null) {
             return;
         }
+        if (firstRenderType == null) {
+            firstRenderType = renderType;
+        }
+        // Resolve this submission's texture to a bindless slot; the capture stamps it on every prim it
+        // emits, so the body and each feature layer (armor, eyes, …) keep their own texture.
+        capture.currentTexSlot = RtEntityTextures.INSTANCE.slotFor(renderType);
         // Pose the model from its render state (idempotent re-pose; mirrors what the renderer does for
         // its feature layers), then render the posed parts into the capture. renderToBuffer applies the
         // PoseStack to every vertex/normal, so the capture receives world-/camera-relative geometry.

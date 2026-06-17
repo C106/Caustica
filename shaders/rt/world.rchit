@@ -2,6 +2,7 @@
 #extension GL_EXT_ray_tracing : require
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_nonuniform_qualifier : require
 
 // P2 closest-hit. Geometry is per-section: gl_InstanceCustomIndexEXT indexes a section table (BDA
 // array reached from the push constant) holding this section's {prim, index, uv} buffer addresses.
@@ -37,6 +38,9 @@ layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer Sec
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer EntityTable { EntityGeom e[]; };
 
 layout(binding = 2, set = 0) uniform sampler2D blockAtlas;
+// P5.1b-2b: bindless entity textures — a runtime-sized array indexed per-prim (tint.w) by the entity
+// hit path. Slot 0 is a fallback. Entities use per-type texture files, so each RenderType gets a slot.
+layout(binding = 0, set = 1) uniform sampler2D entityTex[];
 
 layout(push_constant) uniform Push {
     mat4 invViewProj;
@@ -70,7 +74,17 @@ void main() {
         if (dot(n, gl_WorldRayDirectionEXT) > 0.0) {
             n = -n; // orient toward the viewer, like the terrain path below
         }
-        payload.albedo = pr.tint.rgb; // captured vertex colour (white -> grey-lit) until P5.1b-2b textures
+        // Interpolate the captured entity-texture UV (same scheme as terrain) and sample the bindless
+        // per-type texture; tint.rgb is the model colour multiplier (white for most, tinted for sheep/etc.).
+        Indices eidxBuf = Indices(g.idxAddr);
+        UVs euv = UVs(g.uvAddr);
+        uint e0 = eidxBuf.i[3u * gl_PrimitiveID + 0u];
+        uint e1 = eidxBuf.i[3u * gl_PrimitiveID + 1u];
+        uint e2 = eidxBuf.i[3u * gl_PrimitiveID + 2u];
+        vec3 ebary = vec3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
+        vec2 euvCoord = ebary.x * euv.uv[e0] + ebary.y * euv.uv[e1] + ebary.z * euv.uv[e2];
+        int texSlot = int(pr.tint.w + 0.5);
+        payload.albedo = texture(entityTex[nonuniformEXT(texSlot)], euvCoord).rgb * pr.tint.rgb;
         payload.normal = n;
         payload.hitT = gl_HitTEXT;
         payload.emission = 0.0;

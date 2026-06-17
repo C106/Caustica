@@ -3,12 +3,14 @@ package dev.upscaler.rt;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
 import org.lwjgl.vulkan.VK10;
+import org.lwjgl.vulkan.VK12;
 import org.lwjgl.vulkan.VkCommandBuffer;
 import org.lwjgl.vulkan.VkDescriptorImageInfo;
 import org.lwjgl.vulkan.VkDescriptorPoolCreateInfo;
 import org.lwjgl.vulkan.VkDescriptorPoolSize;
 import org.lwjgl.vulkan.VkDescriptorSetAllocateInfo;
 import org.lwjgl.vulkan.VkDescriptorSetLayoutBinding;
+import org.lwjgl.vulkan.VkDescriptorSetLayoutBindingFlagsCreateInfo;
 import org.lwjgl.vulkan.VkDescriptorSetLayoutCreateInfo;
 import org.lwjgl.vulkan.VkDevice;
 import org.lwjgl.vulkan.VkPipelineShaderStageCreateInfo;
@@ -72,9 +74,17 @@ public final class RtPipeline {
     private final int pushConstantSize;
     private final int pushConstantStages;
     private final int firstExtraBinding;
+    // P5.1b-2b bindless entity textures: an optional second descriptor set (set 1) holding a runtime
+    // sampler2D[] the closest-hit indexes per-prim. Single (not ringed) + update-after-bind: the
+    // RenderType→slot registry is append-only, so existing slots never change and new slots are written
+    // before the frame that uses them. 0 when the pipeline was created without bindless textures.
+    private final long bindlessLayout;
+    private final long bindlessPool;
+    private final long bindlessSet;
     private boolean destroyed;
 
-    private RtPipeline(RtContext ctx, long dsl, long pool, long[] sets, long layout, long pipeline, RtBuffer sbt, long stride, int missCount, int pushConstantSize, int pushConstantStages, int firstExtraBinding) {
+    private RtPipeline(RtContext ctx, long dsl, long pool, long[] sets, long layout, long pipeline, RtBuffer sbt, long stride, int missCount, int pushConstantSize, int pushConstantStages, int firstExtraBinding,
+                       long bindlessLayout, long bindlessPool, long bindlessSet) {
         this.ctx = ctx;
         this.descriptorSetLayout = dsl;
         this.descriptorPool = pool;
@@ -88,6 +98,9 @@ public final class RtPipeline {
         this.pushConstantSize = pushConstantSize;
         this.pushConstantStages = pushConstantStages;
         this.firstExtraBinding = firstExtraBinding;
+        this.bindlessLayout = bindlessLayout;
+        this.bindlessPool = bindlessPool;
+        this.bindlessSet = bindlessSet;
     }
 
     /**
@@ -98,7 +111,7 @@ public final class RtPipeline {
      * images at bindings 3.. (the P4 guide buffers: normal/roughness, albedo, depth, motion vectors);
      * write them with {@link #setExtraStorageImage}.
      */
-    public static RtPipeline create(RtContext ctx, String rgen, String[] rmiss, String rchit, String rahit, int pushConstantSize, boolean withAtlasSampler, int extraStorageImages) {
+    public static RtPipeline create(RtContext ctx, String rgen, String[] rmiss, String rchit, String rahit, int pushConstantSize, boolean withAtlasSampler, int extraStorageImages, int bindlessTextures) {
         VkDevice vk = ctx.vk();
         boolean hasAhit = rahit != null;
         try (MemoryStack stack = MemoryStack.stackPush()) {
@@ -145,7 +158,34 @@ public final class RtPipeline {
             long[] sets = new long[RING];
             pSet.get(sets);
 
-            VkPipelineLayoutCreateInfo plci = VkPipelineLayoutCreateInfo.calloc(stack).sType$Default().pSetLayouts(stack.longs(dsl));
+            // P5.1b-2b: optional bindless set (set 1) — a partially-bound, update-after-bind
+            // combined-image-sampler array the closest-hit samples per-prim for entity textures.
+            long bindlessLayout = 0L, bindlessPool = 0L, bindlessSet = 0L;
+            if (bindlessTextures > 0) {
+                VkDescriptorSetLayoutBinding.Buffer bl = VkDescriptorSetLayoutBinding.calloc(1, stack);
+                bl.get(0).binding(0).descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+                        .descriptorCount(bindlessTextures).stageFlags(VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR);
+                VkDescriptorSetLayoutBindingFlagsCreateInfo bf = VkDescriptorSetLayoutBindingFlagsCreateInfo.calloc(stack).sType$Default()
+                        .pBindingFlags(stack.ints(VK12.VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK12.VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT));
+                VkDescriptorSetLayoutCreateInfo bdslci = VkDescriptorSetLayoutCreateInfo.calloc(stack).sType$Default()
+                        .pNext(bf.address()).flags(VK12.VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT).pBindings(bl);
+                check(VK10.vkCreateDescriptorSetLayout(vk, bdslci, null, p), "vkCreateDescriptorSetLayout(bindless)");
+                bindlessLayout = p.get(0);
+                VkDescriptorPoolSize.Buffer bps = VkDescriptorPoolSize.calloc(1, stack);
+                bps.get(0).type(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(bindlessTextures);
+                VkDescriptorPoolCreateInfo bdpci = VkDescriptorPoolCreateInfo.calloc(stack).sType$Default()
+                        .flags(VK12.VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT).maxSets(1).pPoolSizes(bps);
+                check(VK10.vkCreateDescriptorPool(vk, bdpci, null, p), "vkCreateDescriptorPool(bindless)");
+                bindlessPool = p.get(0);
+                VkDescriptorSetAllocateInfo bdsai = VkDescriptorSetAllocateInfo.calloc(stack).sType$Default()
+                        .descriptorPool(bindlessPool).pSetLayouts(stack.longs(bindlessLayout));
+                LongBuffer bpSet = stack.mallocLong(1);
+                check(VK10.vkAllocateDescriptorSets(vk, bdsai, bpSet), "vkAllocateDescriptorSets(bindless)");
+                bindlessSet = bpSet.get(0);
+            }
+
+            VkPipelineLayoutCreateInfo plci = VkPipelineLayoutCreateInfo.calloc(stack).sType$Default()
+                    .pSetLayouts(bindlessTextures > 0 ? stack.longs(dsl, bindlessLayout) : stack.longs(dsl));
             // Push constants are visible to raygen + closest-hit (+ any-hit when present). vkCmdPushConstants
             // must be called with exactly these stages, so store them for trace().
             int pcStages = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR
@@ -225,7 +265,8 @@ public final class RtPipeline {
             for (int g = 0; g < groupCount; g++) {
                 MemoryUtil.memCopy(MemoryUtil.memAddress(handles) + (long) g * handleSize, sbt.mapped + g * stride, handleSize);
             }
-            return new RtPipeline(ctx, dsl, pool, sets, layout, pipeline, sbt, stride, missCount, pushConstantSize, pcStages, firstExtraBinding);
+            return new RtPipeline(ctx, dsl, pool, sets, layout, pipeline, sbt, stride, missCount, pushConstantSize, pcStages, firstExtraBinding,
+                    bindlessLayout, bindlessPool, bindlessSet);
         }
     }
 
@@ -287,6 +328,24 @@ public final class RtPipeline {
         }
     }
 
+    /** Write an entity texture into bindless slot {@code slot} (set 1, binding 0). Update-after-bind +
+     *  append-only, so this is safe to call mid-frame for a newly-registered slot before it's sampled. */
+    public void setBindlessTexture(int slot, long imageView, long sampler) {
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkDescriptorImageInfo.Buffer info = VkDescriptorImageInfo.calloc(1, stack);
+            info.get(0).sampler(sampler).imageView(imageView).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
+            VkWriteDescriptorSet.Buffer write = VkWriteDescriptorSet.calloc(1, stack);
+            write.get(0).sType$Default().dstSet(bindlessSet).dstBinding(0).dstArrayElement(slot)
+                    .descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).pImageInfo(info);
+            VK10.vkUpdateDescriptorSets(ctx.vk(), write, null);
+        }
+    }
+
+    /** True if this pipeline was created with a bindless entity-texture set. */
+    public boolean hasBindless() {
+        return bindlessSet != 0L;
+    }
+
     public void trace(VkCommandBuffer cmd, int width, int height) {
         trace(cmd, width, height, null);
     }
@@ -295,7 +354,10 @@ public final class RtPipeline {
     public void trace(VkCommandBuffer cmd, int width, int height, java.nio.ByteBuffer pushConstants) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VK10.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipeline);
-            VK10.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipelineLayout, 0, stack.longs(descriptorSets[currentSet]), null);
+            java.nio.LongBuffer boundSets = bindlessSet != 0L
+                    ? stack.longs(descriptorSets[currentSet], bindlessSet)
+                    : stack.longs(descriptorSets[currentSet]);
+            VK10.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipelineLayout, 0, boundSets, null);
             if (pushConstants != null && pushConstantSize > 0) {
                 VK10.vkCmdPushConstants(cmd, pipelineLayout, pushConstantStages, 0, pushConstants);
             }
@@ -320,6 +382,12 @@ public final class RtPipeline {
         VK10.vkDestroyPipelineLayout(vk, pipelineLayout, null);
         VK10.vkDestroyDescriptorPool(vk, descriptorPool, null);
         VK10.vkDestroyDescriptorSetLayout(vk, descriptorSetLayout, null);
+        if (bindlessPool != 0L) {
+            VK10.vkDestroyDescriptorPool(vk, bindlessPool, null);
+        }
+        if (bindlessLayout != 0L) {
+            VK10.vkDestroyDescriptorSetLayout(vk, bindlessLayout, null);
+        }
         destroyed = true;
     }
 
