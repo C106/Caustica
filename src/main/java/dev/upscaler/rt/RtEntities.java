@@ -55,6 +55,16 @@ public final class RtEntities {
     private static final int TABLE_RING = 6;
     // Frames a per-frame entity resource (mesh buffers + BLAS + scratch) must outlive before it's freed.
     private static final int KEEP_FRAMES = 4;
+    // P5-perf #1 (step 2): refit (UPDATE-mode) BLAS. Persistent per-entity AS, refit in place each frame
+    // (cheap) while topology is stable, instead of a full BUILD. Toggle for A/B + fallback to step-1
+    // pooled BUILD. Block entities always use the pooled-BUILD path (they get P5-perf #2 instead).
+    private static final boolean REFIT = Boolean.parseBoolean(System.getProperty("upscaler.rt.entityRefit", "true"));
+    // Per-entity ring depth: a slot is reused every REFIT_RING frames, so it must be off all queues by
+    // then. = KEEP_FRAMES (the established frames-in-flight-safe horizon). Each slot holds one persistent AS.
+    private static final int REFIT_RING = KEEP_FRAMES;
+    // Force a periodic full rebuild of a slot's AS to bound BVH-quality degradation from repeated refits
+    // (an entity that deforms a lot would otherwise refit the same BVH topology forever). Per-slot count.
+    private static final int REFIT_REBUILD_INTERVAL = Integer.getInteger("upscaler.rt.refitRebuildInterval", 120);
     // Identity 3x4 row-major: entity geometry is captured directly in rebased space, so no per-instance
     // transform is needed (unlike terrain sections, which carry sectionOrigin − rebase).
     private static final float[] IDENTITY = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
@@ -78,7 +88,29 @@ public final class RtEntities {
     // Per-frame entity GPU resources awaiting a frames-in-flight-safe free.
     private final List<Deferred> deferred = new ArrayList<>();
 
+    // P5-perf #1 (step 2): persistent per-entity acceleration structures, keyed by entity id, for refit.
+    private final Map<Integer, EntityAccel> entityAccels = new HashMap<>();
+
     private RtEntities() {
+    }
+
+    /** One persistent updatable AS in an entity's ring: its backing buffer (pool-owned) + the topology it
+     *  was built for (refit is valid only while vert/tri counts are unchanged) + refit bookkeeping. */
+    private static final class EntitySlot {
+        RtAccel accel;
+        RtBuffer backing;
+        int vertCount = -1;
+        int triCount = -1;
+        long updateScratchSize;
+        int updatesSinceBuild;
+    }
+
+    /** A per-entity ring of {@link EntitySlot}s, cycled one-per-frame so a refit never writes an AS still
+     *  in flight, plus the last frame the entity was captured (drives eviction). */
+    private static final class EntityAccel {
+        final EntitySlot[] ring = new EntitySlot[REFIT_RING];
+        int cursor;
+        long lastSeen;
     }
 
     /** This frame's entity contribution: the full instance list (terrain + entities), the entity BLAS to
@@ -93,8 +125,10 @@ public final class RtEntities {
     private final class FrameBuild {
         final List<RtAccel.Instance> base;
         List<RtAccel.Instance> instances;
-        List<RtAccel.PreparedBlas> blas;
-        List<RtBuffer> buffers;
+        List<RtAccel.PreparedBlas> blas;        // all BLAS ops to record this frame (BUILD + refit UPDATE)
+        List<RtAccel.PreparedBlas> pooledBlas;  // pooled-BUILD ops (block entities) → releaseBlasToPool
+        List<RtBuffer> refitScratch;            // per-frame scratch from refit ops → pool.release (AS persists)
+        List<RtBuffer> buffers;                 // per-frame mesh buffers (both paths) → pool.release
         long tableBase;
         long geomTableAddr;
         int count;
@@ -132,20 +166,29 @@ public final class RtEntities {
         FrameBuild build = new FrameBuild(base);
         captureEntities(ctx, build, mc, level, partial, rbx, rby, rbz);
         captureBlockEntities(ctx, build, mc, level, partial, rbx, rby, rbz);
+        evictStaleAccels();
 
         if (build.instances == null) {
             return new FrameEntities(base, List.of(), 0L);
         }
-        // Retire this frame's meshes + BLAS once it is no longer in flight (their build + the trace that
-        // reads them must complete first).
+        // Retire this frame's transient meshes + scratch + pooled-BUILD BLAS once it is no longer in flight
+        // (their build + the trace that reads them must complete first). Refit AS persist in entityAccels.
         long freeAt = RtComposite.frameCounter() + KEEP_FRAMES;
-        List<RtAccel.PreparedBlas> blasForFree = build.blas;
+        List<RtAccel.PreparedBlas> pooledForFree = build.pooledBlas;
+        List<RtBuffer> refitScratchForFree = build.refitScratch;
         List<RtBuffer> buffersForFree = build.buffers;
         deferred.add(new Deferred(freeAt, () -> {
             // Recycle (don't destroy): the deferred horizon guarantees these are off all queues, so the
             // pool can hand them straight back to the next frame's appendCapture.
-            for (RtAccel.PreparedBlas b : blasForFree) {
-                RtAccel.releaseBlasToPool(pool, b);
+            if (pooledForFree != null) {
+                for (RtAccel.PreparedBlas b : pooledForFree) {
+                    RtAccel.releaseBlasToPool(pool, b);
+                }
+            }
+            if (refitScratchForFree != null) {
+                for (RtBuffer s : refitScratchForFree) {
+                    pool.release(s);
+                }
             }
             for (RtBuffer buf : buffersForFree) {
                 pool.release(buf);
@@ -189,7 +232,7 @@ public final class RtEntities {
             float dy = prev == null ? 0f : iy - prev[1];
             float dz = prev == null ? 0f : iz - prev[2];
             curPositions.put(id, new float[]{ix, iy, iz});
-            appendCapture(ctx, build, dx, dy, dz);
+            appendCapture(ctx, build, dx, dy, dz, id);
         }
         prevPositions = curPositions;
     }
@@ -230,17 +273,23 @@ public final class RtEntities {
                     if (capture.isEmpty()) {
                         continue;
                     }
-                    appendCapture(ctx, build, 0f, 0f, 0f); // static → zero MV displacement
+                    appendCapture(ctx, build, 0f, 0f, 0f, -1); // BEs: static, no entity id → pooled BUILD (step 1)
                 }
             }
         }
     }
 
-    /** Upload the current {@link #capture} as a per-object mesh + BLAS, add its instance + geom-table entry. */
-    private void appendCapture(RtContext ctx, FrameBuild build, float dispX, float dispY, float dispZ) {
+    /**
+     * Upload the current {@link #capture} as a per-object mesh + BLAS, add its instance + geom-table entry.
+     * {@code entityId} ≥ 0 → refit path (persistent updatable AS keyed by id); {@code < 0} (block entities,
+     * or refit disabled) → pooled full BUILD (step 1).
+     */
+    private void appendCapture(RtContext ctx, FrameBuild build, float dispX, float dispY, float dispZ, int entityId) {
         if (build.instances == null) {
             build.instances = new ArrayList<>(build.base);
             build.blas = new ArrayList<>();
+            build.pooledBlas = new ArrayList<>();
+            build.refitScratch = new ArrayList<>();
             build.buffers = new ArrayList<>();
             ensureResources(ctx);
             tableSlot = (tableSlot + 1) % TABLE_RING;
@@ -263,7 +312,15 @@ public final class RtEntities {
         MemoryUtil.memFloatBuffer(prim.mapped, capture.prim.size()).put(capture.prim.elements(), 0, capture.prim.size());
 
         // Non-opaque so world.rahit alpha-tests the texture (cutout). Opaque texels pass to the chit.
-        RtAccel.PreparedBlas blas = RtAccel.prepareTrianglesBlasPooled(ctx, pool, positions, vertCount, indices, idxCount, false);
+        RtAccel accel;
+        if (REFIT && entityId >= 0) {
+            accel = refitOrBuild(ctx, build, entityId, positions, indices, vertCount, idxCount);
+        } else {
+            RtAccel.PreparedBlas blas = RtAccel.prepareTrianglesBlasPooled(ctx, pool, positions, vertCount, indices, idxCount, false);
+            build.blas.add(blas);
+            build.pooledBlas.add(blas);
+            accel = blas.accel;
+        }
 
         long entry = build.tableBase + (long) build.count * TABLE_ENTRY_BYTES;
         MemoryUtil.memPutLong(entry, prim.deviceAddress);
@@ -274,13 +331,85 @@ public final class RtEntities {
         MemoryUtil.memPutFloat(entry + 40, dispZ);
         MemoryUtil.memPutFloat(entry + 44, 0f);
 
-        build.instances.add(new RtAccel.Instance(IDENTITY, blas.accel.deviceAddress, ENTITY_BIT | (build.count & 0x7FFFFF)));
-        build.blas.add(blas);
+        build.instances.add(new RtAccel.Instance(IDENTITY, accel.deviceAddress, ENTITY_BIT | (build.count & 0x7FFFFF)));
         build.buffers.add(positions);
         build.buffers.add(indices);
         build.buffers.add(uvs);
         build.buffers.add(prim);
         build.count++;
+    }
+
+    /**
+     * Refit-or-build this entity's persistent acceleration structure. Cycles the entity's ring to a slot
+     * that is off all queues, then records an in-place UPDATE (cheap refit) when the slot already holds an
+     * AS of the same topology, else a full ALLOW_UPDATE BUILD (first use of the slot, a topology change, or
+     * the periodic BVH-quality rebuild). The mesh buffers + scratch are per-frame transients; the AS persists.
+     */
+    private RtAccel refitOrBuild(RtContext ctx, FrameBuild build, int entityId, RtBuffer positions, RtBuffer indices, int vertCount, int idxCount) {
+        int triCount = idxCount / 3;
+        int storage = org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        EntityAccel ea = entityAccels.computeIfAbsent(entityId, k -> new EntityAccel());
+        ea.lastSeen = RtComposite.frameCounter();
+        int s = ea.cursor;
+        ea.cursor = (ea.cursor + 1) % REFIT_RING;
+        EntitySlot slot = ea.ring[s];
+        boolean canUpdate = slot != null && slot.accel != null
+                && slot.vertCount == vertCount && slot.triCount == triCount
+                && slot.updatesSinceBuild < REFIT_REBUILD_INTERVAL;
+        if (canUpdate) {
+            RtBuffer scratch = pool.acquire(ctx, slot.updateScratchSize, storage, false);
+            build.blas.add(RtAccel.refitUpdate(slot.accel, scratch, positions.deviceAddress, indices.deviceAddress, vertCount, idxCount, false));
+            build.refitScratch.add(scratch);
+            slot.updatesSinceBuild++;
+            return slot.accel;
+        }
+        // (Re)build: first use of this slot, a topology change, or the periodic rebuild. Retire the old AS
+        // (off-queue by the horizon) and create a fresh updatable one sized for the current topology.
+        if (slot == null) {
+            slot = new EntitySlot();
+            ea.ring[s] = slot;
+        } else if (slot.accel != null) {
+            deferDestroyAccel(slot.accel, slot.backing);
+        }
+        RtAccel.UpdatableBuild ub = RtAccel.prepareUpdatableBlasBuild(ctx, pool, positions, vertCount, indices, idxCount, false);
+        slot.accel = ub.accel();
+        slot.backing = ub.backing();
+        slot.vertCount = vertCount;
+        slot.triCount = triCount;
+        slot.updateScratchSize = ub.updateScratchSize();
+        slot.updatesSinceBuild = 0;
+        build.blas.add(ub.op());
+        build.refitScratch.add(ub.scratch()); // per-frame build scratch (the AS + backing persist in the ring)
+        return slot.accel;
+    }
+
+    /** Retire a per-entity AS once it is off all queues; its backing buffer returns to the pool. */
+    private void deferDestroyAccel(RtAccel accel, RtBuffer backing) {
+        long freeAt = RtComposite.frameCounter() + KEEP_FRAMES;
+        deferred.add(new Deferred(freeAt, () -> RtAccel.destroyPooledAccel(pool, accel, backing)));
+    }
+
+    /** Drop persistent AS for entities not captured within the last KEEP_FRAMES frames (off all queues). */
+    private void evictStaleAccels() {
+        if (entityAccels.isEmpty()) {
+            return;
+        }
+        long now = RtComposite.frameCounter();
+        java.util.Iterator<Map.Entry<Integer, EntityAccel>> it = entityAccels.entrySet().iterator();
+        while (it.hasNext()) {
+            EntityAccel ea = it.next().getValue();
+            if (now - ea.lastSeen < KEEP_FRAMES) {
+                continue;
+            }
+            for (EntitySlot slot : ea.ring) {
+                if (slot != null && slot.accel != null) {
+                    RtAccel.destroyPooledAccel(pool, slot.accel, slot.backing);
+                    slot.accel = null;
+                    slot.backing = null;
+                }
+            }
+            it.remove();
+        }
     }
 
     private void setCamera(double camX, double camY, double camZ, Matrix4f projection, Matrix4f viewRotation) {
@@ -322,12 +451,22 @@ public final class RtEntities {
 
     /** Free the geometry-table ring + any outstanding per-frame entity resources (teardown; GPU idle). */
     public void shutdown() {
-        // Drain outstanding deferred releases first (they return buffers/AS to the pool), then destroy
-        // the pool itself. Runs after waitIdle, so immediate destruction is safe.
+        // Drain outstanding deferred releases first (they return buffers/AS to the pool), then destroy the
+        // persistent per-entity AS, then the pool itself. Runs after waitIdle, so immediate destruction is safe.
         for (Deferred d : deferred) {
             d.free().run();
         }
         deferred.clear();
+        for (EntityAccel ea : entityAccels.values()) {
+            for (EntitySlot slot : ea.ring) {
+                if (slot != null && slot.accel != null) {
+                    RtAccel.destroyPooledAccel(pool, slot.accel, slot.backing);
+                    slot.accel = null;
+                    slot.backing = null;
+                }
+            }
+        }
+        entityAccels.clear();
         pool.destroyAll();
         if (tableRing != null) {
             for (RtBuffer b : tableRing) {

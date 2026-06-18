@@ -19,7 +19,9 @@ import java.util.List;
 import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR;
 import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
 import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
 import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR;
 import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
 import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR;
 import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_GEOMETRY_NO_DUPLICATE_ANY_HIT_INVOCATION_BIT_KHR;
@@ -91,8 +93,14 @@ public final class RtAccel {
         private final int maxVertex;
         private final int triangleCount;
         private final boolean opaque;
+        // P5-perf #1 (step 2): refit support. {@code updatable} = built with ALLOW_UPDATE (so it can be
+        // refit later); {@code update} = this recorded op is an in-place UPDATE (refit) rather than a full
+        // BUILD. Set for the entity refit path; false for terrain + pooled block entities.
+        private final boolean updatable;
+        private final boolean update;
 
-        private PreparedBlas(RtAccel accel, RtBuffer scratch, RtBuffer pooledBacking, long vertexAddr, long indexAddr, int maxVertex, int triangleCount, boolean opaque) {
+        private PreparedBlas(RtAccel accel, RtBuffer scratch, RtBuffer pooledBacking, long vertexAddr, long indexAddr,
+                             int maxVertex, int triangleCount, boolean opaque, boolean updatable, boolean update) {
             this.accel = accel;
             this.scratch = scratch;
             this.pooledBacking = pooledBacking;
@@ -101,7 +109,18 @@ public final class RtAccel {
             this.maxVertex = maxVertex;
             this.triangleCount = triangleCount;
             this.opaque = opaque;
+            this.updatable = updatable;
+            this.update = update;
         }
+    }
+
+    /**
+     * Result of {@link #prepareUpdatableBlasBuild}: the per-frame BUILD op to record, plus the persistent
+     * resources the caller's per-entity ring must keep ({@code backing}) and cache ({@code updateScratchSize}
+     * for sizing later refit scratch). The {@code scratch} is this frame's transient build scratch (release
+     * at the frames-in-flight horizon, like the mesh buffers); the {@code op.accel} + {@code backing} persist.
+     */
+    public record UpdatableBuild(PreparedBlas op, RtAccel accel, RtBuffer backing, RtBuffer scratch, long updateScratchSize) {
     }
 
     /** Allocate a BLAS (AS + backing + scratch) and query sizes, but defer the build to {@link #recordBlasBuilds}. */
@@ -109,11 +128,11 @@ public final class RtAccel {
                                                     RtBuffer indices, int indexCount, boolean opaque) {
         VkDevice vk = ctx.vk();
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            VkAccelerationStructureBuildSizesInfoKHR sizes = queryBlasSizes(vk, stack, positions, indices, vertexCount, indexCount, opaque);
+            VkAccelerationStructureBuildSizesInfoKHR sizes = queryBlasSizes(vk, stack, positions, indices, vertexCount, indexCount, opaque, false);
             RtBuffer backing = ctx.createBuffer(sizes.accelerationStructureSize(), VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR, false);
             RtBuffer scratch = ctx.createBuffer(sizes.buildScratchSize(), VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false);
             RtAccel accel = createBlasOn(vk, stack, backing, sizes.accelerationStructureSize(), true);
-            return new PreparedBlas(accel, scratch, null, positions.deviceAddress, indices.deviceAddress, vertexCount - 1, indexCount / 3, opaque);
+            return new PreparedBlas(accel, scratch, null, positions.deviceAddress, indices.deviceAddress, vertexCount - 1, indexCount / 3, opaque, false, false);
         }
     }
 
@@ -127,13 +146,47 @@ public final class RtAccel {
                                                           RtBuffer indices, int indexCount, boolean opaque) {
         VkDevice vk = ctx.vk();
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            VkAccelerationStructureBuildSizesInfoKHR sizes = queryBlasSizes(vk, stack, positions, indices, vertexCount, indexCount, opaque);
+            VkAccelerationStructureBuildSizesInfoKHR sizes = queryBlasSizes(vk, stack, positions, indices, vertexCount, indexCount, opaque, false);
             // acquire() returns capacity ≥ requested size; the AS is created with the exact queried size.
             RtBuffer backing = pool.acquire(ctx, sizes.accelerationStructureSize(), VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR, false);
             RtBuffer scratch = pool.acquire(ctx, sizes.buildScratchSize(), VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false);
             RtAccel accel = createBlasOn(vk, stack, backing, sizes.accelerationStructureSize(), false);
-            return new PreparedBlas(accel, scratch, backing, positions.deviceAddress, indices.deviceAddress, vertexCount - 1, indexCount / 3, opaque);
+            return new PreparedBlas(accel, scratch, backing, positions.deviceAddress, indices.deviceAddress, vertexCount - 1, indexCount / 3, opaque, false, false);
         }
+    }
+
+    /**
+     * P5-perf #1 (step 2): create a new <em>updatable</em> (ALLOW_UPDATE) BLAS sized for this mesh and a
+     * pool-backed backing buffer, and prepare its initial full BUILD. The {@code accel} + {@code backing}
+     * persist in the caller's per-entity ring (NOT released per frame); later frames refit it with {@link
+     * #refitUpdate} (cheap in-place UPDATE) while the topology is stable, and free it with {@link
+     * #destroyPooledAccel} on eviction / topology change.
+     */
+    public static UpdatableBuild prepareUpdatableBlasBuild(RtContext ctx, RtBufferPool pool, RtBuffer positions, int vertexCount,
+                                                           RtBuffer indices, int indexCount, boolean opaque) {
+        VkDevice vk = ctx.vk();
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkAccelerationStructureBuildSizesInfoKHR sizes = queryBlasSizes(vk, stack, positions, indices, vertexCount, indexCount, opaque, true);
+            long accelSize = sizes.accelerationStructureSize();
+            long updateScratch = sizes.updateScratchSize();
+            RtBuffer backing = pool.acquire(ctx, accelSize, VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR, false);
+            RtBuffer scratch = pool.acquire(ctx, sizes.buildScratchSize(), VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false);
+            RtAccel accel = createBlasOn(vk, stack, backing, accelSize, false);
+            PreparedBlas op = new PreparedBlas(accel, scratch, backing, positions.deviceAddress, indices.deviceAddress,
+                    vertexCount - 1, indexCount / 3, opaque, true, false);
+            return new UpdatableBuild(op, accel, backing, scratch, updateScratch);
+        }
+    }
+
+    /**
+     * P5-perf #1 (step 2): prepare an in-place refit (UPDATE) of an existing updatable BLAS with new vertex
+     * data of the SAME topology. {@code scratch} (sized {@code updateScratchSize}) and the mesh buffers are
+     * caller-owned per-frame transients; the {@code accel} persists. Records nothing on its own — returned
+     * to {@link #recordBlasBuilds} like a BUILD.
+     */
+    public static PreparedBlas refitUpdate(RtAccel accel, RtBuffer scratch, long vertexAddr, long indexAddr,
+                                           int vertexCount, int indexCount, boolean opaque) {
+        return new PreparedBlas(accel, scratch, null, vertexAddr, indexAddr, vertexCount - 1, indexCount / 3, opaque, true, true);
     }
 
     /** Reclaim a pooled BLAS: destroy its AS handle and return its backing + scratch buffers to the pool. */
@@ -143,18 +196,29 @@ public final class RtAccel {
         pool.release(blas.scratch);
     }
 
+    /** Destroy a pool-backed (updatable-entity) AS: destroy the handle, return its backing buffer to the pool. */
+    public static void destroyPooledAccel(RtBufferPool pool, RtAccel accel, RtBuffer backing) {
+        accel.destroy(); // ownsBacking == false → handle only
+        pool.release(backing);
+    }
+
     private static VkAccelerationStructureBuildSizesInfoKHR queryBlasSizes(VkDevice vk, MemoryStack stack, RtBuffer positions,
-                                                                           RtBuffer indices, int vertexCount, int indexCount, boolean opaque) {
+                                                                           RtBuffer indices, int vertexCount, int indexCount, boolean opaque, boolean allowUpdate) {
         VkAccelerationStructureGeometryKHR.Buffer geom = triangleGeometry(stack, positions.deviceAddress,
                 indices.deviceAddress, vertexCount, opaque);
         VkAccelerationStructureBuildGeometryInfoKHR.Buffer build = VkAccelerationStructureBuildGeometryInfoKHR.calloc(1, stack);
         build.sType$Default().type(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR)
-                .flags(VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR)
+                .flags(buildFlags(allowUpdate))
                 .mode(VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR).geometryCount(1).pGeometries(geom);
         VkAccelerationStructureBuildSizesInfoKHR sizes = VkAccelerationStructureBuildSizesInfoKHR.calloc(stack).sType$Default();
         vkGetAccelerationStructureBuildSizesKHR(vk, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
                 build.get(0), stack.ints(indexCount / 3), sizes);
         return sizes;
+    }
+
+    private static int buildFlags(boolean allowUpdate) {
+        return VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR
+                | (allowUpdate ? VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR : 0);
     }
 
     private static RtAccel createBlasOn(VkDevice vk, MemoryStack stack, RtBuffer backing, long accelSize, boolean ownsBacking) {
@@ -308,9 +372,15 @@ public final class RtAccel {
         VkAccelerationStructureGeometryKHR.Buffer geom = triangleGeometry(stack, b.vertexAddr, b.indexAddr, b.maxVertex + 1, b.opaque);
         VkAccelerationStructureBuildGeometryInfoKHR.Buffer build = VkAccelerationStructureBuildGeometryInfoKHR.calloc(1, stack);
         build.sType$Default().type(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR)
-                .flags(VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR)
-                .mode(VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR).geometryCount(1).pGeometries(geom)
+                .flags(buildFlags(b.updatable))
+                .mode(b.update ? VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR : VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR)
+                .geometryCount(1).pGeometries(geom)
                 .dstAccelerationStructure(b.accel.handle);
+        if (b.update) {
+            // In-place refit: the existing (off-queue) AS is both source and destination. The flags +
+            // topology (primitiveCount/maxVertex) must match its original ALLOW_UPDATE build.
+            build.get(0).srcAccelerationStructure(b.accel.handle);
+        }
         build.get(0).scratchData().deviceAddress(b.scratch.deviceAddress);
         VkAccelerationStructureBuildRangeInfoKHR.Buffer range = VkAccelerationStructureBuildRangeInfoKHR.calloc(1, stack);
         range.get(0).primitiveCount(b.triangleCount).primitiveOffset(0).firstVertex(0).transformOffset(0);
