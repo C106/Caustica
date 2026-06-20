@@ -190,6 +190,9 @@ public final class RtEntities {
     private record Deferred(long freeFrame, Runnable free) {
     }
 
+    private record BeCandidate(BlockEntity be, double dist2, long posKey) {
+    }
+
     /** Mutable per-frame build state shared by the entity + block-entity capture passes. */
     private final class FrameBuild {
         final List<RtAccel.Instance> base;
@@ -465,21 +468,31 @@ public final class RtEntities {
         beDispatcher.prepare(cameraState.pos); // sets the camera for shouldRender / extract
         long now = RtComposite.frameCounter();
         int pcx = rbx >> 4, pcz = rbz >> 4;
+        Vec3 cam = cameraState.pos;
+        List<BeCandidate> candidates = new ArrayList<>();
         for (int cx = pcx - BE_VIEW_CHUNKS; cx <= pcx + BE_VIEW_CHUNKS; cx++) {
             for (int cz = pcz - BE_VIEW_CHUNKS; cz <= pcz + BE_VIEW_CHUNKS; cz++) {
-                if (build.full()) {
-                    return;
-                }
                 if (!level.getChunkSource().hasChunk(cx, cz) || !(level.getChunk(cx, cz) instanceof LevelChunk chunk)) {
                     continue;
                 }
                 for (BlockEntity be : chunk.getBlockEntities().values()) {
-                    if (build.full()) {
-                        return;
-                    }
-                    updateBlockEntity(ctx, build, beDispatcher, be, partial, now, rbx, rby, rbz);
+                    BlockPos p = be.getBlockPos();
+                    double dx = p.getX() + 0.5 - cam.x;
+                    double dy = p.getY() + 0.5 - cam.y;
+                    double dz = p.getZ() + 0.5 - cam.z;
+                    candidates.add(new BeCandidate(be, dx * dx + dy * dy + dz * dz, p.asLong()));
                 }
             }
+        }
+        candidates.sort((a, b) -> {
+            int byDistance = Double.compare(a.dist2, b.dist2);
+            return byDistance != 0 ? byDistance : Long.compare(a.posKey, b.posKey);
+        });
+        for (BeCandidate candidate : candidates) {
+            if (build.full()) {
+                return;
+            }
+            updateBlockEntity(ctx, build, beDispatcher, candidate.be, partial, now, rbx, rby, rbz);
         }
     }
 
