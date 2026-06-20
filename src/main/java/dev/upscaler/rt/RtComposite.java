@@ -309,6 +309,9 @@ public final class RtComposite {
         // atlas exists, so the fallback content is never read.
         if (RtMaterials.ENABLED) {
             RtBlockMaterials.INSTANCE.reset();
+            // Build the full _s/_n atlases now (parallel decode + blit), before terrain tessellates, so
+            // ensure() is a pure lookup on the build path instead of decoding each sprite's maps lazily.
+            RtBlockMaterials.INSTANCE.prepareAll();
             long specView = RtBlockMaterials.INSTANCE.viewS();
             long normalView = RtBlockMaterials.INSTANCE.viewN();
             worldPipeline.setBlockSpecAtlas(specView != 0L ? specView : atlasView, sampler);

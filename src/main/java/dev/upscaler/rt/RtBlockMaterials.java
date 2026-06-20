@@ -5,6 +5,7 @@ import com.mojang.blaze3d.textures.GpuTextureView;
 import com.mojang.blaze3d.vulkan.VulkanGpuTextureView;
 import dev.upscaler.UpscalerMod;
 import dev.upscaler.client.SodiumCompat;
+import dev.upscaler.mixin.TextureAtlasAccessor;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.texture.DynamicTexture;
 import net.minecraft.client.renderer.texture.TextureAtlas;
@@ -13,9 +14,10 @@ import net.minecraft.resources.Identifier;
 import net.minecraft.server.packs.resources.Resource;
 
 import java.io.InputStream;
-import java.util.IdentityHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * P6.2 LabPBR material ingestion for terrain. Vanilla MC builds no {@code _n}/{@code _s} atlas, so we
@@ -43,9 +45,11 @@ public final class RtBlockMaterials {
     private final Atlas specAtlas = new Atlas("rt/blocks_s", "_s.png", "rt_blocks_s");
     private final Atlas normalAtlas = new Atlas("rt/blocks_n", "_n.png", "rt_blocks_n");
     private int atlasW, atlasH;
-    // Per-sprite result cache: bitmask of HAS_S | HAS_N (which maps were found + blitted).
-    private final Map<TextureAtlasSprite, Integer> seen = new IdentityHashMap<>();
+    // Per-sprite result cache: bitmask of HAS_S | HAS_N (which maps were found + blitted). Concurrent
+    // because prepareAll() populates it from parallel worker threads (one entry per sprite, disjoint).
+    private final Map<TextureAtlasSprite, Integer> seen = new ConcurrentHashMap<>();
     private boolean loggedFailure;
+    private boolean loggedLazyFallback;
 
     private RtBlockMaterials() {
     }
@@ -138,18 +142,11 @@ public final class RtBlockMaterials {
     }
 
     /**
-     * Ensure this sprite's {@code _s}/{@code _n} maps are present in the parallel atlases. Returns a
-     * bitmask of {@link #HAS_S} | {@link #HAS_N} (which the shader uses, via {@code mat.z}/{@code mat.w},
-     * to decide whether to sample). Cached per sprite.
+     * Decode + blit a sprite's {@code _s}/{@code _n} maps into the parallel atlases and return the
+     * {@link #HAS_S}|{@link #HAS_N} bitmask. Pure CPU (resource read + blit to the sprite's disjoint atlas
+     * rect); safe to call from parallel threads. Does not touch {@link #seen} or upload — callers do.
      */
-    public int ensure(TextureAtlasSprite sprite) {
-        if (sprite == null || specAtlas.image == null) {
-            return 0;
-        }
-        Integer cached = seen.get(sprite);
-        if (cached != null) {
-            return cached;
-        }
+    private int loadSpriteFlags(TextureAtlasSprite sprite) {
         int flags = 0;
         try {
             Identifier name = sprite.contents().name(); // e.g. minecraft:block/stone
@@ -162,6 +159,64 @@ public final class RtBlockMaterials {
         } catch (Throwable t) {
             warnOnce("RT material map load failed for a sprite", t);
         }
+        return flags;
+    }
+
+    /**
+     * Build the {@code _s}/{@code _n} atlases for <em>every</em> block-atlas sprite up front, so terrain
+     * extraction's {@link #ensure} is a pure cache lookup with no per-sprite PNG decode on the build hot
+     * path. The decode + blit run in parallel (each sprite owns a disjoint atlas rect, {@link #seen} is
+     * concurrent); the GPU upload is a single {@link #flush} afterward. Called from the world-pipeline
+     * texture bring-up, before terrain tessellates. No-op if the atlases didn't initialize.
+     */
+    public void prepareAll() {
+        if (specAtlas.image == null) {
+            return;
+        }
+        List<TextureAtlasSprite> sprites;
+        try {
+            TextureAtlas atlas = (TextureAtlas) Minecraft.getInstance().getTextureManager()
+                    .getTexture(TextureAtlas.LOCATION_BLOCKS);
+            sprites = ((TextureAtlasAccessor) atlas).upscaler$sprites();
+        } catch (Throwable t) {
+            warnOnce("RT material prepareAll: could not enumerate block-atlas sprites", t);
+            return;
+        }
+        if (sprites == null) {
+            return;
+        }
+        sprites.parallelStream().forEach(sprite -> {
+            if (sprite == null || seen.containsKey(sprite)) {
+                return;
+            }
+            seen.put(sprite, loadSpriteFlags(sprite));
+        });
+        flush();
+    }
+
+    /**
+     * The {@code _s}/{@code _n} presence bitmask ({@link #HAS_S}|{@link #HAS_N}) for a sprite — a pure
+     * lookup into the {@link #prepareAll}-populated cache. A sprite not yet prepared (should not happen for
+     * block-atlas sprites) is loaded lazily as a fallback; its upload is picked up by the next {@link
+     * #flush} (called pre-trace each frame).
+     */
+    public int ensure(TextureAtlasSprite sprite) {
+        if (sprite == null || specAtlas.image == null) {
+            return 0;
+        }
+        Integer cached = seen.get(sprite);
+        if (cached != null) {
+            return cached;
+        }
+        // prepareAll() is meant to cover every block-atlas sprite; a miss here means terrain hit a sprite
+        // the up-front pass didn't enumerate (or ran before it). Load lazily for correctness, but warn once
+        // so the gap is visible rather than silently paying decode cost back on the build path.
+        if (!loggedLazyFallback) {
+            loggedLazyFallback = true;
+            UpscalerMod.LOGGER.warn("RT material ensure() fell back to a lazy load for sprite {} — "
+                    + "prepareAll() did not cover it (decode is back on the terrain-build path)", sprite.contents().name());
+        }
+        int flags = loadSpriteFlags(sprite);
         seen.put(sprite, flags);
         return flags;
     }
