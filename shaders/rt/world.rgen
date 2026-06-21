@@ -37,7 +37,8 @@ layout(binding = 4, set = 0, rgba16f) uniform image2D gAlbedo; // rgb diffuse al
 layout(binding = 5, set = 0, r32f)    uniform image2D gDepth;  // r linear hit distance (<0 = sky)
 layout(binding = 6, set = 0, rg16f)   uniform image2D gMotion;    // xy screen-space motion (render pixels)
 layout(binding = 7, set = 0, rgba16f) uniform image2D gSpecAlbedo; // specular albedo (0 — diffuse-only)
-layout(binding = 8, set = 0, r32f)    uniform image2D gSpecHitDistance; // reflection hit distance
+layout(binding = 8, set = 0, r32f)    uniform image2D gSpecHitDistance; // disabled RR input; debug only
+layout(binding = 9, set = 0, rg16f)   uniform image2D gSpecMotion; // reflection motion vectors for RR
 
 // P6.4: the per-frame push data moved out of inline push constants (the 256-byte block hit the 256-byte
 // NVIDIA push-constant ceiling) into a host-visible BDA buffer; only its 8-byte address is pushed. The
@@ -47,7 +48,7 @@ struct WorldPush {
     mat4 invViewProj;          // 0
     vec3 camOffset;            // 64
     uint64_t tableAddr;        // 80  closest-hit/any-hit section table (raygen ignores it)
-    uint debugView;            // 88  0=render,1=normals,2=albedo,3=depth,4=roughness,5=motion,6=specular,7=spec hit
+    uint debugView;            // 88  0=render,1=normals,2=albedo,3=depth,4=roughness,5=motion,6=specular,7=spec hit,8=spec motion
     uint frameIndex;           // 92  per-frame RNG variation for the denoiser's temporal reuse
     mat4 prevViewProj;         // 96  P4.0b motion vectors: previous-frame camera-relative view-projection
     vec3 camDelta;             // 160 curCam - prevCam
@@ -333,6 +334,73 @@ float specularHitDistance(vec3 hitPos, vec3 primaryDir) {
     return payload.hitT > 0.0 ? payload.hitT : 0.0;
 }
 
+vec2 projectPrevNdc(vec3 worldPos) {
+    vec4 clip = pc.prevViewProj * vec4(worldPos - pc.camOffset + pc.camDelta, 1.0);
+    return clip.xy / clip.w;
+}
+
+vec2 previousReflectionNdc(vec3 surfacePos, vec3 surfaceNormal, vec3 reflectedWorldPos, vec3 reflectedMotionPrev) {
+    vec3 prevCam = pc.camOffset - pc.camDelta;
+    vec3 prevHit = reflectedWorldPos - reflectedMotionPrev;
+    vec3 n = normalize(surfaceNormal);
+    if (dot(n, prevCam - surfacePos) < 0.0) {
+        n = -n;
+    }
+
+    vec3 mirroredHit = prevHit - 2.0 * n * dot(prevHit - surfacePos, n);
+    vec3 mirrorDir = mirroredHit - prevCam;
+    float denom = dot(mirrorDir, n);
+    if (abs(denom) <= 1.0e-5) {
+        return projectPrevNdc(surfacePos);
+    }
+
+    float t = dot(surfacePos - prevCam, n) / denom;
+    if (t <= 0.0) {
+        return projectPrevNdc(surfacePos);
+    }
+    return projectPrevNdc(prevCam + mirrorDir * t);
+}
+
+vec2 previousReflectionSkyNdc(vec3 surfacePos, vec3 surfaceNormal, vec3 reflectedDir) {
+    vec3 prevCam = pc.camOffset - pc.camDelta;
+    vec3 n = normalize(surfaceNormal);
+    if (dot(n, prevCam - surfacePos) < 0.0) {
+        n = -n;
+    }
+
+    vec3 incidentDir = reflect(reflectedDir, n);
+    float denom = dot(incidentDir, n);
+    if (abs(denom) <= 1.0e-5) {
+        return projectPrevNdc(prevCam + incidentDir * 1.0e6);
+    }
+
+    float t = dot(surfacePos - prevCam, n) / denom;
+    if (t <= 0.0) {
+        return projectPrevNdc(prevCam + incidentDir * 1.0e6);
+    }
+    return projectPrevNdc(prevCam + incidentDir * t);
+}
+
+vec2 specularReflectionMotion(vec3 surfacePos, vec3 primaryDir, vec2 currentNdc, vec2 size) {
+    if (length(gv_normal) < 0.5 || max(gv_specAlb.r, max(gv_specAlb.g, gv_specAlb.b)) <= 0.001 || gv_rough > 0.75) {
+        return vec2(0.0);
+    }
+
+    vec3 specDir = reflect(primaryDir, gv_normal);
+    payload.hitT = -1.0;
+    traceRayEXT(topLevelAS, gl_RayFlagsNoneEXT, CULL_SECONDARY,
+                0u, 0u, 0u, surfacePos + gv_normal * SURF_BIAS, RAY_TMIN, specDir, 10000.0, 0);
+
+    vec2 prevNdc;
+    if (payload.hitT > 0.0) {
+        vec3 reflectedHit = surfacePos + gv_normal * SURF_BIAS + specDir * payload.hitT;
+        prevNdc = previousReflectionNdc(surfacePos, gv_normal, reflectedHit, payload.motionPrev);
+    } else {
+        prevNdc = previousReflectionSkyNdc(surfacePos, gv_normal, specDir);
+    }
+    return (prevNdc - currentNdc) * 0.5 * size;
+}
+
 void refractedGuideHit(vec3 surfacePos, vec3 incidentDir, vec3 surfaceNormal, bool inWaterAtSurface,
                        out vec3 hitCamRel, out vec3 motionPrev, out bool refracted,
                        out bool skyMiss, out vec3 refractedDirOut) {
@@ -366,11 +434,6 @@ void refractedGuideHit(vec3 surfacePos, vec3 incidentDir, vec3 surfaceNormal, bo
     vec3 hitPos = ro + refractedDir * payload.hitT;
     hitCamRel = hitPos - pc.camOffset;
     motionPrev = (payload.material <= 0.5 || payload.material > 1.5) ? payload.motionPrev : vec3(0.0);
-}
-
-vec2 projectPrevNdc(vec3 worldPos) {
-    vec4 clip = pc.prevViewProj * vec4(worldPos - pc.camOffset + pc.camDelta, 1.0);
-    return clip.xy / clip.w;
 }
 
 vec2 previousRefractedNdc(vec3 surfacePos, vec3 surfaceNormal, bool inWaterAtSurface,
@@ -701,7 +764,9 @@ void main() {
     imageStore(gAlbedo, pix, vec4(gv_albedo, 1.0));
     imageStore(gDepth, pix, vec4(gv_depth, 0.0, 0.0, 0.0));
     imageStore(gSpecAlbedo, pix, vec4(gv_specAlb, 1.0)); // P6.1: specular albedo for RR demodulation
-    gv_specHitDistance = specularHitDistance(gv_hitCamRel + pc.camOffset, dir);
+    // Specular hit distance is intentionally disabled as a DLSS-RR input in favour of reflection MVs.
+    // Keep writing it only for debug view 7 so the old guide remains inspectable without its per-frame cost.
+    gv_specHitDistance = pc.debugView == 7u ? specularHitDistance(gv_hitCamRel + pc.camOffset, dir) : 0.0;
     imageStore(gSpecHitDistance, pix, vec4(gv_specHitDistance, 0.0, 0.0, 0.0));
 
     // P4.0b motion vector: reproject this guide point through the previous frame's view-projection.
@@ -733,6 +798,8 @@ void main() {
     }
     vec2 motion = (prevNdc - jndc) * 0.5 * size;
     imageStore(gMotion, pix, vec4(motion, 0.0, 0.0));
+    vec2 specMotion = specularReflectionMotion(gv_hitCamRel + pc.camOffset, dir, jndc, size);
+    imageStore(gSpecMotion, pix, vec4(specMotion, 0.0, 0.0));
 
     // Debug guide-buffer visualization: bypass accumulation and show a guide directly.
     if (pc.debugView != 0u) {
@@ -749,6 +816,8 @@ void main() {
             dbg = gv_specAlb;                       // specular albedo
         } else if (pc.debugView == 7u) {
             dbg = vec3(min(gv_specHitDistance / 64.0, 1.0)); // reflection hit distance
+        } else if (pc.debugView == 8u) {
+            dbg = vec3(clamp(0.5 + specMotion * 0.05, 0.0, 1.0), 0.5); // reflection motion
         } else {
             dbg = vec3(clamp(0.5 + motion * 0.05, 0.0, 1.0), 0.5); // motion: red=+x, green=+y
         }

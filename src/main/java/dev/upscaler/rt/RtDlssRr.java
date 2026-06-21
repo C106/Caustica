@@ -21,7 +21,7 @@ import java.nio.file.Path;
 /**
  * DLSS Ray Reconstruction backend for the RT renderer. Runs the DLSSD (Ray Reconstruction) feature
  * over our path-traced color + guide buffers (normals/roughness, diffuse/specular albedo, depth,
- * motion vectors), denoising and upscaling (render res -> display res) in one pass.
+ * motion vectors, reflection motion vectors), denoising and upscaling (render res -> display res) in one pass.
  *
  * <p>P4.2a wired NGX init, the RR-available gate, and feature creation. P4.2b adds the render-res
  * split (trace render res &lt; display res, RR upscales to display) and sub-pixel camera jitter.
@@ -78,7 +78,7 @@ public final class RtDlssRr {
      */
     public boolean evaluate(long cmd, RtImage color, RtImage depth, RtImage motion,
                             RtImage diffuseAlbedo, RtImage specularAlbedo, RtImage normals,
-                            RtImage specularHitDistance, RtImage out,
+                            RtImage specularMotion, RtImage specularHitDistance, RtImage out,
                             int renderWidth, int renderHeight, int displayWidth, int displayHeight,
                             float jitterX, float jitterY, Matrix4fc worldToView, Matrix4fc viewToClip) {
         if (!isReady()) {
@@ -103,6 +103,7 @@ public final class RtDlssRr {
                         diffuseAlbedo.view, diffuseAlbedo.image, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
                         specularAlbedo.view, specularAlbedo.image, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
                         normals.view, normals.image, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
+                        specularMotion.view, specularMotion.image, VK10.VK_FORMAT_R16G16_SFLOAT,
                         specularHitDistance.view, specularHitDistance.image, VK10.VK_FORMAT_R32_SFLOAT,
                         out.view, out.image, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
                         renderWidth, renderHeight, displayWidth, displayHeight,

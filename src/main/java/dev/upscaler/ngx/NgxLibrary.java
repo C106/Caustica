@@ -70,10 +70,11 @@ public final class NgxLibrary {
 		this.createDlssd = handle(lookup, "ngxshim_create_dlssd",
 				FunctionDescriptor.of(ValueLayout.ADDRESS, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT,
 						ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT));
-		// int ngxshim_evaluate_dlssd(cmd, feature, [color/depth/mv/diffAlbedo/specAlbedo/normals/specHit/out: view,img,fmt]*8, rw,rh,dw,dh, jx,jy,mvsx,mvsy, reset, frameMs, matrices)
+		// int ngxshim_evaluate_dlssd(cmd, feature, [color/depth/mv/diffAlbedo/specAlbedo/normals/specMotion/specHit/out: view,img,fmt]*9, rw,rh,dw,dh, jx,jy,mvsx,mvsy, reset, frameMs, matrices)
 		this.evaluateDlssd = handle(lookup, "ngxshim_evaluate_dlssd",
 				FunctionDescriptor.of(ValueLayout.JAVA_INT,
 						ValueLayout.JAVA_LONG, ValueLayout.ADDRESS,
+						ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT,
 						ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT,
 						ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT,
 						ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT,
@@ -195,6 +196,7 @@ public final class NgxLibrary {
 	                         long diffuseAlbedoView, long diffuseAlbedoImage, int diffuseAlbedoFormat,
 	                         long specularAlbedoView, long specularAlbedoImage, int specularAlbedoFormat,
 	                         long normalsView, long normalsImage, int normalsFormat,
+	                         long specularMotionView, long specularMotionImage, int specularMotionFormat,
 	                         long specularHitDistanceView, long specularHitDistanceImage, int specularHitDistanceFormat,
 	                         long outputView, long outputImage, int outputFormat,
 	                         int renderWidth, int renderHeight, int displayWidth, int displayHeight,
@@ -209,6 +211,7 @@ public final class NgxLibrary {
 					diffuseAlbedoView, diffuseAlbedoImage, diffuseAlbedoFormat,
 					specularAlbedoView, specularAlbedoImage, specularAlbedoFormat,
 					normalsView, normalsImage, normalsFormat,
+					specularMotionView, specularMotionImage, specularMotionFormat,
 					specularHitDistanceView, specularHitDistanceImage, specularHitDistanceFormat,
 					outputView, outputImage, outputFormat,
 					renderWidth, renderHeight, displayWidth, displayHeight,

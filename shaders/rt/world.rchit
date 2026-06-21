@@ -49,8 +49,8 @@ layout(binding = 2, set = 0) uniform sampler2D blockAtlas;
 // P6.2a/b: parallel LabPBR _s (specular) and _n (normal) atlases, stitched to mirror the block atlas
 // sprite layout (RtBlockMaterials), sampled at the SAME uv as blockAtlas. Read only when the prim is
 // flagged (pr.mat.z for _s, pr.mat.w for _n).
-layout(binding = 9, set = 0) uniform sampler2D blockSpecAtlas;
-layout(binding = 10, set = 0) uniform sampler2D blockNormalAtlas;
+layout(binding = 10, set = 0) uniform sampler2D blockSpecAtlas;
+layout(binding = 11, set = 0) uniform sampler2D blockNormalAtlas;
 // P5.1b-2b: bindless entity textures — a runtime-sized array indexed per-prim (tint.w) by the entity
 // hit path. Slot 0 is a fallback. Entities use per-type texture files, so each RenderType gets a slot.
 layout(binding = 0, set = 1) uniform sampler2D entityTex[];

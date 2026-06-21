@@ -54,13 +54,13 @@ public final class RtComposite {
     // + flags(@192): P6.1 bit 0 = camera submerged, bit 1 = PBR BRDF enabled
     // + P6.3 dynamic sky (16-byte aligned vec4s): sunDir+dayFactor(@208) + lightDir(@224) + lightRadiance(@240)
     private static final int WORLD_PUSH_SIZE = 256;
-    private static final int GUIDE_COUNT = 6; // P4/RR guide buffers bound at world-pipeline bindings 3..8
+    private static final int GUIDE_COUNT = 7; // P4/RR guide buffers bound at world-pipeline bindings 3..9
     // Frames a retired per-frame TLAS must outlive before it's freed (> frames-in-flight); matches
     // RtTerrain's deferred-free horizon. The frame TLAS is built + traced this frame, then freed once
     // the composite frame counter has advanced this far past it (so no in-flight frame still reads it).
     private static final int KEEP_FRAMES = 4;
 
-    /** Debug guide-buffer view: 0 = normal render, 1 = normals, 2 = albedo, 3 = depth, 4 = roughness, 5 = motion, 6 = specular, 7 = spec hit. */
+    /** Debug guide-buffer view: 0 = normal render, 1 = normals, 2 = albedo, 3 = depth, 4 = roughness, 5 = motion, 6 = specular, 7 = spec hit, 8 = spec motion. */
     public static final int DEBUG_VIEW = Integer.getInteger("upscaler.rt.debugView", 0);
     /** Samples per pixel per frame. Default 1: DLSS-RR denoises ~1 spp; raise for the no-RR reference. */
     public static final int SPP = Math.max(1, Integer.getInteger("upscaler.rt.spp", 1));
@@ -126,13 +126,14 @@ public final class RtComposite {
     private RtImage output;
     private RtImage displayImage;
     // P4 guide buffers (first-hit attributes for the denoiser/DLSS-RR): normal+roughness, albedo,
-    // depth, motion, specular albedo, and specular hit distance.
+    // depth, motion, specular albedo, disabled specular hit distance, and reflection motion.
     private RtImage gNormal;
     private RtImage gAlbedo;
     private RtImage gDepth;
     private RtImage gMotion;
     private RtImage gSpecAlbedo;
     private RtImage gSpecHitDistance;
+    private RtImage gSpecMotion;
     // Display-res RT image the display mapper reads: DLSS-RR writes it (render -> display denoise+upscale), or a
     // linear blit of `output` fills it when RR is off/unavailable (the no-RR reference / fallback).
     private RtImage rrOutput;
@@ -354,6 +355,7 @@ public final class RtComposite {
         worldPipeline.setExtraStorageImage(3, gMotion.view);
         worldPipeline.setExtraStorageImage(4, gSpecAlbedo.view);
         worldPipeline.setExtraStorageImage(5, gSpecHitDistance.view);
+        worldPipeline.setExtraStorageImage(6, gSpecMotion.view);
     }
 
     private void destroyGuideImages() {
@@ -380,6 +382,10 @@ public final class RtComposite {
         if (gSpecHitDistance != null) {
             gSpecHitDistance.destroy();
             gSpecHitDistance = null;
+        }
+        if (gSpecMotion != null) {
+            gSpecMotion.destroy();
+            gSpecMotion = null;
         }
         if (rrOutput != null) {
             rrOutput.destroy();
@@ -421,6 +427,7 @@ public final class RtComposite {
         gMotion = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16_SFLOAT, "guide motion " + renderW + "x" + renderH);
         gSpecAlbedo = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "guide specular albedo " + renderW + "x" + renderH);
         gSpecHitDistance = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R32_SFLOAT, "guide specular hit distance " + renderW + "x" + renderH);
+        gSpecMotion = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16_SFLOAT, "guide specular motion " + renderW + "x" + renderH);
         // Display-res RT image the display mapper reads. Always present (DLSS-RR target, or blit-upscale fallback).
         rrOutput = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "DLSS-RR output " + width + "x" + height);
         exposure.ensureResources(ctx);
@@ -559,7 +566,7 @@ public final class RtComposite {
                 // -J). The shader push above uses +jitter; report -jitter here.
                 try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "DLSS-RR evaluate")) {
                     rrDone = RtDlssRr.INSTANCE.evaluate(cmd.address(), output, gDepth, gMotion, gAlbedo,
-                            gSpecAlbedo, gNormal, gSpecHitDistance, rrOutput, renderW, renderH, displayW, displayH,
+                            gSpecAlbedo, gNormal, gSpecMotion, gSpecHitDistance, rrOutput, renderW, renderH, displayW, displayH,
                             -jitterX, -jitterY, frameViewRotation, frameProjection);
                 }
             }

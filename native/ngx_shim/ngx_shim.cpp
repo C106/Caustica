@@ -304,8 +304,8 @@ NGX_SHIM_EXPORT void* ngxshim_create_dlssd(VkCommandBuffer cmd,
 
 // Records a DLSS Ray Reconstruction evaluation. Guide buffers: HDR color, linear depth, motion
 // vectors, diffuse albedo, specular albedo, world-space normals (roughness packed in normals.w),
-// and specular hit distance. The two matrices are row-major left-multiply arrays for the specular
-// hit-distance path.
+// and reflection motion vectors. Specular hit distance remains in the ABI/resources for debug and
+// easy A/B, but is disabled by leaving pInSpecularHitDistance null.
 // Output is the only read-write (storage) resource. All non-output images use the color aspect;
 // depth is a linear value carried in a color image, not a depth-aspect attachment.
 NGX_SHIM_EXPORT int ngxshim_evaluate_dlssd(VkCommandBuffer cmd, void* feature,
@@ -313,10 +313,11 @@ NGX_SHIM_EXPORT int ngxshim_evaluate_dlssd(VkCommandBuffer cmd, void* feature,
                                            VkImageView depthView, VkImage depthImage, int depthFormat,
                                            VkImageView mvView, VkImage mvImage, int mvFormat,
                                            VkImageView diffuseAlbedoView, VkImage diffuseAlbedoImage, int diffuseAlbedoFormat,
-                                           VkImageView specularAlbedoView, VkImage specularAlbedoImage, int specularAlbedoFormat,
-                                           VkImageView normalsView, VkImage normalsImage, int normalsFormat,
-                                           VkImageView specularHitDistanceView, VkImage specularHitDistanceImage, int specularHitDistanceFormat,
-                                           VkImageView outputView, VkImage outputImage, int outputFormat,
+                                            VkImageView specularAlbedoView, VkImage specularAlbedoImage, int specularAlbedoFormat,
+                                            VkImageView normalsView, VkImage normalsImage, int normalsFormat,
+                                            VkImageView specularMotionView, VkImage specularMotionImage, int specularMotionFormat,
+                                            VkImageView specularHitDistanceView, VkImage specularHitDistanceImage, int specularHitDistanceFormat,
+                                            VkImageView outputView, VkImage outputImage, int outputFormat,
                                            unsigned int renderWidth, unsigned int renderHeight,
                                            unsigned int displayWidth, unsigned int displayHeight,
                                            float jitterX, float jitterY, float mvScaleX, float mvScaleY,
@@ -326,6 +327,11 @@ NGX_SHIM_EXPORT int ngxshim_evaluate_dlssd(VkCommandBuffer cmd, void* feature,
     if (!f) {
         return -1;
     }
+    (void) specularHitDistanceView;
+    (void) specularHitDistanceImage;
+    (void) specularHitDistanceFormat;
+    (void) worldToViewMatrix;
+    (void) viewToClipMatrix;
 
     NVSDK_NGX_Resource_VK color = makeImageResource(colorView, colorImage, colorFormat, renderWidth, renderHeight, VK_IMAGE_ASPECT_COLOR_BIT, false);
     NVSDK_NGX_Resource_VK depth = makeImageResource(depthView, depthImage, depthFormat, renderWidth, renderHeight, VK_IMAGE_ASPECT_COLOR_BIT, false);
@@ -333,7 +339,7 @@ NGX_SHIM_EXPORT int ngxshim_evaluate_dlssd(VkCommandBuffer cmd, void* feature,
     NVSDK_NGX_Resource_VK diffuseAlbedo = makeImageResource(diffuseAlbedoView, diffuseAlbedoImage, diffuseAlbedoFormat, renderWidth, renderHeight, VK_IMAGE_ASPECT_COLOR_BIT, false);
     NVSDK_NGX_Resource_VK specularAlbedo = makeImageResource(specularAlbedoView, specularAlbedoImage, specularAlbedoFormat, renderWidth, renderHeight, VK_IMAGE_ASPECT_COLOR_BIT, false);
     NVSDK_NGX_Resource_VK normals = makeImageResource(normalsView, normalsImage, normalsFormat, renderWidth, renderHeight, VK_IMAGE_ASPECT_COLOR_BIT, false);
-    NVSDK_NGX_Resource_VK specularHitDistance = makeImageResource(specularHitDistanceView, specularHitDistanceImage, specularHitDistanceFormat, renderWidth, renderHeight, VK_IMAGE_ASPECT_COLOR_BIT, false);
+    NVSDK_NGX_Resource_VK specularMotion = makeImageResource(specularMotionView, specularMotionImage, specularMotionFormat, renderWidth, renderHeight, VK_IMAGE_ASPECT_COLOR_BIT, false);
     NVSDK_NGX_Resource_VK output = makeImageResource(outputView, outputImage, outputFormat, displayWidth, displayHeight, VK_IMAGE_ASPECT_COLOR_BIT, true);
 
     NVSDK_NGX_VK_DLSSD_Eval_Params eval;
@@ -345,9 +351,10 @@ NGX_SHIM_EXPORT int ngxshim_evaluate_dlssd(VkCommandBuffer cmd, void* feature,
     eval.pInDiffuseAlbedo = &diffuseAlbedo;
     eval.pInSpecularAlbedo = &specularAlbedo;
     eval.pInNormals = &normals;
-    eval.pInSpecularHitDistance = &specularHitDistance;
-    eval.pInWorldToViewMatrix = worldToViewMatrix;
-    eval.pInViewToClipMatrix = viewToClipMatrix;
+    eval.pInMotionVectorsReflections = &specularMotion;
+    eval.pInSpecularHitDistance = nullptr;
+    eval.pInWorldToViewMatrix = nullptr;
+    eval.pInViewToClipMatrix = nullptr;
     // pInRoughness left null: InRoughnessMode_Packed reads roughness from normals.w.
     eval.InJitterOffsetX = jitterX;
     eval.InJitterOffsetY = jitterY;
