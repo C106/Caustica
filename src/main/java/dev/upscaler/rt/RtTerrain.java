@@ -512,7 +512,9 @@ public final class RtTerrain {
                         capture.state = state;
                         capture.pos = m;
                         renderer.tesselateBlock(capture, lx, ly, lz, region, m, state, model, state.getSeed(m));
+                        capture.flushBlock(); // resolve coplanar ties (grass overlay / cross faces), then emit
                     } catch (Throwable t) {
+                        capture.discardBlock(); // drop any partially-buffered quads from the throw
                         warnMeshOnce("block model", t); // skip a block whose meshing throws, don't fail the section
                     }
                 }
@@ -1395,51 +1397,47 @@ public final class RtTerrain {
         BlockState state;
         BlockPos pos;
 
+        // Coplanar-resolution: vanilla emits coincident quads that tie on depth in the BVH and flicker —
+        // a block face's opaque base + its tinted cutout overlay (grass/snowy sides), and a cross model's
+        // two-sided faces. put() buffers a block's quads here; flushBlock() (called per block) nudges all
+        // but the first member of each coincident group outward along its own normal so each lands on its
+        // own plane (base stays, overlay moves in front so its cutout reveals the base; cross back-face
+        // separates from the front). Pooled — reset each block, never reallocated steady-state.
+        private static final float OFFSET = 2.0e-4f;         // outward nudge (blocks) to break coplanar depth ties
+        private static final float COINCIDENT_EPS = 1.0e-4f; // verts this close are "the same" point
+        private static final int RESOLVE_CAP = 128;          // skip the O(n^2) resolve for pathological blocks
+        private final List<PendingQuad> pending = new ArrayList<>();
+        private int pendingCount;
+        private int[] gidScratch = new int[0];
+
         @Override
         public void put(float x, float y, float z, BakedQuad quad, QuadInstance instance) {
-            // Route the quad by its chunk render layer: only SOLID is fully opaque (no alpha test), so it
-            // goes into the OPAQUE-flagged geometry whose any-hit the driver skips. CUTOUT (foliage/glass)
-            // and TRANSLUCENT (stained glass/ice) keep the alpha-test any-hit (cutout bucket). Blocks are
-            // never the water bucket — that's fluids only (FluidCapture).
-            Geom g = quad.materialInfo().layer() == ChunkSectionLayer.SOLID ? cur.opaque : cur.cutout;
-            FloatArrayList verts = g.verts;
-            IntArrayList idx = g.idx;
-            int base = verts.size() / 3;
-            Vector3fc p0 = quad.position(0);
-            Vector3fc p1 = quad.position(1);
-            Vector3fc p2 = quad.position(2);
-            Vector3fc p3 = quad.position(3);
-            addVertex(g, p0, x, y, z);
-            addVertex(g, p1, x, y, z);
-            addVertex(g, p2, x, y, z);
-            addVertex(g, p3, x, y, z);
-            idx.add(base);
-            idx.add(base + 1);
-            idx.add(base + 2);
-            idx.add(base);
-            idx.add(base + 2);
-            idx.add(base + 3);
-            // Per-triangle corner UVs (primitive order, matching the two triangles emitted above:
-            // 0,1,2 then 0,2,3) so the hit shader reads cornerUv[3*pid + k] without an index gather.
-            long pu0 = quad.packedUV(0), pu1 = quad.packedUV(1), pu2 = quad.packedUV(2), pu3 = quad.packedUV(3);
-            addTriUv(g, pu0, pu1, pu2);
-            addTriUv(g, pu0, pu2, pu3);
+            PendingQuad q = acquire();
+            Vector3fc p0 = quad.position(0), p1 = quad.position(1), p2 = quad.position(2), p3 = quad.position(3);
+            q.x[0] = p0.x() + x; q.y[0] = p0.y() + y; q.z[0] = p0.z() + z;
+            q.x[1] = p1.x() + x; q.y[1] = p1.y() + y; q.z[1] = p1.z() + z;
+            q.x[2] = p2.x() + x; q.y[2] = p2.y() + y; q.z[2] = p2.z() + z;
+            q.x[3] = p3.x() + x; q.y[3] = p3.y() + y; q.z[3] = p3.z() + z;
+            q.uv[0] = quad.packedUV(0); q.uv[1] = quad.packedUV(1);
+            q.uv[2] = quad.packedUV(2); q.uv[3] = quad.packedUV(3);
 
-            float ex1 = p1.x() - p0.x(), ey1 = p1.y() - p0.y(), ez1 = p1.z() - p0.z();
-            float ex2 = p2.x() - p0.x(), ey2 = p2.y() - p0.y(), ez2 = p2.z() - p0.z();
-            float nx = ey1 * ez2 - ez1 * ey2;
-            float ny = ez1 * ex2 - ex1 * ez2;
-            float nz = ex1 * ey2 - ey1 * ex2;
+            float ex1 = q.x[1] - q.x[0], ey1 = q.y[1] - q.y[0], ez1 = q.z[1] - q.z[0];
+            float ex2 = q.x[2] - q.x[0], ey2 = q.y[2] - q.y[0], ez2 = q.z[2] - q.z[0];
+            float nx = ey1 * ez2 - ez1 * ey2, ny = ez1 * ex2 - ex1 * ez2, nz = ex1 * ey2 - ey1 * ex2;
             float len = (float) Math.sqrt(nx * nx + ny * ny + nz * nz);
-            if (len > 1.0e-6f) {
-                nx /= len;
-                ny /= len;
-                nz /= len;
-            }
-            // Biome tint: tintIndex >= 0 means the quad is biome-colored (grass/foliage/etc.). In 26.2
-            // the color comes from a BlockTintSource; colorInWorld blends the biome color at this pos
-            // (0x00RRGGBB). Untinted quads (tintIndex < 0) stay white.
+            if (len > 1.0e-6f) { nx /= len; ny /= len; nz /= len; }
+            q.nx = nx; q.ny = ny; q.nz = nz;
+
+            // Route by chunk render layer: only SOLID is fully opaque (no alpha test) → OPAQUE-flagged
+            // geometry whose any-hit the driver skips. CUTOUT/TRANSLUCENT keep the alpha-test any-hit. Blocks
+            // are never the water bucket (fluids only). The non-SOLID flag also marks overlay candidates.
+            q.cutout = quad.materialInfo().layer() != ChunkSectionLayer.SOLID;
+
+            // Biome tint: tintIndex >= 0 means biome-colored (grass/foliage). In 26.2 the color comes from a
+            // BlockTintSource; colorInWorld blends the biome color at this pos. Untinted quads stay white.
+            // tintIndex >= 0 also marks the overlay member of a base+overlay pair (the tinted one is on top).
             int tintIndex = quad.materialInfo().tintIndex();
+            q.tinted = tintIndex >= 0;
             float tr = 1f, tg = 1f, tb = 1f;
             if (tintIndex >= 0 && blockColors != null && state != null) {
                 BlockTintSource src = blockColors.getTintSource(state, tintIndex);
@@ -1450,46 +1448,174 @@ public final class RtTerrain {
                     tb = (rgb & 0xFF) * (1f / 255f);
                 }
             }
+            q.tr = tr; q.tg = tg; q.tb = tb;
 
-            // Emissive: vanilla block light level (0..15) -> 0..1, stashed in the free normal.w slot
-            // (no per-prim layout change). The path tracer multiplies it by albedo for colored glow.
-            float emission = state != null ? state.getLightEmission() / 15f : 0f;
-
+            // Emissive: vanilla block light level (0..15) -> 0..1, stashed in the free normal.w slot.
+            q.emission = state != null ? state.getLightEmission() / 15f : 0f;
             // P6.1: heuristic PBR material (roughness, metalness) for the GGX BRDF / DLSS-RR guides.
-            float rough = RtMaterials.roughness(state);
-            float metal = RtMaterials.metalness(state);
-            // P6.2a/b: this quad's sprite's LabPBR maps get ingested into the parallel atlases, flagging
-            // the prim — mat.z = 1 if an _s map exists (per-texel roughness/metalness/F0/emission), mat.w
-            // = 1 if an _n map exists (per-texel normal). The ingest (RtBlockMaterials.ensure) creates GPU
-            // textures, so it's deferred to the render thread: record the sprite per triangle and write a
-            // 0 placeholder now; resolveMaterials() patches hasS/hasN before upload.
+            q.rough = RtMaterials.roughness(state);
+            q.metal = RtMaterials.metalness(state);
+            // P6.2a/b: the sprite's LabPBR maps get ingested into the parallel atlases (deferred to the render
+            // thread); record the sprite per triangle, resolveMaterials() patches hasS/hasN before upload.
             TextureAtlasSprite sprite = quad.materialInfo().sprite();
-            TextureAtlasSprite materialSprite = RtMaterials.ENABLED ? sprite : null;
+            q.sprite = sprite;
+            q.materialSprite = RtMaterials.ENABLED ? sprite : null;
+        }
 
-            FloatArrayList prim = g.prim;
-            for (int t = 0; t < 2; t++) { // one {normal+emission, tint, mat} record per triangle
-                prim.add(nx);
-                prim.add(ny);
-                prim.add(nz);
-                prim.add(emission);
-                prim.add(tr);
-                prim.add(tg);
-                prim.add(tb);
-                prim.add(0f);
-                prim.add(rough);
-                prim.add(metal);
-                prim.add(0f); // hasS placeholder — patched in resolveMaterials()
-                prim.add(0f); // hasN placeholder
-                g.triSprites.add(materialSprite);
-                g.ommSprites.add(sprite);
+        /** Acquire a pooled PendingQuad for the current block (grown on demand, count reset by flushBlock). */
+        private PendingQuad acquire() {
+            if (pendingCount == pending.size()) {
+                pending.add(new PendingQuad());
+            }
+            return pending.get(pendingCount++);
+        }
+
+        /** Drop the current block's buffered quads without emitting (a meshing throw left them partial). */
+        void discardBlock() {
+            pendingCount = 0;
+        }
+
+        /** Resolve coplanar ties among the current block's quads, then emit them into the section buckets. */
+        void flushBlock() {
+            int n = pendingCount;
+            if (n == 0) {
+                return;
+            }
+            if (n >= 2 && n <= RESOLVE_CAP) {
+                resolveCoplanar(n);
+            }
+            for (int i = 0; i < n; i++) {
+                emit(pending.get(i));
+            }
+            pendingCount = 0;
+        }
+
+        /**
+         * Union coincident quads (same 4 corners, any winding) into groups, then within each group keep the
+         * first member (the opaque/untinted base if present) in place and push the rest outward along their
+         * own normals by {@link #OFFSET} × rank. Same-normal layers (grass base/overlay) fan out along one
+         * direction; opposite-normal pairs (cross faces) separate because each moves along its own normal.
+         */
+        private void resolveCoplanar(int n) {
+            int[] gid = gidScratch.length >= n ? gidScratch : (gidScratch = new int[n]);
+            for (int i = 0; i < n; i++) {
+                gid[i] = -1;
+            }
+            for (int i = 0; i < n; i++) {
+                if (gid[i] != -1) {
+                    continue;
+                }
+                gid[i] = i;
+                for (int j = i + 1; j < n; j++) {
+                    if (gid[j] == -1 && coincident(pending.get(i), pending.get(j))) {
+                        gid[j] = i;
+                    }
+                }
+            }
+            for (int r = 0; r < n; r++) {
+                if (gid[r] != r) {
+                    continue; // not a group representative
+                }
+                int rank = 0;
+                // Pass 1: bases (opaque + untinted) — the first stays put (rank 0), so the overlay lands in
+                // front of it. Pass 2: overlays (cutout or tinted) — always pushed outward.
+                for (int k = 0; k < n; k++) {
+                    PendingQuad q = pending.get(k);
+                    if (gid[k] == r && !(q.cutout || q.tinted)) {
+                        if (rank > 0) {
+                            offset(q, OFFSET * rank);
+                        }
+                        rank++;
+                    }
+                }
+                for (int k = 0; k < n; k++) {
+                    PendingQuad q = pending.get(k);
+                    if (gid[k] == r && (q.cutout || q.tinted)) {
+                        if (rank > 0) {
+                            offset(q, OFFSET * rank);
+                        }
+                        rank++;
+                    }
+                }
             }
         }
 
-        private void addVertex(Geom g, Vector3fc p, float x, float y, float z) {
-            g.verts.add(p.x() + x);
-            g.verts.add(p.y() + y);
-            g.verts.add(p.z() + z);
+        /** True if every corner of {@code a} coincides with a corner of {@code b} (same quad, any winding). */
+        private static boolean coincident(PendingQuad a, PendingQuad b) {
+            for (int k = 0; k < 4; k++) {
+                boolean found = false;
+                for (int m = 0; m < 4; m++) {
+                    if (Math.abs(a.x[k] - b.x[m]) < COINCIDENT_EPS
+                            && Math.abs(a.y[k] - b.y[m]) < COINCIDENT_EPS
+                            && Math.abs(a.z[k] - b.z[m]) < COINCIDENT_EPS) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    return false;
+                }
+            }
+            return true;
         }
+
+        /** Shift all four of a quad's corners by {@code d} along its (outward) normal. */
+        private static void offset(PendingQuad q, float d) {
+            for (int v = 0; v < 4; v++) {
+                q.x[v] += q.nx * d;
+                q.y[v] += q.ny * d;
+                q.z[v] += q.nz * d;
+            }
+        }
+
+        /** Emit one resolved quad into its section bucket (2 triangles, corner UVs, per-prim records). */
+        private void emit(PendingQuad q) {
+            Geom g = q.cutout ? cur.cutout : cur.opaque;
+            int base = g.verts.size() / 3;
+            for (int k = 0; k < 4; k++) {
+                g.verts.add(q.x[k]);
+                g.verts.add(q.y[k]);
+                g.verts.add(q.z[k]);
+            }
+            IntArrayList idx = g.idx;
+            idx.add(base);
+            idx.add(base + 1);
+            idx.add(base + 2);
+            idx.add(base);
+            idx.add(base + 2);
+            idx.add(base + 3);
+            // Per-triangle corner UVs (primitive order matching the two triangles: 0,1,2 then 0,2,3).
+            addTriUv(g, q.uv[0], q.uv[1], q.uv[2]);
+            addTriUv(g, q.uv[0], q.uv[2], q.uv[3]);
+            FloatArrayList prim = g.prim;
+            for (int t = 0; t < 2; t++) { // one {normal+emission, tint, mat} record per triangle
+                prim.add(q.nx);
+                prim.add(q.ny);
+                prim.add(q.nz);
+                prim.add(q.emission);
+                prim.add(q.tr);
+                prim.add(q.tg);
+                prim.add(q.tb);
+                prim.add(0f);
+                prim.add(q.rough);
+                prim.add(q.metal);
+                prim.add(0f); // hasS placeholder — patched in resolveMaterials()
+                prim.add(0f); // hasN placeholder
+                g.triSprites.add(q.materialSprite);
+                g.ommSprites.add(q.sprite);
+            }
+        }
+    }
+
+    /** One block's buffered quad, awaiting coplanar resolution before it is emitted into a section bucket. */
+    private static final class PendingQuad {
+        final float[] x = new float[4], y = new float[4], z = new float[4];
+        final long[] uv = new long[4];
+        float nx, ny, nz;
+        boolean cutout; // non-SOLID render layer (alpha-tested) — also an overlay candidate
+        boolean tinted; // tintIndex >= 0 — the tinted member of a base+overlay pair
+        float tr, tg, tb, emission, rough, metal;
+        TextureAtlasSprite sprite, materialSprite;
     }
 
     /** Append one triangle's 3 corner UVs (6 floats) from packed UVPairs. UVPair packs u in the high 32
