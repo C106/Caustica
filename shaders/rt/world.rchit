@@ -91,6 +91,7 @@ struct Payload {
     float metalness; // P6.1: 0 = dielectric, 1 = conductor
     vec3 f0;         // P6.2a: specular reflectance at normal incidence (dielectric 0.04 / LabPBR / metal)
     float showCelestial; // sky-disc gate (raygen-set, read by world.rmiss); unused here, kept for layout match
+    float sss;           // P6.5: LabPBR _s blue channel SSS strength (0 = no subsurface scattering)
 };
 layout(location = 0) rayPayloadInEXT Payload payload;
 hitAttributeEXT vec2 attribs;
@@ -141,7 +142,7 @@ const float NORMAL_AO_STRENGTH = 0.5;
 // LabPBR _s decode (shared by terrain + entities): red = perceptual smoothness -> roughness; green =
 // reflectance (dielectric F0 0..229 / predefined metal 230..237 / generic metal albedo); alpha = emission
 // (255 = ignored). `albedo` feeds the generic-metal F0.
-void decodeSpec(vec4 s, vec3 albedo, out float rough, out float metal, out vec3 f0, out float emission) {
+void decodeSpec(vec4 s, vec3 albedo, out float rough, out float metal, out vec3 f0, out float emission, out float sss) {
     rough = (1.0 - s.r) * (1.0 - s.r);
     float g = s.g * 255.0;
     if (g < 229.5) {
@@ -156,6 +157,8 @@ void decodeSpec(vec4 s, vec3 albedo, out float rough, out float metal, out vec3 
     }
     float a = s.a * 255.0;
     emission = a < 254.5 ? a / 254.0 : 0.0;
+    float b = s.b * 255.0;
+    sss = b > 64.5 ? (b - 65.0) / 190.0 : 0.0; // P6.5: porosity 0-64 ignored; SSS 65-255 → 0..1
 }
 
 // LabPBR _n decode (shared): rotate the tangent-space normal into world space via a TBN built from the hit
@@ -223,6 +226,7 @@ void main() {
         payload.roughness = 1.0;
         payload.metalness = 0.0;
         payload.f0 = vec3(0.0);
+        payload.sss = 0.0;
         return;
     }
     if ((gl_InstanceCustomIndexEXT & ENTITY_BIT) != 0) {
@@ -253,13 +257,14 @@ void main() {
         vec3 f0 = mix(vec3(0.04), albedo, metal);
         float emission = 0.0;
         float ao = 1.0;
+        float sss = 0.0;
         // LabPBR _s / _n for entities. mat.z/mat.w encode the source: 2 = block atlas (block-like entities —
         // block items / falling / contained blocks; sampled from the terrain parallel atlases at the same UV,
         // since their geometry textures from the block atlas), 1 = per-type bindless entity arrays (P6.2c mobs).
         if (pr.mat.z > 1.5) {
-            decodeSpec(textureLod(blockSpecAtlas, euvCoord, 0.0), albedo, rough, metal, f0, emission);
+            decodeSpec(textureLod(blockSpecAtlas, euvCoord, 0.0), albedo, rough, metal, f0, emission, sss);
         } else if (pr.mat.z > 0.5) {
-            decodeSpec(texture(entitySpecTex[nonuniformEXT(texSlot)], euvCoord), albedo, rough, metal, f0, emission);
+            decodeSpec(texture(entitySpecTex[nonuniformEXT(texSlot)], euvCoord), albedo, rough, metal, f0, emission, sss);
         }
         if (pr.mat.w > 1.5) {
             n = perturbNormal(n, gl_HitTriangleVertexPositionsEXT[0], gl_HitTriangleVertexPositionsEXT[1],
@@ -288,6 +293,7 @@ void main() {
         payload.roughness = rough;
         payload.metalness = metal;
         payload.f0 = f0;
+        payload.sss = sss;
         return;
     }
 
@@ -342,12 +348,14 @@ void main() {
     float emission = pr.normal.w;   // 0..1 block light level (extraction): the heuristic emission source
     // P6.2a LabPBR _s, gated by mat.z — shared decode. When an _s map is authored we trust ITS emission and
     // REPLACE the block-light heuristic, so emissive texels come from the pack, not the light level.
-    // (blue channel: porosity 0..64 / SSS 65..255 — deferred, not consumed yet.)
+    // P6.5: blue channel (porosity 0-64 / SSS 65-255) now decoded into sss (0 if no _s map or porosity range).
+    float sss = 0.0;
     if (pr.mat.z > 0.5) {
-        decodeSpec(textureLod(blockSpecAtlas, uv, 0.0), payload.albedo, rough, metal, f0, emission);
+        decodeSpec(textureLod(blockSpecAtlas, uv, 0.0), payload.albedo, rough, metal, f0, emission, sss);
     }
     payload.roughness = rough;
     payload.metalness = metal;
     payload.f0 = f0;
     payload.emission = emission;
+    payload.sss = sss;
 }

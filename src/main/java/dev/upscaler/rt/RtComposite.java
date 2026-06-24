@@ -72,7 +72,7 @@ public final class RtComposite {
 
     // invViewProj(64) + camOffset(@64) + sectionTableAddr(@80) + debugView(@88) + frameIndex(@92)
     // + prevViewProj(@96) + camDelta(@160) + spp(@172) + jitter(@176) + entityTableAddr(@184)
-    // + flags(@192): bit 0 = camera submerged, bit 1 = PBR BRDF enabled
+    // + flags(@192): bit 0 = camera submerged, bit 1 = PBR BRDF enabled, bit 3 = SSS translucency (P6.5)
     // + dynamic sky (16-byte aligned vec4s): sunDir+dayFactor(@208) + lightDir(@224) + lightRadiance(@240)
     // + sky rewrite: moonDir+moonPhase(@256) + celestialAxis+starAngle(@272) + sunUv(@288) + moonUv(@304)
     private static final int WORLD_PUSH_SIZE = 320;
@@ -552,6 +552,9 @@ public final class RtComposite {
             var level = Minecraft.getInstance().level;
             if (level != null && level.getFluidState(BlockPos.containing(camX, camY, camZ)).is(FluidTags.WATER)) {
                 flags |= 0b01;
+            }
+            if (Boolean.parseBoolean(System.getProperty("upscaler.rt.sss", "true"))) {
+                flags |= 0b1000; // LabPBR SSS translucency
             }
             push.putInt(192, flags);
             writeSky(push);

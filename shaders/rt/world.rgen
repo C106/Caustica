@@ -96,6 +96,7 @@ struct Payload {
     float metalness; // P6.1: 0 = dielectric, 1 = conductor.
     vec3 f0;         // P6.2a: specular F0 (set by the chit: dielectric 0.04 / LabPBR green / metal).
     float showCelestial; // raygen sets this before each trace: >0.5 ⇒ world.rmiss draws the sun/moon disc.
+    float sss;           // P6.5: LabPBR _s blue channel SSS strength (0 = no subsurface scattering)
 };
 layout(location = 0) rayPayloadEXT Payload payload;
 layout(location = 1) rayPayloadEXT float shadowVis; // 1.0 if the visibility ray escaped, else 0.0
@@ -151,6 +152,16 @@ vec3 fresnelSchlick(float cosT, vec3 f0) {
     float m = clamp(1.0 - cosT, 0.0, 1.0);
     float m2 = m * m;
     return f0 + (1.0 - f0) * (m2 * m2 * m);
+}
+
+// P6.5: Henyey–Greenstein phase function (with 4π normalisation so it integrates to 1 over the sphere).
+// g=0 → isotropic; g>0 → forward-scatter peak at cosT=1 (light and view aligned through a thin slab).
+const float SSS_G        = 0.6; // forward-scatter anisotropy; leaves/grass are quite directional
+const float SSS_STRENGTH = 1.0; // scale factor; 1.0 ≈ 2.5× the Lambertian at peak (sss=1, cosT=1, backNdl=1)
+const int   MAX_SSS_BOUNCE = 1; // fire the transmission shadow ray on primary + first indirect hit only
+float hg(float cosT, float g) {
+    float g2 = g * g;
+    return (1.0 - g2) / (4.0 * PI * pow(max(0.0, 1.0 + g2 - 2.0 * g * cosT), 1.5));
 }
 
 // NVIDIA RR guide-buffer helper: integrated/view-dependent specular reflectivity, not raw F0.
@@ -402,6 +413,7 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed) {
     vec3 L = vec3(0.0);
     vec3 throughput = vec3(1.0);
     bool pbr = (pc.flags & 2u) != 0u; // P6.1: GGX BRDF + material guides (else legacy Lambertian)
+    bool sssOn = (pc.flags & 8u) != 0u; // P6.5: LabPBR SSS translucency (transmission NEE through thin surfaces)
     // P6.1: start submerged if the camera is in water (fixes the air->water first-segment orientation
     // + absorption when the eye is underwater; without it the first hit was treated as an air segment).
     bool inWater = (pc.flags & 1u) != 0u;
@@ -516,6 +528,7 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed) {
         }
 
         vec3 albedo = payload.albedo;
+        float sss = payload.sss; // P6.5: LabPBR SSS strength (0 when absent; non-zero only for _s-mapped terrain/entities)
         vec3 p = hitPos + n * SURF_BIAS;
         vec3 v = -rd; // view direction (toward the camera / incoming ray)
 
@@ -573,6 +586,23 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed) {
                     brdf += (D * G) * F / (4.0 * ndv * ndl); // Cook–Torrance specular
                 }
                 L += throughput * brdf * pc.lightRadiance.xyz * ndl * vis;
+            }
+        }
+
+        // P6.5 SSS: thin-surface transmission. Light entering from the back face scatters through toward the
+        // viewer via a forward-biased HG phase (leaves/grass backlit by the sun glow when you look through them
+        // toward the light source). Shadow ray fires from the back face to avoid self-occlusion. Limited to
+        // bounce <= MAX_SSS_BOUNCE for cost; the sss > 0 guard makes it free on non-SSS geometry.
+        // cosT = dot(lightDir, rd): rd tracks the ray toward the sun when the sun is behind the slab,
+        // giving cosT ≈ 1 → forward-scatter peak.
+        if (sssOn && sss > 0.0 && bounce <= MAX_SSS_BOUNCE) {
+            float backNdl = max(0.0, dot(-n, lightDir));
+            if (backNdl > 0.0) {
+                float visB = visibility(hitPos - n * SURF_BIAS, lightDir, 10000.0);
+                if (visB > 0.0) {
+                    float cosT = dot(lightDir, rd);
+                    L += throughput * diffAlb * sss * SSS_STRENGTH * hg(cosT, SSS_G) * backNdl * pc.lightRadiance.xyz * visB;
+                }
             }
         }
 
