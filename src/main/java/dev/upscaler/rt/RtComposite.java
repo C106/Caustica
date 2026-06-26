@@ -21,7 +21,6 @@ import net.minecraft.tags.FluidTags;
 import net.minecraft.util.Mth;
 import net.minecraft.world.attribute.EnvironmentAttributes;
 import net.minecraft.world.level.MoonPhase;
-import org.joml.Vector3f;
 import org.joml.Matrix4f;
 import org.joml.Matrix4fc;
 import org.lwjgl.system.MemoryStack;
@@ -73,10 +72,11 @@ public final class RtComposite {
 
     // invViewProj(64) + camOffset(@64) + sectionTableAddr(@80) + debugView(@88) + frameIndex(@92)
     // + prevViewProj(@96) + camDelta(@160) + spp(@172) + jitter(@176) + entityTableAddr(@184)
-    // + flags(@192): bit 0 = camera submerged, bit 1 = PBR BRDF enabled, bit 3 = SSS translucency (P6.5)
+    // + flags(@192): bit 0 = camera submerged, bit 1 = PBR BRDF enabled, bit 3 = SSS translucency (P6.5), bit 4 = water waves
     // + dynamic sky (16-byte aligned vec4s): sunDir+dayFactor(@208) + lightDir(@224) + lightRadiance(@240)
     // + sky rewrite: moonDir+moonPhase(@256) + celestialAxis+starAngle(@272) + sunUv(@288) + moonUv(@304)
-    private static final int WORLD_PUSH_SIZE = 320;
+    // + W1/W2 water: waterParams(@320) xyz=camera-biome tint, w=wave time; waterAnchor(@336) xy=wave anchor
+    private static final int WORLD_PUSH_SIZE = 352;
     private static final int GUIDE_COUNT = 7; // RR guide buffers bound at world-pipeline bindings 3..9
     // Frames a retired per-frame TLAS must outlive before it's freed (> frames-in-flight); matches
     // RtTerrain's deferred-free horizon. The frame TLAS is built + traced this frame, then freed once
@@ -98,11 +98,20 @@ public final class RtComposite {
      * Radii in degrees; the real sun/moon are ~0.27° but a touch larger reads as a pleasant penumbra.
      */
     public static final boolean SOFT_SHADOWS = Boolean.parseBoolean(System.getProperty("upscaler.rt.softShadows", "true"));
+    public static final boolean SSS = Boolean.parseBoolean(System.getProperty("upscaler.rt.sss", "true"));
+    public static final boolean WATER_WAVES = Boolean.parseBoolean(System.getProperty("upscaler.rt.waterWaves", "true"));
     private static final float SUN_ANGULAR_RADIUS = (float) Math.toRadians(Double.parseDouble(System.getProperty("upscaler.rt.sunAngularRadius", "0.6")));
     private static final float MOON_ANGULAR_RADIUS = (float) Math.toRadians(Double.parseDouble(System.getProperty("upscaler.rt.moonAngularRadius", "1.5")));
     private static final float SUN_NOON_SOUTH_TILT = (float) Math.toRadians(Double.parseDouble(System.getProperty("upscaler.rt.sunNoonSouthDeg", "0.0")));
     private static final float SUN_NOON_Y = Mth.cos(SUN_NOON_SOUTH_TILT);
     private static final float SUN_NOON_Z = Mth.sin(SUN_NOON_SOUTH_TILT);
+    private static final float FIXED_SUN_INV_LEN = 1.0f / (float) Math.sqrt(0.35f * 0.35f + 0.9f * 0.9f + 0.25f * 0.25f);
+    private static final float FIXED_SUN_X = 0.35f * FIXED_SUN_INV_LEN;
+    private static final float FIXED_SUN_Y = 0.9f * FIXED_SUN_INV_LEN;
+    private static final float FIXED_SUN_Z = 0.25f * FIXED_SUN_INV_LEN;
+    private static final int WATER_ANCHOR_MASK = 4095;
+    private static final Identifier SUN_ID = Identifier.withDefaultNamespace("sun");
+    private static final Identifier[] MOON_IDS = createMoonIds();
     // Celestial rotation axis (the pole the sun/moon arc about): perpendicular to the east-west arc,
     // tilted by SUN_NOON_SOUTH_TILT. Pushed so the sky shader can build the sun/moon square's tangent
     // frame (right = travel direction) and wheel the starfield. = normalize(noonDir x sunriseDir).
@@ -177,6 +186,8 @@ public final class RtComposite {
     private final Matrix4f mvPrevProjView = new Matrix4f();
     private final Matrix4f mvCurProjView = new Matrix4f();
     private final Matrix4f mvPushMatrix = new Matrix4f();
+    private final Matrix4f frameInvViewProj = new Matrix4f();
+    private final BlockPos.MutableBlockPos cameraBlockPos = new BlockPos.MutableBlockPos();
     private double mvPrevCamX;
     private double mvPrevCamY;
     private double mvPrevCamZ;
@@ -195,6 +206,16 @@ public final class RtComposite {
     private double camY;
     private double camZ;
     private boolean frameCaptured;
+    private long celestialUvAtlasHandle;
+    private int celestialUvMoonPhase = -1;
+    private float sunU0;
+    private float sunV0;
+    private float sunU1 = 1f;
+    private float sunV1 = 1f;
+    private float moonU0;
+    private float moonV0;
+    private float moonU1 = 1f;
+    private float moonV1 = 1f;
 
     // Per-frame TLASes awaiting a frames-in-flight-safe free (the build + trace that used them must
     // finish first). Each is retired at the composite frame counter it was built on + KEEP_FRAMES.
@@ -205,6 +226,15 @@ public final class RtComposite {
     }
 
     private RtComposite() {
+    }
+
+    private static Identifier[] createMoonIds() {
+        MoonPhase[] phases = MoonPhase.values();
+        Identifier[] ids = new Identifier[phases.length];
+        for (int i = 0; i < phases.length; i++) {
+            ids[i] = Identifier.withDefaultNamespace("moon/" + phases[i].getSerializedName());
+        }
+        return ids;
     }
 
     public boolean hasFailed() {
@@ -349,10 +379,11 @@ public final class RtComposite {
         // Sky rewrite: bind the vanilla celestials atlas (sun + moon phases) for world.rmiss. The view
         // handle is stable across frames; the shader only samples it inside the sun/moon discs (sky
         // directions), so the block-atlas fallback is never read if the celestials atlas isn't ready.
+        long celView = celestialsAtlasView();
         if (worldPipeline.hasSkyAtlas()) {
-            long celView = celestialsAtlasView();
             worldPipeline.setSkyAtlas(celView != 0L ? celView : atlasView, sampler);
         }
+        setCelestialUvAtlas(celView);
         RtTerrain.markAllDirty();
     }
 
@@ -380,6 +411,7 @@ public final class RtComposite {
      */
     public void onResourceReloadStart() {
         reloadRebindRequested = true;
+        setCelestialUvAtlas(0L);
         RtContext ctx = RtContext.currentOrNull();
         if (ctx != null && worldPipeline != null) {
             ctx.waitIdle();
@@ -533,7 +565,7 @@ public final class RtComposite {
             pushSlot = (pushSlot + 1) % PUSH_RING;
             RtBuffer pushBuf = pushRing[pushSlot];
             ByteBuffer push = MemoryUtil.memByteBuffer(pushBuf.mapped, WORLD_PUSH_SIZE);
-            new Matrix4f(frameProjection).mul(frameViewRotation).invert().get(0, push);
+            frameInvViewProj.set(frameProjection).mul(frameViewRotation).invert().get(0, push);
             push.putFloat(64, (float) (camX - terrain.blockX));
             push.putFloat(68, (float) (camY - terrain.blockY));
             push.putFloat(72, (float) (camZ - terrain.blockZ));
@@ -551,13 +583,16 @@ public final class RtComposite {
             // when the eye is submerged, fixing the air→water first-segment orientation).
             int flags = RtMaterials.ENABLED ? 0b10 : 0;
             var level = Minecraft.getInstance().level;
-            if (level != null && level.getFluidState(BlockPos.containing(camX, camY, camZ)).is(FluidTags.WATER)) {
-                flags |= 0b01;
+            if (level != null) {
+                cameraBlockPos.set(Mth.floor(camX), Mth.floor(camY), Mth.floor(camZ));
+                if (level.getFluidState(cameraBlockPos).is(FluidTags.WATER)) {
+                    flags |= 0b01;
+                }
             }
-            if (Boolean.parseBoolean(System.getProperty("upscaler.rt.sss", "true"))) {
+            if (SSS) {
                 flags |= 0b1000; // LabPBR SSS translucency
             }
-            if (Boolean.parseBoolean(System.getProperty("upscaler.rt.waterWaves", "true"))) {
+            if (WATER_WAVES) {
                 flags |= 0b10000; // W1: animated water wave normals
             }
             push.putInt(192, flags);
@@ -686,13 +721,12 @@ public final class RtComposite {
         float moonX, moonY, moonZ, moonPhase, starAngle, starBrightness;
         Minecraft mc = Minecraft.getInstance();
         if (!DYNAMIC_SKY || mc.level == null) {
-            Vector3f s = new Vector3f(0.35f, 0.9f, 0.25f).normalize();
-            sunX = s.x; sunY = s.y; sunZ = s.z; dayFactor = 1f;
-            lx = s.x; ly = s.y; lz = s.z;
+            sunX = FIXED_SUN_X; sunY = FIXED_SUN_Y; sunZ = FIXED_SUN_Z; dayFactor = 1f;
+            lx = sunX; ly = sunY; lz = sunZ;
             rr = 4.2f; rg = 4.0f; rb = 3.6f; // fixed noon sun radiance
             lightRadius = SOFT_SHADOWS ? SUN_ANGULAR_RADIUS : 0f;
             // Fixed-sky A/B: park the moon opposite the sun, full phase, no stars (daylit).
-            moonX = -s.x; moonY = -s.y; moonZ = -s.z; moonPhase = 0f; starAngle = 0f; starBrightness = 0f;
+            moonX = -sunX; moonY = -sunY; moonZ = -sunZ; moonPhase = 0f; starAngle = 0f; starBrightness = 0f;
         } else {
             float partial = mc.getDeltaTracker().getGameTimeDeltaPartialTick(false);
             var probe = mc.gameRenderer.mainCamera().attributeProbe();
@@ -747,20 +781,42 @@ public final class RtComposite {
      * boot / no resources) leaves full-range UVs and the shader's block-atlas fallback covers it.
      */
     private void writeCelestialUv(ByteBuffer push, float moonPhaseIndex) {
-        float su0 = 0f, sv0 = 0f, su1 = 1f, sv1 = 1f;
-        float mu0 = 0f, mv0 = 0f, mu1 = 1f, mv1 = 1f;
+        if (celestialUvAtlasHandle == 0L) {
+            setCelestialUvAtlas(celestialsAtlasView());
+        }
+        int phase = Math.clamp((int) moonPhaseIndex, 0, MOON_IDS.length - 1);
+        if (phase != celestialUvMoonPhase) {
+            refreshCelestialUvCache(phase);
+        }
+        push.putFloat(288, sunU0); push.putFloat(292, sunV0); push.putFloat(296, sunU1); push.putFloat(300, sunV1);
+        push.putFloat(304, moonU0); push.putFloat(308, moonV0); push.putFloat(312, moonU1); push.putFloat(316, moonV1);
+    }
+
+    private void setCelestialUvAtlas(long atlasHandle) {
+        if (celestialUvAtlasHandle == atlasHandle) {
+            return;
+        }
+        celestialUvAtlasHandle = atlasHandle;
+        celestialUvMoonPhase = -1;
+        sunU0 = 0f; sunV0 = 0f; sunU1 = 1f; sunV1 = 1f;
+        moonU0 = 0f; moonV0 = 0f; moonU1 = 1f; moonV1 = 1f;
+    }
+
+    private void refreshCelestialUvCache(int moonPhase) {
+        sunU0 = 0f; sunV0 = 0f; sunU1 = 1f; sunV1 = 1f;
+        moonU0 = 0f; moonV0 = 0f; moonU1 = 1f; moonV1 = 1f;
         try {
-            TextureAtlas atlas = Minecraft.getInstance().getAtlasManager().getAtlasOrThrow(AtlasIds.CELESTIALS);
-            TextureAtlasSprite sun = atlas.getSprite(Identifier.withDefaultNamespace("sun"));
-            su0 = sun.getU0(); sv0 = sun.getV0(); su1 = sun.getU1(); sv1 = sun.getV1();
-            MoonPhase mp = MoonPhase.values()[Math.clamp((int) moonPhaseIndex, 0, MoonPhase.COUNT - 1)];
-            TextureAtlasSprite moon = atlas.getSprite(Identifier.withDefaultNamespace("moon/" + mp.getSerializedName()));
-            mu0 = moon.getU0(); mv0 = moon.getV0(); mu1 = moon.getU1(); mv1 = moon.getV1();
+            if (celestialUvAtlasHandle != 0L) {
+                TextureAtlas atlas = Minecraft.getInstance().getAtlasManager().getAtlasOrThrow(AtlasIds.CELESTIALS);
+                TextureAtlasSprite sun = atlas.getSprite(SUN_ID);
+                sunU0 = sun.getU0(); sunV0 = sun.getV0(); sunU1 = sun.getU1(); sunV1 = sun.getV1();
+                TextureAtlasSprite moon = atlas.getSprite(MOON_IDS[moonPhase]);
+                moonU0 = moon.getU0(); moonV0 = moon.getV0(); moonU1 = moon.getU1(); moonV1 = moon.getV1();
+            }
         } catch (Exception ignored) {
             // celestials atlas not yet loaded — keep full-range UVs (fallback texture is the block atlas)
         }
-        push.putFloat(288, su0); push.putFloat(292, sv0); push.putFloat(296, su1); push.putFloat(300, sv1);
-        push.putFloat(304, mu0); push.putFloat(308, mv0); push.putFloat(312, mu1); push.putFloat(316, mv1);
+        celestialUvMoonPhase = moonPhase;
     }
 
     /** Hermite smoothstep matching GLSL semantics (0 below edge0, 1 above edge1). */

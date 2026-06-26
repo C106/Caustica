@@ -116,6 +116,8 @@ public final class RtEntities {
     private final QuadParticleRenderState particleScratch = new QuadParticleRenderState();
     private final FloatArrayList particleDisp = new FloatArrayList();
     private IdentityHashMap<Particle, ParticlePrev> particlePrev = new IdentityHashMap<>();
+    private IdentityHashMap<Particle, ParticlePrev> particleCur = new IdentityHashMap<>();
+    private final float[] particleCenterScratch = new float[3];
 
     /** Previous frame's particle center (rebase-space) + that frame's rebase origin, for the MV diff. */
     private record ParticlePrev(float cx, float cy, float cz, int rbx, int rby, int rbz) {
@@ -150,6 +152,7 @@ public final class RtEntities {
 
     // Persistent per-block-entity geometry, keyed by BlockPos.asLong(). Built once and reused every frame.
     private final Map<Long, BeEntry> beCache = new HashMap<>();
+    private final List<BeCandidate> beCandidates = new ArrayList<>();
     // (Re)builds recorded so far this frame, reset each beginFrame; gates new BE builds to BE_BUILDS_PER_FRAME.
     private int beBuildsThisFrame;
 
@@ -424,6 +427,8 @@ public final class RtEntities {
     private void captureParticles(RtContext ctx, FrameBuild build, Minecraft mc, float partial,
                                   int rbx, int rby, int rbz, Matrix4f projection, Matrix4f viewRotation) {
         if (!PARTICLES_ENABLED || build.full()) {
+            particlePrev.clear();
+            particleCur.clear();
             return;
         }
         Camera cam = mc.gameRenderer.mainCamera();
@@ -433,6 +438,8 @@ public final class RtEntities {
         Map<ParticleRenderType, ParticleGroup<?>> groups =
                 ((ParticleEngineAccessor) mc.particleEngine).upscaler$getParticleGroups();
         if (groups == null || groups.isEmpty()) {
+            particlePrev.clear();
+            particleCur.clear();
             return;
         }
         capture.reset();
@@ -444,7 +451,8 @@ public final class RtEntities {
         // particles for identity, so cull the off-screen ones out of the BVH after capturing each.
         Frustum frustum = new Frustum(viewRotation, projection);
         frustum.prepare(camPos.x, camPos.y, camPos.z);
-        IdentityHashMap<Particle, ParticlePrev> cur = new IdentityHashMap<>();
+        IdentityHashMap<Particle, ParticlePrev> cur = particleCur;
+        cur.clear();
         try {
             for (ParticleGroup<?> group : groups.values()) {
                 Queue<? extends Particle> queue = ((ParticleGroupAccessor) group).upscaler$getParticles();
@@ -466,16 +474,16 @@ public final class RtEntities {
                     if (vertAfter == vertBefore) {
                         continue; // nothing captured for this particle
                     }
-                    float[] center = particleCenter(vertBefore, vertAfter);
+                    particleCenter(vertBefore, vertAfter, particleCenterScratch);
                     // pointInFrustum wants the world position: rebased center + rebase origin.
-                    if (!frustum.pointInFrustum(center[0] + rbx, center[1] + rby, center[2] + rbz)) {
+                    if (!frustum.pointInFrustum(particleCenterScratch[0] + rbx, particleCenterScratch[1] + rby, particleCenterScratch[2] + rbz)) {
                         capture.verts.size(vb); // off-screen → truncate this particle back out (clean quad boundary)
                         capture.idx.size(ib);
                         capture.uvList.size(ub);
                         capture.prim.size(prb);
                         continue;
                     }
-                    appendParticleMv(p, center, vertBefore, vertAfter, rbx, rby, rbz, cur);
+                    appendParticleMv(p, particleCenterScratch, vertBefore, vertAfter, rbx, rby, rbz, cur);
                 }
             }
         } catch (Throwable t) {
@@ -483,7 +491,9 @@ public final class RtEntities {
             particleDisp.clear();
             throw new RuntimeException("RT particle capture failed", t); // propagate to composite() (see entity path)
         }
+        IdentityHashMap<Particle, ParticlePrev> oldPrev = particlePrev;
         particlePrev = cur;
+        particleCur = oldPrev;
         if (capture.isEmpty()) {
             return;
         }
@@ -492,7 +502,7 @@ public final class RtEntities {
     }
 
     /** Average (rebase-space) position of a captured particle's verts — approximates the particle center. */
-    private float[] particleCenter(int vertBefore, int vertAfter) {
+    private void particleCenter(int vertBefore, int vertAfter, float[] out) {
         float[] v = capture.verts.elements();
         float cx = 0f, cy = 0f, cz = 0f;
         for (int i = vertBefore; i < vertAfter; i++) {
@@ -501,7 +511,9 @@ public final class RtEntities {
             cz += v[i * 3 + 2];
         }
         int vc = vertAfter - vertBefore;
-        return new float[]{cx / vc, cy / vc, cz / vc};
+        out[0] = cx / vc;
+        out[1] = cy / vc;
+        out[2] = cz / vc;
     }
 
     /**
@@ -541,7 +553,8 @@ public final class RtEntities {
         long now = RtComposite.frameCounter();
         int pcx = rbx >> 4, pcz = rbz >> 4;
         Vec3 cam = cameraState.pos;
-        List<BeCandidate> candidates = new ArrayList<>();
+        List<BeCandidate> candidates = beCandidates;
+        candidates.clear();
         for (int cx = pcx - BE_VIEW_CHUNKS; cx <= pcx + BE_VIEW_CHUNKS; cx++) {
             for (int cz = pcz - BE_VIEW_CHUNKS; cz <= pcz + BE_VIEW_CHUNKS; cz++) {
                 if (!level.getChunkSource().hasChunk(cx, cz) || !(level.getChunk(cx, cz) instanceof LevelChunk chunk)) {
@@ -556,15 +569,21 @@ public final class RtEntities {
                 }
             }
         }
-        candidates.sort((a, b) -> {
-            int byDistance = Double.compare(a.dist2, b.dist2);
-            return byDistance != 0 ? byDistance : Long.compare(a.posKey, b.posKey);
-        });
-        for (BeCandidate candidate : candidates) {
-            if (build.full()) {
-                return;
+        if (candidates.size() > 1) {
+            candidates.sort((a, b) -> {
+                int byDistance = Double.compare(a.dist2, b.dist2);
+                return byDistance != 0 ? byDistance : Long.compare(a.posKey, b.posKey);
+            });
+        }
+        try {
+            for (BeCandidate candidate : candidates) {
+                if (build.full()) {
+                    return;
+                }
+                updateBlockEntity(ctx, build, beDispatcher, candidate.be, partial, now, rbx, rby, rbz);
             }
-            updateBlockEntity(ctx, build, beDispatcher, candidate.be, partial, now, rbx, rby, rbz);
+        } finally {
+            candidates.clear();
         }
     }
 
