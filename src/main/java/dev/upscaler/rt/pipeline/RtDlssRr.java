@@ -16,9 +16,13 @@ import org.lwjgl.vulkan.VkInstance;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.io.IOException;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Arrays;
 
 /**
  * DLSS Ray Reconstruction backend for the RT renderer. Runs the DLSSD (Ray Reconstruction) feature
@@ -33,6 +37,7 @@ public final class RtDlssRr {
 
     private static final String SHIM_DLL = "ngxshim.dll";
     private static final String RR_DLL = "nvngx_dlssd.dll";
+    private static final String BUNDLED_NATIVE_DIR = "/upscaler/natives/windows-x64/";
     // DLSS feature flags. IsHDR (bit 0): color is linear HDR (rgba16f) — RR requires it ("HDR Color
     // required"). MVLowRes (bit 1): motion vectors are at render/input resolution, not display — RR
     // requires it ("Low resolution Motion Vectors required"). AutoExposure (bit 6): in HDR mode DLSS
@@ -181,7 +186,7 @@ public final class RtDlssRr {
         }
         Path shim = locate(SHIM_DLL);
         if (shim == null) {
-            throw new IllegalStateException(SHIM_DLL + " not found (run dir natives/ or -Dupscaler.ngx.path)");
+            throw new IllegalStateException(SHIM_DLL + " not found (bundled natives or -Dupscaler.ngx.path)");
         }
         Path nativesDir = shim.getParent();
         if (nativesDir != null && !Files.isRegularFile(nativesDir.resolve(RR_DLL))) {
@@ -295,13 +300,47 @@ public final class RtDlssRr {
             Path p = Path.of(override);
             return Files.isRegularFile(p) ? p : null;
         }
-        Path runDir = FabricLoader.getInstance().getGameDir();
-        Path[] candidates = {runDir.resolve("natives").resolve(name), runDir.resolve(name)};
-        for (Path candidate : candidates) {
-            if (Files.isRegularFile(candidate)) {
-                return candidate;
+        if (name.equals(SHIM_DLL)) {
+            Path bundled = extractBundledNatives();
+            if (bundled != null) {
+                return bundled;
             }
         }
         return null;
+    }
+
+    private static Path extractBundledNatives() {
+        Path dir = FabricLoader.getInstance().getGameDir().resolve("upscaler-ngx").resolve("natives");
+        try {
+            Files.createDirectories(dir);
+            boolean hasShim = extractBundledNative(SHIM_DLL, dir.resolve(SHIM_DLL));
+            extractBundledNative(RR_DLL, dir.resolve(RR_DLL));
+            return hasShim && Files.isRegularFile(dir.resolve(SHIM_DLL)) ? dir.resolve(SHIM_DLL) : null;
+        } catch (IOException e) {
+            UpscalerMod.LOGGER.warn("Could not extract bundled NGX natives to {}", dir, e);
+            return null;
+        }
+    }
+
+    private static boolean extractBundledNative(String name, Path dst) throws IOException {
+        String resource = BUNDLED_NATIVE_DIR + name;
+        try (InputStream in = RtDlssRr.class.getResourceAsStream(resource)) {
+            if (in == null) {
+                return false;
+            }
+            byte[] bytes = in.readAllBytes();
+            if (!sameBytes(dst, bytes)) {
+                Files.write(dst, bytes);
+            }
+            return true;
+        }
+    }
+
+    private static boolean sameBytes(Path path, byte[] bytes) throws IOException {
+        try {
+            return Files.size(path) == bytes.length && Arrays.equals(Files.readAllBytes(path), bytes);
+        } catch (NoSuchFileException e) {
+            return false;
+        }
     }
 }

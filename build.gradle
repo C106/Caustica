@@ -115,6 +115,32 @@ def compileShaders = tasks.register("compileShaders", CompileShaders) {
 // same /upscaler/rt/ path the loader (RtPipeline/RtBlendPipeline) reads. builtBy wires the dependency.
 sourceSets.main.resources.srcDir(files(shaderGenRoot).builtBy(compileShaders))
 
+def ngxNativeGenRoot = layout.buildDirectory.dir("generated/ngx-natives")
+def requiredNgxNatives = [
+	file("native/ngx_shim/out/Release/ngxshim.dll"),
+	file("native/ngx_shim/out/Release/nvngx_dlssd.dll")
+]
+
+def bundleNgxNatives = tasks.register("bundleNgxNatives", Copy) {
+	group = "build"
+	description = "Bundles NGX shim and DLSS DLLs into the mod resources."
+	onlyIf { org.gradle.internal.os.OperatingSystem.current().windows }
+	def outDir = layout.buildDirectory.dir("generated/ngx-natives/upscaler/natives/windows-x64")
+	inputs.files(requiredNgxNatives)
+	into outDir
+	from(requiredNgxNatives)
+	doFirst {
+		delete(outDir)
+		requiredNgxNatives.each { dll ->
+			if (!dll.isFile()) {
+				throw new GradleException("Missing required NGX native ${dll}.")
+			}
+		}
+	}
+}
+
+sourceSets.main.resources.srcDir(files(ngxNativeGenRoot).builtBy(bundleNgxNatives))
+
 tasks.withType(JavaCompile).configureEach {
 	it.options.release = 25
 }
