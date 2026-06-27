@@ -251,7 +251,28 @@ void main() {
         vec2 euvCoord = ebary.x * euv.uv[e0] + ebary.y * euv.uv[e1] + ebary.z * euv.uv[e2];
         int texSlot = int(pr.tint.w + 0.5);
 
-        vec3 albedo = texture(entityTex[nonuniformEXT(texSlot)], euvCoord).rgb * pr.tint.rgb;
+        vec4 etex = texture(entityTex[nonuniformEXT(texSlot)], euvCoord);
+        // Translucent shells (slime / sulfur cube / ghost): a thin colored filter resolved in raygen
+        // (material 3) — the same colored-transmission path as stained-glass/ice terrain. normal.w flags it.
+        if (pr.normal.w > 0.5) {
+            if (g.dispAddr != 0ul) {
+                Disps tdd = Disps(g.dispAddr);
+                payload.motionPrev = ebary.x * tdd.d[e0].xyz + ebary.y * tdd.d[e1].xyz + ebary.z * tdd.d[e2].xyz;
+            } else {
+                payload.motionPrev = g.rigidDisp.xyz;
+            }
+            payload.albedo = mix(vec3(1.0), etex.rgb * pr.tint.rgb, etex.a); // alpha = opacity -> tint strength
+            payload.normal = n;
+            payload.hitT = gl_HitTEXT;
+            payload.material = 3.0;
+            payload.roughness = 0.05;
+            payload.metalness = 0.0;
+            payload.f0 = vec3(0.04);
+            payload.emission = 0.0;
+            payload.sss = 0.0;
+            return;
+        }
+        vec3 albedo = etex.rgb * pr.tint.rgb;
         float rough = pr.mat.x;          // P6.1 heuristic defaults
         float metal = pr.mat.y;
         vec3 f0 = mix(vec3(0.04), albedo, metal);
@@ -335,6 +356,24 @@ void main() {
                 textureLod(blockNormalAtlas, uv, 0.0), ao);
     }
 
+    // Stained glass / ice (tint.w == 2, flagged at extraction): a thin colored filter resolved in raygen
+    // (material 3). albedo carries the transmission tint = texel rgb mixed toward white by (1 − opacity), so
+    // a more opaque texel tints transmitted light more strongly.
+    if (pr.tint.w > 1.5) {
+        vec4 gtex = textureLod(blockAtlas, uv, 0.0);
+        payload.albedo = mix(vec3(1.0), gtex.rgb * tint * ao, gtex.a);
+        payload.normal = n;
+        payload.hitT = gl_HitTEXT;
+        payload.motionPrev = vec3(0.0);
+        payload.material = 3.0;
+        payload.roughness = 0.05;
+        payload.metalness = 0.0;
+        payload.f0 = vec3(0.04);
+        payload.emission = 0.0;
+        payload.sss = 0.0;
+        return;
+    }
+
     // Water (tint.w == 1) carries the pure biome water tint (no grey water-texture multiply): raygen
     // shades the surface as a clear dielectric and only needs the tint to derive the per-channel
     // Beer–Lambert absorption. Opaque terrain uses the textured albedo as before.
@@ -348,13 +387,18 @@ void main() {
     float rough = pr.mat.x;
     float metal = pr.mat.y;
     vec3 f0 = mix(vec3(0.04), payload.albedo, metal);
-    float emission = pr.normal.w;   // 0..1 block light level (extraction): the heuristic emission source
+    // normal.w packs the 0..1 block-light level plus a +2 offset flag for non-SOLID (cutout / translucent)
+    // render layers, set at extraction so the hit can opt SOLID terrain out of SSS below.
+    float ew = pr.normal.w;
+    bool nonSolid = ew >= 1.5;
+    float emission = nonSolid ? ew - 2.0 : ew; // heuristic emission source (block light level)
     // P6.2a LabPBR _s, gated by mat.z — shared decode. When an _s map is authored we trust ITS emission and
     // REPLACE the block-light heuristic, so emissive texels come from the pack, not the light level.
     // P6.5: blue channel (porosity 0-64 / SSS 65-255) now decoded into sss (0 if no _s map or porosity range).
     float sss = 0.0;
     if (pr.mat.z > 0.5) {
         decodeSpec(textureLod(blockSpecAtlas, uv, 0.0), payload.albedo, rough, metal, f0, emission, sss);
+        if (!nonSolid) sss = 0.0; // SSS only on non-SOLID terrain (leaves/foliage); SOLID blocks opt out
     }
     payload.roughness = rough;
     payload.metalness = metal;

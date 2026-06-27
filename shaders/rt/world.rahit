@@ -61,14 +61,6 @@ layout(push_constant) uniform PushAddr { uint64_t worldPushAddr; } pcAddr;
 
 hitAttributeEXT vec2 attribs;
 
-// PCG hash RNG (matches world.rgen) — drives stochastic transparency for alpha-blended entity surfaces.
-uint pcg(inout uint s) {
-    s = s * 747796405u + 2891336453u;
-    uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
-    return (w >> 22u) ^ w;
-}
-float rndf(inout uint s) { return float(pcg(s)) * (1.0 / 4294967296.0); }
-
 const float ALPHA_CUTOFF = 0.5;       // terrain (matches the cutout block models)
 const float ENTITY_ALPHA_CUTOFF = 0.1; // entities: only discard near-fully-transparent texels
 const int ENTITY_BIT = 0x800000;
@@ -88,22 +80,19 @@ void main() {
         uint i2 = indices.i[3u * pid + 2u];
         vec2 uv = bary.x * uvs.uv[i0] + bary.y * uvs.uv[i1] + bary.z * uvs.uv[i2];
         Prim epr = Prims(g.primAddr).p[pid];
-        int texSlot = int(epr.tint.w + 0.5);
-        float ealpha = texture(entityTex[nonuniformEXT(texSlot)], uv).a;
         // normal.w flags an alpha-blended (translucent) surface — slime / sulfur-cube shells, ghosts, …
         // (set by RtEntityCapture; 0 for opaque/cutout mobs + particles, which keep the binary cutout).
+        // Translucent shells are a colored filter resolved in the closest hit (material 3): accept for path
+        // rays, and pass light through for shadow/visibility rays so they don't cast a hard shadow.
         if (epr.normal.w > 0.5) {
-            // Stochastic transparency: keep the hit with probability = texel alpha; DLSS-RR resolves the
-            // per-pixel noise into a smooth see-through shell, so the inner content (slime core, the sulfur
-            // cube's contained block) shows through. Seed by pixel + frame + primitive + hit distance so
-            // each surface along a ray — and primary vs shadow/GI rays — decorrelate.
-            uint seed = (uint(gl_LaunchIDEXT.x) * 1973u + uint(gl_LaunchIDEXT.y) * 9277u
-                         + uint(pid) * 26699u) ^ (pc.frameIndex * 2654435761u)
-                         ^ (floatBitsToUint(gl_HitTEXT) * 668265263u);
-            if (rndf(seed) >= ealpha) {
+            if ((gl_IncomingRayFlagsEXT & gl_RayFlagsSkipClosestHitShaderEXT) != 0u) {
                 ignoreIntersectionEXT;
             }
-        } else if (ealpha < ENTITY_ALPHA_CUTOFF) {
+            return;
+        }
+        int texSlot = int(epr.tint.w + 0.5);
+        float ealpha = texture(entityTex[nonuniformEXT(texSlot)], uv).a;
+        if (ealpha < ENTITY_ALPHA_CUTOFF) {
             ignoreIntersectionEXT;
         }
         return;
@@ -126,6 +115,17 @@ void main() {
     // Cutout geometry: alpha-test the atlas. gl_PrimitiveID restarts at 0 per geometry, so re-add this
     // geometry's triangle base to index the section's packed index/uv arrays.
     uint tri = gl_PrimitiveID + sec.triBase[gl_GeometryIndexEXT];
+
+    // Stained glass / ice (tint.w == 2, flagged at extraction and excluded from the OMM) is a colored
+    // dielectric resolved in the closest hit (material 3): accept for path rays, pass light through for
+    // shadow/visibility rays — so it neither alpha-cutout-holes nor casts a hard shadow.
+    if (Prims(sec.primAddr).p[tri].tint.w > 1.5) {
+        if ((gl_IncomingRayFlagsEXT & gl_RayFlagsSkipClosestHitShaderEXT) != 0u) {
+            ignoreIntersectionEXT;
+        }
+        return;
+    }
+
     // Lever B: per-triangle corner UVs in primitive order (see world.rchit) — a contiguous, directly
     // addressed load, no index buffer, no scattered vertex-UV gather.
     UVs uvs = UVs(sec.uvAddr);

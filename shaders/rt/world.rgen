@@ -130,6 +130,11 @@ const float WATER_GUIDE_ROUGH = 0.02;
 const vec3 WATER_F0 = vec3(0.02);
 const vec3 SKY_SPEC_ALBEDO = vec3(0.5); // RR guide default for sky pixels.
 
+// Stained glass / ice (material 3): a thin colored dielectric. IOR ~1.5 (soda-lime glass); the guide
+// roughness feeds DLSS-RR a stable smooth primary surface, as for water.
+const float GLASS_IOR = 1.52;
+const float GLASS_GUIDE_ROUGH = 0.04;
+
 // W2: per-channel Beer–Lambert extinction from a water body's biome tint (carried in payload.albedo for
 // water hits, or pc.waterParams.xyz for the camera's own biome when starting submerged). A blue ocean
 // tint (low red) absorbs red fastest → bluer with depth; swamp green-brown shifts the hue. The floor
@@ -525,6 +530,44 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed) {
 
         vec3 n = payload.normal; // oriented toward the incoming ray by the closest-hit
         vec3 hitPos = ro + rd * payload.hitT;
+
+        // Stained glass / ice / translucent shells (material 3): a thin colored dielectric. Stochastically
+        // reflect (Fresnel glint) or transmit; on transmission the throughput is multiplied by the pane's
+        // tint, so light passing through is colored (red glass reddens what is behind it). payload.albedo is
+        // the transmission tint (texel rgb mixed toward white by 1 − opacity). Treated as a thin pane, so the
+        // transmitted ray continues straight (no refraction bend) — like the particle path, the instance
+        // stays double-sided and the normal already faces the incoming ray.
+        if (payload.material > 2.5) {
+            vec3 glassTint = payload.albedo;
+            float cosI = clamp(dot(-rd, n), 0.0, 1.0);
+            float F = fresnelDielectric(cosI, 1.0, GLASS_IOR);
+            if (bounce == 0) { // primary glass hit: feed RR a smooth dielectric specular surface
+                gv_normal = n;
+                gv_rough = GLASS_GUIDE_ROUGH;
+                gv_specAlb = vec3(F);
+                gv_albedo = glassTint;            // demodulate by the transmission tint
+                gv_hitCamRel = hitPos - pc.camOffset;
+                gv_motionHitCamRel = gv_hitCamRel;
+                gv_motionUseRefracted = false;
+                gv_motionObjDisp = payload.motionPrev; // 0 for static terrain; per-vertex for translucent mobs
+            }
+            if (rndf(seed) < F) {
+                rd = reflect(rd, n);
+                ro = hitPos + n * SURF_BIAS;       // reflected ray stays on the incidence side
+            } else {
+                throughput *= glassTint;           // colored transmission
+                ro = hitPos - n * SURF_BIAS;       // transmitted ray crosses to the far side (no bend)
+            }
+            showCelestial = true;                  // specular interface: the continuation ray may see the disc
+            if (bounce >= RR_START) {
+                float q = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.02, 1.0);
+                if (rndf(seed) > q) {
+                    break;
+                }
+                throughput /= q;
+            }
+            continue;
+        }
 
         // Particles (material == 2): unlit camera-facing billboard, shown directly and the path stops.
         // The instance mask keeps particles off shadow/GI rays, so this only ever fires at bounce 0, where

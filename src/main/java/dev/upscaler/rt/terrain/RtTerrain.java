@@ -1455,6 +1455,9 @@ public final class RtTerrain {
             // geometry whose any-hit the driver skips. CUTOUT/TRANSLUCENT keep the alpha-test any-hit. Blocks
             // are never the water bucket (fluids only). The non-SOLID flag also marks overlay candidates.
             q.cutout = quad.materialInfo().layer() != ChunkSectionLayer.SOLID;
+            // TRANSLUCENT (stained glass, ice, honey, slime, nether portal): a colored-transmission
+            // dielectric resolved in the path tracer (tint.w == 2), excluded from the binary alpha cutout.
+            q.translucent = quad.materialInfo().layer() == ChunkSectionLayer.TRANSLUCENT;
 
             // Biome tint: tintIndex >= 0 means biome-colored (grass/foliage). In 26.2 the color comes from a
             // BlockTintSource; colorInWorld blends the biome color at this pos. Untinted quads stay white.
@@ -1613,17 +1616,21 @@ public final class RtTerrain {
                 prim.add(q.nx);
                 prim.add(q.ny);
                 prim.add(q.nz);
-                prim.add(q.emission);
+                // normal.w = block-light emission (0..1) + a +2 flag for non-SOLID layers, so the closest
+                // hit can opt SOLID terrain out of SSS (leaves/foliage keep it). See world.rchit.
+                prim.add(q.cutout ? q.emission + 2f : q.emission);
                 prim.add(q.tr);
                 prim.add(q.tg);
                 prim.add(q.tb);
-                prim.add(0f);
+                prim.add(q.translucent ? 2f : 0f); // tint.w material flag: 2 = stained glass / ice (0 opaque)
                 prim.add(q.rough);
                 prim.add(q.metal);
                 prim.add(0f); // hasS placeholder; patched by resolveMaterials()
                 prim.add(0f); // hasN placeholder
                 g.materialSprites.add(q.materialSprite);
-                g.ommSprites.add(q.sprite);
+                // Exclude glass from the opacity micromap (null sprite): its any-hit must run every time to
+                // resolve transmission, not be pre-classified opaque/transparent into holes.
+                g.ommSprites.add(q.translucent ? null : q.sprite);
             }
         }
     }
@@ -1634,6 +1641,7 @@ public final class RtTerrain {
         final long[] uv = new long[4];
         float nx, ny, nz;
         boolean cutout; // non-SOLID render layer (alpha-tested) — also an overlay candidate
+        boolean translucent; // TRANSLUCENT layer (stained glass / ice): colored-transmission dielectric
         boolean tinted; // tintIndex >= 0 — the tinted member of a base+overlay pair
         float tr, tg, tb, emission, rough, metal;
         TextureAtlasSprite sprite, materialSprite;
