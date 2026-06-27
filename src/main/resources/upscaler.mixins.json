@@ -7,7 +7,6 @@
 		"BlockModelRenderStateMixin",
 		"BlockModelResolverMixin",
 		"CommandEncoderAccessor",
-		"ClientLevelLightMixin",
 		"GameRendererMixin",
 		"GpuDeviceAccessor",
 		"LevelRendererMixin",

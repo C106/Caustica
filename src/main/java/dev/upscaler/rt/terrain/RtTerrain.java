@@ -81,12 +81,12 @@ public final class RtTerrain {
     private static final int VIEW_SECTIONS_V = Integer.getInteger("upscaler.rt.viewSectionsV", 6);
     // CPU tessellation runs on RtWorkerPool. The render thread snapshots RenderSectionRegions, uploads
     // completed meshes, prepares BLASes, and submits the GPU build.
-    private static final int ASYNC_DISPATCH_PER_TICK = Integer.getInteger("upscaler.rt.asyncDispatchPerTick", 64);
-    private static final int SECTION_RESULTS_PER_TICK = Integer.getInteger("upscaler.rt.sectionResultsPerTick", 64);
+    private static final int ASYNC_DISPATCH_PER_TICK = Integer.getInteger("upscaler.rt.asyncDispatchPerTick", 32);
+    private static final int SECTION_RESULTS_PER_TICK = Integer.getInteger("upscaler.rt.sectionResultsPerTick", 32);
     private static final int ASYNC_DISPATCH_MOVING_PER_TICK = Integer.getInteger("upscaler.rt.asyncDispatchMovingPerTick",
-            Math.min(ASYNC_DISPATCH_PER_TICK, 24));
+            Math.min(ASYNC_DISPATCH_PER_TICK, 16));
     private static final int SECTION_RESULTS_MOVING_PER_TICK = Integer.getInteger("upscaler.rt.sectionResultsMovingPerTick",
-            Math.min(SECTION_RESULTS_PER_TICK, 24));
+            Math.min(SECTION_RESULTS_PER_TICK, 16));
     // Backpressure cap: stop dispatching once this many sections are in flight. Bounds queue depth and
     // snapshot memory (each RenderSectionRegion holds 27 SectionCopies) when flying through the world.
     private static final int MAX_INFLIGHT = Integer.getInteger("upscaler.rt.maxInflightSections", 192);
