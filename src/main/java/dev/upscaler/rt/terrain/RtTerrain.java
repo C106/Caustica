@@ -27,6 +27,7 @@ import com.mojang.blaze3d.platform.NativeImage;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.color.block.BlockColors;
 import net.minecraft.client.color.block.BlockTintSource;
+import net.minecraft.client.multiplayer.ClientChunkCache;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.block.BlockAndTintGetter;
 import net.minecraft.client.renderer.block.BlockQuadOutput;
@@ -100,9 +101,15 @@ public final class RtTerrain {
     private final Object dirtyLock = new Object();
     private final LongOpenHashSet dirty = new LongOpenHashSet(); // edited sections to re-extract
     private final LongArrayList dirtyDrain = new LongArrayList();
+    // Persistent desired window and queued work. The expensive section window is rebuilt only when the
+    // player crosses a section/radius/Y-band boundary; steady ticks poll chunk columns for load changes.
     private final LongOpenHashSet desired = new LongOpenHashSet();
+    private final LongOpenHashSet desiredColumns = new LongOpenHashSet();
+    private final LongOpenHashSet loadedColumns = new LongOpenHashSet();
     private final LongArrayList missing = new LongArrayList();
+    private final LongOpenHashSet queuedMissing = new LongOpenHashSet();
     private final LongArrayList reextract = new LongArrayList();
+    private final LongOpenHashSet queuedReextract = new LongOpenHashSet();
     private final List<SectionGeom> removed = new ArrayList<>();
     private final List<PreparedSection> prepared = new ArrayList<>();
     private final RtBufferPool pool = new RtBufferPool();
@@ -136,6 +143,13 @@ public final class RtTerrain {
     public int blockX;
     public int blockY;
     public int blockZ;
+    private boolean windowValid;
+    private int windowPcx;
+    private int windowPsy;
+    private int windowPcz;
+    private int windowRadius;
+    private int windowLoY;
+    private int windowHiY;
 
     private RtTerrain() {
         inFlight.defaultReturnValue(NO_TESS_TOKEN);
@@ -274,6 +288,7 @@ public final class RtTerrain {
         int pbz = mc.player.getBlockZ();
         int pcx = pbx >> 4, pcz = pbz >> 4, psy = pby >> 4;
         int r = horizontalChunks(mc);
+        ClientChunkCache chunkSource = level.getChunkSource();
         int minSecY = level.getMinY() >> 4;
         int maxSecY = (level.getMinY() + level.getHeight() - 1) >> 4;
         int loY = Math.max(minSecY, psy - VIEW_SECTIONS_V);
@@ -281,57 +296,133 @@ public final class RtTerrain {
 
         List<SectionGeom> removed = this.removed;
         removed.clear();
-        LongArrayList reextract = this.reextract;
-        reextract.clear(); // dirty sections to rebuild in place (kept resident)
+        List<PreparedSection> prepared = this.prepared;
+        prepared.clear();
+
+        syncDesiredWindow(chunkSource, pcx, psy, pcz, r, loY, hiY, removed);
 
         // Re-extract edited sections. Drain under a short lock so concurrent block updates are not lost.
         drainDirty();
         if (!dirtyDrain.isEmpty()) {
             for (LongIterator it = dirtyDrain.iterator(); it.hasNext(); ) {
                 long key = it.nextLong();
-                empty.remove(key);
-                inFlight.remove(key); // invalidate any in-flight tessellation of the now-stale section
-                // Keep the old geometry resident + traced; re-dispatch and swap when the new mesh is
-                // ready (no eviction gap -> no flicker). Non-resident dirty keys fall through to the
-                // normal window/missing pass.
-                SectionGeom g = resident.get(key);
-                if (g != null) {
-                    reextract.add(key);
-                }
+                handleDirtySection(key);
             }
         }
 
-        // Desired window = loaded sections within the view. hasChunk gating makes residency follow
-        // vanilla: unloaded chunks aren't desired (so their sections get freed), loaded ones are.
-        LongOpenHashSet desired = this.desired;
-        LongArrayList missing = this.missing;
+        // Tessellate + upload new sections (BLAS build deferred to rebuild's single batched submission).
+        DispatchContext dispatch = null;
+        int dispatchSlots = Math.min(ASYNC_DISPATCH_PER_TICK, Math.max(0, MAX_INFLIGHT - inFlight.size()));
+        if (dispatchSlots > 0 && !reextract.isEmpty()) {
+            dispatch = dispatchContext(level);
+            dispatchSlots -= dispatchReextract(dispatch, chunkSource, dispatchSlots);
+        }
+        if (dispatchSlots > 0 && !missing.isEmpty()) {
+            if (dispatch == null) {
+                dispatch = dispatchContext(level);
+            }
+            dispatchTessellation(dispatch, chunkSource, dispatchSlots);
+        }
+        drainTessellation(ctx, prepared, removed);
+
+        if (!removed.isEmpty() || !prepared.isEmpty()) {
+            startBuild(ctx, prepared, removed, pbx, pby, pbz);
+        }
+    }
+
+    private void syncDesiredWindow(ClientChunkCache chunkSource, int pcx, int psy, int pcz,
+                                   int radius, int loY, int hiY, List<SectionGeom> removed) {
+        if (!windowValid || windowPcx != pcx || windowPsy != psy || windowPcz != pcz
+                || windowRadius != radius || windowLoY != loY || windowHiY != hiY) {
+            rebuildDesiredWindow(chunkSource, pcx, psy, pcz, radius, loY, hiY, removed);
+        } else {
+            pollLoadedColumns(chunkSource, pcx, psy, pcz, loY, hiY, removed);
+        }
+    }
+
+    private void rebuildDesiredWindow(ClientChunkCache chunkSource, int pcx, int psy, int pcz,
+                                      int radius, int loY, int hiY, List<SectionGeom> removed) {
         desired.clear();
+        desiredColumns.clear();
+        loadedColumns.clear();
         missing.clear();
-        for (int scx = pcx - r; scx <= pcx + r; scx++) {
-            for (int scz = pcz - r; scz <= pcz + r; scz++) {
-                if (!level.getChunkSource().hasChunk(scx, scz)) {
+        queuedMissing.clear();
+
+        for (int scx = pcx - radius; scx <= pcx + radius; scx++) {
+            for (int scz = pcz - radius; scz <= pcz + radius; scz++) {
+                long column = columnKey(scx, scz);
+                desiredColumns.add(column);
+                if (!chunkSource.hasChunk(scx, scz)) {
                     continue;
                 }
-                boolean checkedNeighbors = false;
-                boolean neighborsReady = false;
-                for (int scy = loY; scy <= hiY; scy++) {
-                    long key = sectionKey(scx, scy, scz);
-                    desired.add(key);
-                    if (resident.containsKey(key) || empty.contains(key) || inFlight.containsKey(key)) {
-                        continue;
-                    }
-                    if (!checkedNeighbors) {
-                        neighborsReady = neighborChunksReady(level, scx, scz);
-                        checkedNeighbors = true;
-                    }
-                    if (neighborsReady) {
-                        missing.add(key);
-                    }
-                }
+                loadedColumns.add(column);
+                addDesiredColumnSections(scx, scz, loY, hiY);
             }
         }
 
-        // Free sections that left the window (or whose chunk unloaded).
+        pruneUndesired(removed);
+        removeKeysNotIn(queuedReextract, desired);
+        sortMissing(pcx, psy, pcz);
+        windowValid = true;
+        windowPcx = pcx;
+        windowPsy = psy;
+        windowPcz = pcz;
+        windowRadius = radius;
+        windowLoY = loY;
+        windowHiY = hiY;
+    }
+
+    private void pollLoadedColumns(ClientChunkCache chunkSource, int pcx, int psy, int pcz,
+                                   int loY, int hiY, List<SectionGeom> removed) {
+        boolean addedMissing = false;
+        for (LongIterator it = desiredColumns.iterator(); it.hasNext(); ) {
+            long column = it.nextLong();
+            int scx = columnX(column);
+            int scz = columnZ(column);
+            boolean loaded = chunkSource.hasChunk(scx, scz);
+            boolean wasLoaded = loadedColumns.contains(column);
+            if (loaded == wasLoaded) {
+                continue;
+            }
+            if (loaded) {
+                loadedColumns.add(column);
+                addedMissing |= addDesiredColumnSections(scx, scz, loY, hiY);
+            } else {
+                loadedColumns.remove(column);
+                removeDesiredColumnSections(scx, scz, loY, hiY, removed);
+            }
+        }
+        if (addedMissing) {
+            sortMissing(pcx, psy, pcz);
+        }
+    }
+
+    private boolean addDesiredColumnSections(int scx, int scz, int loY, int hiY) {
+        boolean addedMissing = false;
+        for (int scy = loY; scy <= hiY; scy++) {
+            long key = sectionKey(scx, scy, scz);
+            desired.add(key);
+            addedMissing |= enqueueMissingIfNeeded(key);
+        }
+        return addedMissing;
+    }
+
+    private void removeDesiredColumnSections(int scx, int scz, int loY, int hiY, List<SectionGeom> removed) {
+        for (int scy = loY; scy <= hiY; scy++) {
+            long key = sectionKey(scx, scy, scz);
+            desired.remove(key);
+            queuedMissing.remove(key);
+            queuedReextract.remove(key);
+            inFlight.remove(key);
+            empty.remove(key);
+            SectionGeom g = resident.remove(key);
+            if (g != null) {
+                removed.add(g);
+            }
+        }
+    }
+
+    private void pruneUndesired(List<SectionGeom> removed) {
         for (ObjectIterator<Long2ObjectMap.Entry<SectionGeom>> it = resident.long2ObjectEntrySet().fastIterator(); it.hasNext(); ) {
             Long2ObjectMap.Entry<SectionGeom> e = it.next();
             if (!desired.contains(e.getLongKey())) {
@@ -340,32 +431,43 @@ public final class RtTerrain {
             }
         }
         removeKeysNotIn(empty, desired);
-        // Drop in-flight tessellations whose section left the window / unloaded since dispatch.
         removeKeysNotIn(inFlight.keySet(), desired);
+    }
 
-        // Tessellate + upload new sections (BLAS build deferred to rebuild's single batched submission).
-        List<PreparedSection> prepared = this.prepared;
-        prepared.clear();
-        // Build nearest-first so terrain fills from the player outward.
-        if (!missing.isEmpty()) {
-            missing.sort((a, b) -> Integer.compare(dist2(a, pcx, psy, pcz), dist2(b, pcx, psy, pcz)));
+    private void handleDirtySection(long key) {
+        empty.remove(key);
+        inFlight.remove(key); // invalidate any in-flight tessellation of the now-stale section
+        if (!desired.contains(key)) {
+            queuedMissing.remove(key);
+            queuedReextract.remove(key);
+            return;
         }
-        DispatchContext dispatch = null;
-        if (!reextract.isEmpty()) {
-            dispatch = dispatchContext(level);
-            dispatchReextract(dispatch, reextract);
-        }
-        int dispatchSlots = Math.min(ASYNC_DISPATCH_PER_TICK, Math.max(0, MAX_INFLIGHT - inFlight.size()));
-        if (dispatchSlots > 0 && !missing.isEmpty()) {
-            if (dispatch == null) {
-                dispatch = dispatchContext(level);
+        // Keep the old geometry resident + traced; re-dispatch and swap when the new mesh is ready
+        // (no eviction gap -> no flicker). Non-resident dirty keys re-enter the normal missing queue.
+        SectionGeom g = resident.get(key);
+        if (g != null) {
+            if (queuedReextract.add(key)) {
+                reextract.add(key);
             }
-            dispatchTessellation(dispatch, missing, dispatchSlots);
+        } else {
+            enqueueMissingIfNeeded(key);
         }
-        drainTessellation(ctx, prepared, removed);
+    }
 
-        if (!removed.isEmpty() || !prepared.isEmpty()) {
-            startBuild(ctx, prepared, removed, pbx, pby, pbz);
+    private boolean enqueueMissingIfNeeded(long key) {
+        if (resident.containsKey(key) || empty.contains(key) || inFlight.containsKey(key)) {
+            return false;
+        }
+        if (!queuedMissing.add(key)) {
+            return false;
+        }
+        missing.add(key);
+        return true;
+    }
+
+    private void sortMissing(int pcx, int psy, int pcz) {
+        if (missing.size() > 1) {
+            missing.sort((a, b) -> Integer.compare(dist2(a, pcx, psy, pcz), dist2(b, pcx, psy, pcz)));
         }
     }
 
@@ -383,13 +485,13 @@ public final class RtTerrain {
      * area. Without this, the edge section would mesh against air, then show a seam once the player moves
      * and that neighbour becomes interior and is rendered.
      */
-    private boolean neighborChunksReady(ClientLevel level, int scx, int scz) {
+    private boolean neighborChunksReady(ClientChunkCache chunkSource, int scx, int scz) {
         for (int dx = -1; dx <= 1; dx++) {
             for (int dz = -1; dz <= 1; dz++) {
                 if (dx == 0 && dz == 0) {
                     continue;
                 }
-                if (!level.getChunkSource().hasChunk(scx + dx, scz + dz)) {
+                if (!chunkSource.hasChunk(scx + dx, scz + dz)) {
                     return false;
                 }
             }
@@ -629,14 +731,32 @@ public final class RtTerrain {
                 mc.getBlockColors());
     }
 
-    private void dispatchTessellation(DispatchContext dispatch, LongArrayList missing, int budget) {
+    private void dispatchTessellation(DispatchContext dispatch, ClientChunkCache chunkSource, int budget) {
         if (missing.isEmpty() || budget <= 0) {
             return;
         }
-        for (LongIterator it = missing.iterator(); it.hasNext() && budget > 0; ) {
-            long key = it.nextLong();
+        int attempts = Math.min(missing.size(), Math.max(64, budget * 4));
+        for (int i = 0; i < missing.size() && budget > 0 && attempts-- > 0; ) {
+            long key = missing.getLong(i);
+            if (!queuedMissing.contains(key)) {
+                missing.removeLong(i);
+                continue;
+            }
+            if (!desired.contains(key) || resident.containsKey(key) || empty.contains(key) || inFlight.containsKey(key)) {
+                queuedMissing.remove(key);
+                missing.removeLong(i);
+                continue;
+            }
+            int sx = sectionX(key);
+            int sz = sectionZ(key);
+            if (!neighborChunksReady(chunkSource, sx, sz)) {
+                i++;
+                continue;
+            }
+            queuedMissing.remove(key);
+            missing.removeLong(i);
             budget--;
-            dispatchSection(dispatch, key, sectionX(key), sectionY(key), sectionZ(key));
+            dispatchSection(dispatch, key, sx, sectionY(key), sz);
         }
     }
 
@@ -646,19 +766,38 @@ public final class RtTerrain {
      * with a gap — when the new mesh is built (see {@link #startBuild} retiring the replaced geom). This
      * is what prevents the visible flicker on block updates that plain eviction would cause.
      */
-    private void dispatchReextract(DispatchContext dispatch, LongArrayList reextract) {
+    private int dispatchReextract(DispatchContext dispatch, ClientChunkCache chunkSource, int budget) {
         if (reextract.isEmpty()) {
-            return;
+            return 0;
         }
-        for (LongIterator it = reextract.iterator(); it.hasNext(); ) {
-            long key = it.nextLong();
-            // Skip ones the window pass freed this tick (out of view) — they're being retired, not rebuilt.
-            SectionGeom g = resident.get(key);
-            if (g == null) {
+        int dispatched = 0;
+        int attempts = Math.min(reextract.size(), Math.max(64, budget * 4));
+        for (int i = 0; i < reextract.size() && budget > 0 && attempts-- > 0; ) {
+            long key = reextract.getLong(i);
+            if (!queuedReextract.contains(key)) {
+                reextract.removeLong(i);
                 continue;
             }
+            // Skip ones the window pass freed this tick (out of view) — they're being retired, not rebuilt.
+            SectionGeom g = resident.get(key);
+            if (g == null || !desired.contains(key) || inFlight.containsKey(key)) {
+                queuedReextract.remove(key);
+                reextract.removeLong(i);
+                continue;
+            }
+            int sx = g.sx >> 4;
+            int sz = g.sz >> 4;
+            if (!neighborChunksReady(chunkSource, sx, sz)) {
+                i++;
+                continue;
+            }
+            queuedReextract.remove(key);
+            reextract.removeLong(i);
             dispatchSection(dispatch, key, g.sx >> 4, g.sy >> 4, g.sz >> 4);
+            budget--;
+            dispatched++;
         }
+        return dispatched;
     }
 
     /** Snapshot one section on the render thread and submit its tessellation to the worker pool. */
@@ -776,8 +915,8 @@ public final class RtTerrain {
             }
         }
 
-        List<SectionGeom> ordered = new ArrayList<>(resident.values());
-        if (ordered.isEmpty()) {
+        int residentCount = resident.size();
+        if (residentCount == 0) {
             // Everything left the window: retire the current table + removed sections, go not-ready.
             long freeAt = RtComposite.frameCounter() + KEEP_FRAMES;
             retire(freeAt, sectionTable, removed);
@@ -789,11 +928,15 @@ public final class RtTerrain {
         }
 
         int storage = org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-        RtBuffer newTable = pool.acquire(ctx, (long) ordered.size() * SECTION_ENTRY_BYTES, storage, true,
-                "terrain section table " + ordered.size() + " sections");
-        List<RtAccel.Instance> instances = new ArrayList<>(ordered.size());
-        for (int i = 0; i < ordered.size(); i++) {
-            SectionGeom g = ordered.get(i);
+        RtBuffer newTable = pool.acquire(ctx, (long) residentCount * SECTION_ENTRY_BYTES, storage, true,
+                "terrain section table " + residentCount + " sections");
+        List<RtAccel.Instance> instances = new ArrayList<>(residentCount);
+        LongOpenHashSet newPublished = new LongOpenHashSet(residentCount);
+        int i = 0;
+        for (ObjectIterator<Long2ObjectMap.Entry<SectionGeom>> it = resident.long2ObjectEntrySet().fastIterator(); it.hasNext(); i++) {
+            Long2ObjectMap.Entry<SectionGeom> e = it.next();
+            SectionGeom g = e.getValue();
+            newPublished.add(e.getLongKey());
             long base = newTable.mapped + (long) i * SECTION_ENTRY_BYTES;
             MemoryUtil.memPutLong(base, g.material.deviceAddress);
             MemoryUtil.memPutLong(base + 8, g.indices.deviceAddress);
@@ -813,9 +956,21 @@ public final class RtTerrain {
         for (PreparedSection ps : prepared) {
             blasBuilds.add(ps.blas());
         }
-        // BLAS-only async build (empty when this tick only freed sections — completes immediately).
+        if (blasBuilds.isEmpty()) {
+            long freeAt = RtComposite.frameCounter() + KEEP_FRAMES;
+            retire(freeAt, sectionTable, removed);
+            sectionTable = newTable;
+            staticInstances = instances;
+            published = newPublished;
+            blockX = rbx;
+            blockY = rby;
+            blockZ = rbz;
+            ready = true;
+            return;
+        }
+        // BLAS-only async build; remove-only batches published above without a queue submit.
         RtContext.AsyncSubmit op = ctx.submitAsync(cmd -> RtAccel.recordBlasBuilds(ctx, cmd, blasBuilds));
-        pending = new Pending(op, blasBuilds, newTable, instances, new LongOpenHashSet(resident.keySet()), removed, rbx, rby, rbz);
+        pending = new Pending(op, blasBuilds, newTable, instances, newPublished, removed, rbx, rby, rbz);
     }
 
     /** Swap a completed async build in: retire old table + removed sections, publish the new instances/table. */
@@ -881,8 +1036,13 @@ public final class RtTerrain {
         }
         dirtyDrain.clear();
         desired.clear();
+        desiredColumns.clear();
+        loadedColumns.clear();
         missing.clear();
+        queuedMissing.clear();
         reextract.clear();
+        queuedReextract.clear();
+        windowValid = false;
         if (pending == null && resident.isEmpty() && sectionTable == null && deferred.isEmpty()) {
             empty.clear();
             staticInstances = null;
@@ -927,6 +1087,18 @@ public final class RtTerrain {
             pool.destroyAll();
         }
         ready = false;
+    }
+
+    private static long columnKey(int scx, int scz) {
+        return ((long) scx << 32) ^ (scz & 0xFFFFFFFFL);
+    }
+
+    private static int columnX(long key) {
+        return (int) (key >> 32);
+    }
+
+    private static int columnZ(long key) {
+        return (int) key;
     }
 
     /** Pack section coords into a stable map key; ranges fit comfortably in the masks. */

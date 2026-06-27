@@ -20,10 +20,12 @@ import org.joml.Vector3fc;
  * share the terrain upload + BLAS path verbatim.
  */
 public final class RtEntityCapture implements VertexConsumer {
-    final FloatArrayList verts = new FloatArrayList();   // 3 floats/vertex (capture-space position)
-    final IntArrayList idx = new IntArrayList();         // 3 indices/triangle
-    final FloatArrayList uvList = new FloatArrayList();  // 2 floats/vertex (entity-texture UV)
-    final FloatArrayList prim = new FloatArrayList();    // 12 floats/triangle: normal.xyz+0, tint.rgb+texSlot, mat.{rough,metal,0,0}
+    private static final int DEFAULT_VERTEX_CAPACITY = Integer.getInteger("upscaler.rt.entityCaptureInitialVertices", 1024);
+
+    final FloatArrayList verts = new FloatArrayList(DEFAULT_VERTEX_CAPACITY * 3);   // 3 floats/vertex (capture-space position)
+    final IntArrayList idx = new IntArrayList(indexCapacity(DEFAULT_VERTEX_CAPACITY)); // 3 indices/triangle
+    final FloatArrayList uvList = new FloatArrayList(DEFAULT_VERTEX_CAPACITY * 2);  // 2 floats/vertex (entity-texture UV)
+    final FloatArrayList prim = new FloatArrayList(primCapacity(DEFAULT_VERTEX_CAPACITY)); // 12 floats/triangle: normal.xyz+0, tint.rgb+texSlot, mat.{rough,metal,0,0}
 
     // Bindless texture slot for the geometry currently being submitted (set by the collector per
     // submitModel, so body + feature layers get their own texture). Stored per-prim in tint.w;
@@ -60,10 +62,16 @@ public final class RtEntityCapture implements VertexConsumer {
 
     /** Clear all accumulators for a fresh entity capture. */
     public void reset() {
+        reset(0);
+    }
+
+    /** Clear and pre-size for a known previous topology to avoid add() growth during capture. */
+    public void reset(int expectedVertices) {
         verts.clear();
         idx.clear();
         uvList.clear();
         prim.clear();
+        ensureVertexCapacity(expectedVertices);
         n = 0;
         currentTexSlot = 0;
         currentHasS = false;
@@ -71,6 +79,26 @@ public final class RtEntityCapture implements VertexConsumer {
         currentBlockAtlas = false;
         currentTranslucent = false;
         uvRemap = false;
+    }
+
+    private void ensureVertexCapacity(int vertexCount) {
+        if (vertexCount <= 0) {
+            return;
+        }
+        verts.ensureCapacity(vertexCount * 3);
+        idx.ensureCapacity(indexCapacity(vertexCount));
+        uvList.ensureCapacity(vertexCount * 2);
+        prim.ensureCapacity(primCapacity(vertexCount));
+    }
+
+    private static int indexCapacity(int vertexCount) {
+        int quadCount = (vertexCount + 3) / 4;
+        return quadCount * 6;
+    }
+
+    private static int primCapacity(int vertexCount) {
+        int quadCount = (vertexCount + 3) / 4;
+        return quadCount * 24;
     }
 
     /** Remap subsequent {@link #addVertex} (ModelPart) UVs from 0..1 into a sprite's atlas region. */

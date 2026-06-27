@@ -35,6 +35,7 @@ import dev.upscaler.rt.accel.RtBufferPool;
 import dev.upscaler.rt.pipeline.RtPipeline;
 
 import it.unimi.dsi.fastutil.floats.FloatArrayList;
+import java.util.AbstractList;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
@@ -69,6 +70,9 @@ public final class RtEntities {
     private static final int PARTICLE_MASK = 0x02;
     public static final boolean PARTICLES_ENABLED = Boolean.parseBoolean(System.getProperty("upscaler.rt.particles", "true"));
     private static final int MAX_ENTITIES = Integer.getInteger("upscaler.rt.maxEntities", 1024);
+    private static final int ENTITY_LIST_CAPACITY = Math.max(16, MAX_ENTITIES);
+    private static final int ENTITY_BUFFER_LIST_CAPACITY = (int) Math.min(Integer.MAX_VALUE, (long) ENTITY_LIST_CAPACITY * 5L);
+    private static final int ENTITY_MAP_CAPACITY = (int) Math.min(Integer.MAX_VALUE, Math.max(16L, (long) MAX_ENTITIES * 2L));
     // Chunk radius around the player to scan for block entities (chests/signs/…) each frame.
     private static final int BE_VIEW_CHUNKS = Integer.getInteger("upscaler.rt.beViewChunks", 8);
     // Block entities keep a cached mesh + BLAS keyed by BlockPos. Each frame the BE is re-meshed (cheap)
@@ -86,6 +90,7 @@ public final class RtEntities {
     private static final int TABLE_RING = 6;
     // Frames a per-frame entity resource (mesh buffers + BLAS + scratch) must outlive before it's freed.
     private static final int KEEP_FRAMES = 4;
+    private static final int FRAME_LIST_RING = KEEP_FRAMES;
     // Refit (UPDATE-mode) BLAS: persistent per-entity AS, refit in place each frame (cheap) while
     // topology is stable, instead of a full BUILD. Block entities always use the pooled-BUILD path.
     private static final boolean REFIT = Boolean.parseBoolean(System.getProperty("upscaler.rt.entityRefit", "true"));
@@ -129,12 +134,13 @@ public final class RtEntities {
     // Recycle per-frame entity mesh buffers + BLAS backing/scratch instead of alloc/free churning
     // ~6 VMA buffers per entity per frame. See RtBufferPool.
     private final RtBufferPool pool = new RtBufferPool();
+    private final FrameLists[] frameLists = new FrameLists[FRAME_LIST_RING];
 
     // Previous frame's captured (rebase-space) vertex positions + that frame's rebase origin, keyed by
     // entity id. Maps are swapped/reused each frame: entries not seen this frame fall out, while visible
     // entities keep their float[] backing to avoid steady-state allocation churn.
-    private Map<Integer, EntityPrev> prevVerts = new HashMap<>();
-    private Map<Integer, EntityPrev> curVerts = new HashMap<>();
+    private Map<Integer, EntityPrev> prevVerts = new HashMap<>(ENTITY_MAP_CAPACITY);
+    private Map<Integer, EntityPrev> curVerts = new HashMap<>(ENTITY_MAP_CAPACITY);
 
     /** Last frame's posed mesh for one entity: rebase-space vertex positions + the rebase origin they were
      *  captured against (needed to convert the inter-frame delta to world space when the rebase moved). */
@@ -157,6 +163,9 @@ public final class RtEntities {
     private int beBuildsThisFrame;
 
     private RtEntities() {
+        for (int i = 0; i < frameLists.length; i++) {
+            frameLists[i] = new FrameLists();
+        }
     }
 
     /**
@@ -209,9 +218,78 @@ public final class RtEntities {
     private record BeCandidate(BlockEntity be, double dist2, long posKey) {
     }
 
+    /** Read-only base terrain instances plus this frame's appended dynamic instances. */
+    private static final class FrameInstanceList extends AbstractList<RtAccel.Instance> {
+        private List<RtAccel.Instance> base = List.of();
+        private final ArrayList<RtAccel.Instance> dynamic = new ArrayList<>(ENTITY_LIST_CAPACITY);
+
+        void reset(List<RtAccel.Instance> base) {
+            this.base = base;
+            dynamic.clear();
+        }
+
+        void release() {
+            base = List.of();
+            dynamic.clear();
+        }
+
+        @Override
+        public RtAccel.Instance get(int index) {
+            int baseSize = base.size();
+            return index < baseSize ? base.get(index) : dynamic.get(index - baseSize);
+        }
+
+        @Override
+        public int size() {
+            return base.size() + dynamic.size();
+        }
+
+        @Override
+        public boolean add(RtAccel.Instance instance) {
+            dynamic.add(instance);
+            modCount++;
+            return true;
+        }
+    }
+
+    /** Reused per-frame lists; one slot is retired before it can be selected again. */
+    private static final class FrameLists {
+        final FrameInstanceList instances = new FrameInstanceList();
+        final ArrayList<RtAccel.PreparedBlas> blas = new ArrayList<>(ENTITY_LIST_CAPACITY);
+        final ArrayList<RtAccel.PreparedBlas> pooledBlas = new ArrayList<>(ENTITY_LIST_CAPACITY);
+        final ArrayList<RtBuffer> refitScratch = new ArrayList<>(ENTITY_LIST_CAPACITY);
+        final ArrayList<RtBuffer> buffers = new ArrayList<>(ENTITY_BUFFER_LIST_CAPACITY);
+
+        void reset(List<RtAccel.Instance> base) {
+            instances.reset(base);
+            blas.clear();
+            pooledBlas.clear();
+            refitScratch.clear();
+            buffers.clear();
+        }
+
+        void releaseDeferred(RtBufferPool pool) {
+            for (RtAccel.PreparedBlas b : pooledBlas) {
+                RtAccel.releaseBlasToPool(pool, b);
+            }
+            for (RtBuffer s : refitScratch) {
+                pool.release(s);
+            }
+            for (RtBuffer buf : buffers) {
+                pool.release(buf);
+            }
+            instances.release();
+            blas.clear();
+            pooledBlas.clear();
+            refitScratch.clear();
+            buffers.clear();
+        }
+    }
+
     /** Mutable per-frame build state shared by the entity + block-entity capture passes. */
     private final class FrameBuild {
         final List<RtAccel.Instance> base;
+        FrameLists lists;
         List<RtAccel.Instance> instances;
         List<RtAccel.PreparedBlas> blas;        // all BLAS ops to record this frame (BUILD + refit UPDATE)
         List<RtAccel.PreparedBlas> pooledBlas;  // pooled-BUILD ops (block entities) → releaseBlasToPool
@@ -264,25 +342,11 @@ public final class RtEntities {
         // Retire this frame's transient meshes + scratch + pooled-BUILD BLAS once it is no longer in flight
         // (their build + the trace that reads them must complete first). Refit AS persist in entityAccels.
         long freeAt = RtComposite.frameCounter() + KEEP_FRAMES;
-        List<RtAccel.PreparedBlas> pooledForFree = build.pooledBlas;
-        List<RtBuffer> refitScratchForFree = build.refitScratch;
-        List<RtBuffer> buffersForFree = build.buffers;
+        FrameLists listsForFree = build.lists;
         deferred.add(new Deferred(freeAt, () -> {
             // Recycle (don't destroy): the deferred horizon guarantees these are off all queues, so the
             // pool can hand them straight back to the next frame's appendCapture.
-            if (pooledForFree != null) {
-                for (RtAccel.PreparedBlas b : pooledForFree) {
-                    RtAccel.releaseBlasToPool(pool, b);
-                }
-            }
-            if (refitScratchForFree != null) {
-                for (RtBuffer s : refitScratchForFree) {
-                    pool.release(s);
-                }
-            }
-            for (RtBuffer buf : buffersForFree) {
-                pool.release(buf);
-            }
+            listsForFree.releaseDeferred(pool);
         }));
         return new FrameEntities(build.instances, build.blas, build.geomTableAddr);
     }
@@ -302,7 +366,9 @@ public final class RtEntities {
             float ix = (float) Mth.lerp(partial, entity.xo, entity.getX());
             float iy = (float) Mth.lerp(partial, entity.yo, entity.getY());
             float iz = (float) Mth.lerp(partial, entity.zo, entity.getZ());
-            capture.reset();
+            int id = entity.getId();
+            EntityPrev prev = prevVerts.get(id);
+            capture.reset(prev != null ? prev.size / 3 : 0);
             try {
                 EntityRenderState state = dispatcher.extractEntity(entity, partial);
                 collector.begin(capture);
@@ -319,10 +385,8 @@ public final class RtEntities {
             if (capture.isEmpty()) {
                 continue; // non-model entity (arrow/etc.) — no body geometry captured
             }
-            int id = entity.getId();
             // Motion vs last frame's posed mesh. New/topology-changed entities get one frame of camera-only
             // MV; rigid translation is packed into the table, deformation gets a disp buffer.
-            EntityPrev prev = prevVerts.get(id);
             Motion motion = uploadVertexMotion(ctx, build, capture.verts, prev, rbx, rby, rbz, "entity " + id);
             curVerts.put(id, storeEntityPrev(prev, capture.verts, rbx, rby, rbz));
             appendCapture(ctx, build, motion, id, ENTITY_BIT, 0xFF);
@@ -375,12 +439,13 @@ public final class RtEntities {
         beginBuildIfNeeded(ctx, build);
         int storage = org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
         RtBuffer dispBuf = pool.acquire(ctx, (long) vc * 4L * Float.BYTES, storage, true, label + " disp");
-        java.nio.FloatBuffer out = MemoryUtil.memFloatBuffer(dispBuf.mapped, vc * 4);
+        long out = dispBuf.mapped;
         for (int i = 0; i < vc; i++) {
-            out.put((curVerts[i * 3]     - prevVerts[i * 3])     + sx);
-            out.put((curVerts[i * 3 + 1] - prevVerts[i * 3 + 1]) + sy);
-            out.put((curVerts[i * 3 + 2] - prevVerts[i * 3 + 2]) + sz);
-            out.put(0f);
+            MemoryUtil.memPutFloat(out, (curVerts[i * 3] - prevVerts[i * 3]) + sx);
+            MemoryUtil.memPutFloat(out + 4, (curVerts[i * 3 + 1] - prevVerts[i * 3 + 1]) + sy);
+            MemoryUtil.memPutFloat(out + 8, (curVerts[i * 3 + 2] - prevVerts[i * 3 + 2]) + sz);
+            MemoryUtil.memPutFloat(out + 12, 0f);
+            out += 16;
         }
         build.buffers.add(dispBuf);
         return new Motion(dispBuf.deviceAddress, 0f, 0f, 0f);
@@ -759,11 +824,14 @@ public final class RtEntities {
         if (build.instances != null) {
             return;
         }
-        build.instances = new ArrayList<>(build.base);
-        build.blas = new ArrayList<>();
-        build.pooledBlas = new ArrayList<>();
-        build.refitScratch = new ArrayList<>();
-        build.buffers = new ArrayList<>();
+        FrameLists lists = frameLists[(int) (RtComposite.frameCounter() % frameLists.length)];
+        lists.reset(build.base);
+        build.lists = lists;
+        build.instances = lists.instances;
+        build.blas = lists.blas;
+        build.pooledBlas = lists.pooledBlas;
+        build.refitScratch = lists.refitScratch;
+        build.buffers = lists.buffers;
         ensureResources(ctx);
         tableSlot = (tableSlot + 1) % TABLE_RING;
         build.tableBase = tableRing[tableSlot].mapped;
