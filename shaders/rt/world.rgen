@@ -333,10 +333,14 @@ vec3 sampleGGXVNDF(vec3 n, vec3 ve, float rough, inout uint s) {
     return normalize(Ne.x * t + Ne.y * b + Ne.z * n);             // -> world space
 }
 
-// Particles are tagged with TLAS instance mask 0x02 and everything else (terrain/entities/BEs) keeps
-// 0xFF, so a cull mask of 0x01 sees all the real geometry but skips particles. Shadow rays and GI bounce
-// rays use it → particles are camera-ray-only (no shadows / GI / reflections; that's the v1 scope).
+// TLAS instance-mask bits (set on the Java side, ANDed against these per-ray cull masks):
+//   bit 0 (0x01) — secondary rays: shadows, GI bounces, reflections.
+//   bit 1 (0x02) — the primary camera ray.
+// Terrain / entities / block entities keep 0xFF (both bits) and are seen by everything. Particles use 0x02
+// (primary only → no shadows / GI / reflections; the v1 scope). The first-person camera owner uses 0x01
+// (secondary only), so the player appears in reflections / shadows but never blocks the camera ray.
 const uint CULL_SECONDARY = 0x01u;
+const uint CULL_PRIMARY = 0x02u;
 
 float visibility(vec3 origin, vec3 dir, float tmax) {
     shadowVis = 0.0; // assume occluded; shadow.rmiss sets 1.0 if the ray escapes
@@ -485,8 +489,9 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed) {
         // No opaque flag: cutout geometry stays alpha-tested via world.rahit on every path ray, so
         // foliage/glass are see-through for GI too. Geometry is double-sided; the chit flips the
         // shading normal toward the incoming ray.
-        // Primary (bounce 0) sees particles too (0xFF); bounce rays exclude them (CULL_SECONDARY).
-        traceRayEXT(topLevelAS, gl_RayFlagsNoneEXT, bounce == 0 ? 0xFFu : CULL_SECONDARY,
+        // Primary (bounce 0) is the camera ray (CULL_PRIMARY): sees particles but not the first-person
+        // player. Bounce rays are secondary (CULL_SECONDARY): exclude particles, include the player.
+        traceRayEXT(topLevelAS, gl_RayFlagsNoneEXT, bounce == 0 ? CULL_PRIMARY : CULL_SECONDARY,
                     0u, 0u, 0u, ro, 0.0, rd, 10000.0, 0);
 
         if (payload.hitT < 0.0) {

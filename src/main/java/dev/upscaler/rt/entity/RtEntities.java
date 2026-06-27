@@ -69,9 +69,14 @@ public final class RtEntities {
     public static final int ENTITY_BIT = 0x800000;
     /** Custom-index flag (bit 22) marking a particle billboard instance (shares the entity geom table). */
     public static final int PARTICLE_BIT = 0x400000;
-    /** TLAS instance mask for particles: bit 1 only, so the 0x01 secondary cull mask skips them — particles
-     *  are seen by the primary (camera) ray only (no shadows / GI / reflections; the v1 scope). */
-    private static final int PARTICLE_MASK = 0x02;
+    // TLAS visibility-mask bits, ANDed against the per-ray cull mask in world.rgen. Bit 0 = secondary rays
+    // (shadows / GI / reflections, CULL_SECONDARY); bit 1 = the primary camera ray (CULL_PRIMARY).
+    private static final int MASK_SECONDARY = 0x01;
+    private static final int MASK_PRIMARY = 0x02;
+    /** Default mask: visible to every ray (terrain and ordinary entities use this). */
+    private static final int MASK_ALL = 0xFF;
+    /** Particles are primary-ray-only (no shadows / GI / reflections; the v1 scope). */
+    private static final int PARTICLE_MASK = MASK_PRIMARY;
     public static boolean particlesEnabled() {
         return UpscalerConfig.Rt.Entities.PARTICLES_ENABLED.value();
     }
@@ -387,14 +392,19 @@ public final class RtEntities {
     private void captureEntities(RtContext ctx, FrameBuild build, Minecraft mc, ClientLevel level, float partial, int rbx, int rby, int rbz) {
         EntityRenderDispatcher dispatcher = mc.getEntityRenderDispatcher();
         Entity cameraEntity = mc.getCameraEntity();
+        // In first person the camera owner's own body must not block the primary camera ray, but it should
+        // still appear in reflections / shadows / GI (so the player sees themselves in water as others would).
+        // In F5 third person it renders fully, like any other entity.
+        boolean firstPerson = mc.options.getCameraType().isFirstPerson();
         curVerts.clear();
         for (Entity entity : level.entitiesForRendering()) {
             if (build.full()) {
                 break;
             }
-            if (entity == cameraEntity || entity.isInvisible()) {
+            if (entity.isInvisible()) {
                 continue;
             }
+            int mask = entity == cameraEntity && firstPerson ? MASK_SECONDARY : MASK_ALL;
             float ix = (float) Mth.lerp(partial, entity.xo, entity.getX());
             float iy = (float) Mth.lerp(partial, entity.yo, entity.getY());
             float iz = (float) Mth.lerp(partial, entity.zo, entity.getZ());
@@ -421,7 +431,7 @@ public final class RtEntities {
             // MV; rigid translation is packed into the table, deformation gets a disp buffer.
             Motion motion = uploadVertexMotion(ctx, build, capture.verts, prev, rbx, rby, rbz, "entity " + id);
             curVerts.put(id, storeEntityPrev(prev, capture.verts, rbx, rby, rbz));
-            appendCapture(ctx, build, motion, id, ENTITY_BIT, 0xFF);
+            appendCapture(ctx, build, motion, id, ENTITY_BIT, mask);
         }
         Map<Integer, EntityPrev> oldPrev = prevVerts;
         prevVerts = curVerts;
