@@ -69,7 +69,42 @@ public final class RtUiOverlay {
      * core/screenquad"). Gating the redirect here keeps the loading-screen GUI on the normal path.
      */
     public static boolean enabled() {
-        return UpscalerConfig.Rt.Hdr.UI_OVERLAY.value() && !compositeFailed && Minecraft.getInstance().isGameLoadFinished();
+        return (UpscalerConfig.Rt.Hdr.UI_OVERLAY.value() || hdrUiActive())
+                && !compositeFailed && Minecraft.getInstance().isGameLoadFinished();
+    }
+
+    /** HDR present mode: the UI must go through the overlay since the SDR main target isn't presented. */
+    private static boolean hdrUiActive() {
+        return UpscalerConfig.Rt.Hdr.SCRGB_SWAPCHAIN.value() && UpscalerConfig.Rt.Hdr.enabled();
+    }
+
+    /** Whether the overlay holds this frame's UI (for the HDR present path to composite + consume). */
+    public static boolean populatedThisFrame() {
+        return usedThisFrame && overlay != null;
+    }
+
+    /** Mark the overlay consumed by the HDR present composite (so it isn't reused next frame). */
+    public static void markConsumed() {
+        usedThisFrame = false;
+    }
+
+    public static int overlayWidth() {
+        return overlay != null ? overlay.width : 0;
+    }
+
+    public static int overlayHeight() {
+        return overlay != null ? overlay.height : 0;
+    }
+
+    /** The overlay color image view, for the HDR composite compute pass (0 if not available). */
+    public static long overlayColorView() {
+        if (overlay == null || overlay.getColorTextureView() == null) {
+            return 0L;
+        }
+        if (overlay.getColorTextureView() instanceof com.mojang.blaze3d.vulkan.VulkanGpuTextureView v) {
+            return v.vkImageView();
+        }
+        return 0L;
     }
 
     /**
@@ -97,6 +132,11 @@ public final class RtUiOverlay {
     public static void compositeIfUsed() {
         if (!usedThisFrame || overlay == null) {
             usedThisFrame = false;
+            return;
+        }
+        if (RtComposite.INSTANCE.isHdrPresentActive()) {
+            // HDR path composites the overlay over the scRGB HDR image at present; leave usedThisFrame set so
+            // presentHdr can consume it. Do NOT composite over the SDR main target (it isn't presented).
             return;
         }
         usedThisFrame = false;

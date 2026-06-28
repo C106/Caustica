@@ -45,6 +45,7 @@ import dev.upscaler.rt.material.RtEntityMaterials;
 import dev.upscaler.rt.material.RtMaterials;
 import dev.upscaler.rt.pipeline.RtDisplayPipeline;
 import dev.upscaler.rt.pipeline.RtDlssRr;
+import dev.upscaler.rt.pipeline.RtHdrCompositePipeline;
 import dev.upscaler.rt.pipeline.RtExposure;
 import dev.upscaler.rt.pipeline.RtPipeline;
 import dev.upscaler.rt.terrain.RtTerrain;
@@ -184,6 +185,9 @@ public final class RtComposite {
     // Set true after this frame's display dispatch wrote hdrDisplayImage (HDR enabled + RT ran); gates the
     // HDR present blit so a frame where RT did not run falls back to the vanilla SDR present.
     private boolean hdrWrittenThisFrame;
+        // Step C.2: composites the captured UI overlay over hdrDisplayImage at paper white, just before present.
+    private RtHdrCompositePipeline hdrCompositePipeline;
+    private long hdrUiSampler;
     // Guide buffers (first-hit attributes for DLSS-RR): normal+roughness, albedo, depth, motion,
     // specular albedo, disabled specular hit distance, and reflection motion.
     private RtImage gNormal;
@@ -928,6 +932,17 @@ public final class RtComposite {
             displayPipeline.destroy();
             displayPipeline = null;
         }
+        if (hdrCompositePipeline != null) {
+            hdrCompositePipeline.destroy();
+            hdrCompositePipeline = null;
+        }
+        if (hdrUiSampler != 0L) {
+            RtContext hdrCtx = RtContext.currentOrNull();
+            if (hdrCtx != null) {
+                VK10.vkDestroySampler(hdrCtx.vk(), hdrUiSampler, null);
+            }
+            hdrUiSampler = 0L;
+        }
         if (worldPipeline != null) {
             worldPipeline.destroy();
             worldPipeline = null;
@@ -1023,6 +1038,24 @@ public final class RtComposite {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkCommandBuffer cmd = enc.allocateAndBeginTransientCommandBuffer();
 
+            // Step C.2: composite the captured UI overlay over the HDR world image (in place) at paper white,
+            // before the swapchain blit. The overlay is an MC render target kept in GENERAL layout, sampled by
+            // the compute pass. A memory barrier first makes the GUI overlay writes + the world HDR writes
+            // visible to the compute; the dep1 barrier below (ALL writes -> transfer read) then covers the
+            // compute's HDR write for the blit.
+            long overlayView = RtUiOverlay.populatedThisFrame() ? RtUiOverlay.overlayColorView() : 0L;
+            if (overlayView != 0L) {
+                ensureHdrUiResources();
+                if (hdrCompositePipeline != null) {
+                    VkMemoryBarrier2.Buffer pre = VkMemoryBarrier2.calloc(1, stack).sType$Default();
+                    pre.get(0).srcStageMask(65536L).srcAccessMask(65536L).dstStageMask(2048L).dstAccessMask(98304L);
+                    VkDependencyInfo preDep = VkDependencyInfo.calloc(stack).sType$Default().pMemoryBarriers(pre);
+                    KHRSynchronization2.vkCmdPipelineBarrier2KHR(cmd, preDep);
+                    hdrCompositePipeline.setImages(hdrDisplayImage.view, overlayView, hdrUiSampler);
+                    hdrCompositePipeline.dispatch(cmd, src.width, src.height, UpscalerConfig.Rt.Hdr.paperWhiteScale());
+                }
+                RtUiOverlay.markConsumed();
+            }
             // Swapchain UNDEFINED -> TRANSFER_DST, plus make the HDR compute writes visible to the blit read.
             VkImageMemoryBarrier2.Buffer toDst = VkImageMemoryBarrier2.calloc(1, stack).sType$Default();
             toDst.get(0).srcStageMask(0L).srcAccessMask(0L).dstStageMask(4096L).dstAccessMask(4096L)
@@ -1062,6 +1095,33 @@ public final class RtComposite {
             enc.execute(cmd);
             enc.signalSemaphore(presentSem, 0L, 4096L);
         }
+    }
+
+    /** Lazily create the HDR UI-composite compute pipeline + its nearest/clamp sampler (first HDR present). */
+    private void ensureHdrUiResources() {
+        if (hdrCompositePipeline != null) {
+            return;
+        }
+        RtContext ctx = RtContext.get();
+        if (ctx == null) {
+            return;
+        }
+        if (hdrUiSampler == 0L) {
+            try (MemoryStack stack = MemoryStack.stackPush()) {
+                VkSamplerCreateInfo sci = VkSamplerCreateInfo.calloc(stack).sType$Default()
+                        .magFilter(VK10.VK_FILTER_NEAREST).minFilter(VK10.VK_FILTER_NEAREST)
+                        .mipmapMode(VK10.VK_SAMPLER_MIPMAP_MODE_NEAREST)
+                        .addressModeU(VK10.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)
+                        .addressModeV(VK10.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)
+                        .addressModeW(VK10.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+                var p = stack.mallocLong(1);
+                if (VK10.vkCreateSampler(ctx.vk(), sci, null, p) != VK10.VK_SUCCESS) {
+                    return;
+                }
+                hdrUiSampler = p.get(0);
+            }
+        }
+        hdrCompositePipeline = RtHdrCompositePipeline.create(ctx);
     }
 
     /**
