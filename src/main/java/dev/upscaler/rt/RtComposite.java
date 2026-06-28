@@ -25,10 +25,14 @@ import org.joml.Matrix4f;
 import org.joml.Matrix4fc;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
+import org.lwjgl.vulkan.KHRSynchronization2;
 import org.lwjgl.vulkan.VK10;
 import org.lwjgl.vulkan.VkCommandBuffer;
+import org.lwjgl.vulkan.VkDependencyInfo;
 import org.lwjgl.vulkan.VkImageBlit;
 import org.lwjgl.vulkan.VkImageCopy;
+import org.lwjgl.vulkan.VkImageMemoryBarrier2;
+import org.lwjgl.vulkan.VkMemoryBarrier2;
 import org.lwjgl.vulkan.VkSamplerCreateInfo;
 
 import dev.upscaler.rt.accel.RtAccel;
@@ -173,10 +177,13 @@ public final class RtComposite {
     private RtDisplayPipeline displayPipeline;
     private RtImage output;
     private RtImage displayImage;
-    // Parallel scRGB-linear HDR display image (Phase 1). Written alongside displayImage when HDR is enabled;
-    // not yet presented (the SDR displayImage is still what gets copied to the main target). Phase 3 will
-    // composite/present this instead under an HDR swapchain.
+    // Parallel scRGB-linear HDR display image (Phase 1). Written alongside displayImage when HDR is enabled.
+    // Step C: when the scRGB swapchain is active, this is blitted straight to the swapchain (world-only;
+    // bypasses the SDR main target + its UI). UI compositing over it is a later sub-step.
     private RtImage hdrDisplayImage;
+    // Set true after this frame's display dispatch wrote hdrDisplayImage (HDR enabled + RT ran); gates the
+    // HDR present blit so a frame where RT did not run falls back to the vanilla SDR present.
+    private boolean hdrWrittenThisFrame;
     // Guide buffers (first-hit attributes for DLSS-RR): normal+roughness, albedo, depth, motion,
     // specular albedo, disabled specular hit distance, and reflection motion.
     private RtImage gNormal;
@@ -269,6 +276,7 @@ public final class RtComposite {
 
     public boolean composite(GpuTexture nativeColor, int width, int height) {
         frameCounter++; // advances once per frame; RtTerrain retires resources relative to it
+        hdrWrittenThisFrame = false; // set true again below once this frame's HDR display image is written
         if (failed) {
             return false;
         }
@@ -746,6 +754,7 @@ public final class RtComposite {
                 displayPipeline.dispatch(cmd, displayW, displayH, UpscalerConfig.Rt.Hdr.enabled(),
                         UpscalerConfig.Rt.Hdr.paperWhiteScale(), UpscalerConfig.Rt.Hdr.headroom());
             }
+            hdrWrittenThisFrame = UpscalerConfig.Rt.Hdr.enabled();
             VulkanCommandEncoder.memoryBarrier(cmd, stack);
 
             try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "copy composite to main target")) {
@@ -989,6 +998,70 @@ public final class RtComposite {
         region.get(0).dstSubresource().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT).mipLevel(0).baseArrayLayer(0).layerCount(1);
         region.get(0).extent().set(width, height, 1);
         return region;
+    }
+
+    /** Whether the world-only HDR present (HDR image -> scRGB swapchain) should replace the vanilla SDR blit. */
+    public boolean isHdrPresentActive() {
+        return UpscalerConfig.Rt.Hdr.SCRGB_SWAPCHAIN.value()
+                && UpscalerConfig.Rt.Hdr.enabled()
+                && hdrWrittenThisFrame
+                && hdrDisplayImage != null;
+    }
+
+    /**
+     * Blit this frame's scRGB-linear HDR image straight into the swapchain image, replacing Minecraft's SDR
+     * blit. Replicates {@code VulkanGpuSurface.blitFromTexture}'s barrier + acquire-wait/present-signal
+     * sequence with the HDR {@link RtImage} as the (GENERAL-layout) source; an added memory barrier makes the
+     * display-compute writes visible to the blit read. World-only — the SDR main target (and its UI) is
+     * bypassed (UI compositing over the HDR image is a later sub-step). The magic stage/access values mirror
+     * vanilla {@code blitFromTexture} exactly. Y is flipped to match the vanilla swapchain blit.
+     */
+    public void presentHdr(VulkanCommandEncoder enc, long swapchainImage, int swapW, int swapH, long acquireSem, long presentSem) {
+        RtImage src = hdrDisplayImage;
+        int copyW = Math.min(swapW, src.width);
+        int copyH = Math.min(swapH, src.height);
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkCommandBuffer cmd = enc.allocateAndBeginTransientCommandBuffer();
+
+            // Swapchain UNDEFINED -> TRANSFER_DST, plus make the HDR compute writes visible to the blit read.
+            VkImageMemoryBarrier2.Buffer toDst = VkImageMemoryBarrier2.calloc(1, stack).sType$Default();
+            toDst.get(0).srcStageMask(0L).srcAccessMask(0L).dstStageMask(4096L).dstAccessMask(4096L)
+                    .oldLayout(VK10.VK_IMAGE_LAYOUT_UNDEFINED).newLayout(VK10.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+                    .srcQueueFamilyIndex(-1).dstQueueFamilyIndex(-1).image(swapchainImage);
+            toDst.get(0).subresourceRange().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT).baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1);
+            VkMemoryBarrier2.Buffer srcVis = VkMemoryBarrier2.calloc(1, stack).sType$Default();
+            srcVis.get(0).srcStageMask(65536L).srcAccessMask(65536L).dstStageMask(4096L).dstAccessMask(2048L);
+            VkDependencyInfo dep1 = VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(toDst).pMemoryBarriers(srcVis);
+            KHRSynchronization2.vkCmdPipelineBarrier2KHR(cmd, dep1);
+
+            // Blit HDR (GENERAL) -> swapchain (TRANSFER_DST), Y-flipped like vanilla.
+            VkImageBlit.Buffer region = VkImageBlit.calloc(1, stack);
+            region.get(0).srcSubresource().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT).mipLevel(0).baseArrayLayer(0).layerCount(1);
+            region.get(0).dstSubresource().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT).mipLevel(0).baseArrayLayer(0).layerCount(1);
+            region.get(0).srcOffsets(1).set(copyW, copyH, 1); // srcOffsets[0] = (0,0,0) from calloc
+            region.get(0).dstOffsets(0).set(0, copyH, 0);
+            region.get(0).dstOffsets(1).set(copyW, 0, 1);
+            VK10.vkCmdBlitImage(cmd, src.image, VK10.VK_IMAGE_LAYOUT_GENERAL, swapchainImage,
+                    VK10.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region, VK10.VK_FILTER_NEAREST);
+
+            // Swapchain TRANSFER_DST -> PRESENT_SRC_KHR (1000001002).
+            VkImageMemoryBarrier2.Buffer toPresent = VkImageMemoryBarrier2.calloc(1, stack).sType$Default();
+            toPresent.get(0).srcStageMask(4096L).srcAccessMask(4096L).dstStageMask(65536L).dstAccessMask(0L)
+                    .oldLayout(VK10.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL).newLayout(1000001002)
+                    .srcQueueFamilyIndex(-1).dstQueueFamilyIndex(-1).image(swapchainImage);
+            toPresent.get(0).subresourceRange().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT).baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1);
+            VkMemoryBarrier2.Buffer mem2 = VkMemoryBarrier2.calloc(1, stack).sType$Default();
+            mem2.get(0).srcStageMask(4096L).srcAccessMask(2048L).dstStageMask(65536L).dstAccessMask(98304L);
+            VkDependencyInfo dep2 = VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(toPresent).pMemoryBarriers(mem2);
+            KHRSynchronization2.vkCmdPipelineBarrier2KHR(cmd, dep2);
+
+            if (VK10.vkEndCommandBuffer(cmd) != VK10.VK_SUCCESS) {
+                throw new IllegalStateException("vkEndCommandBuffer(hdr present) failed");
+            }
+            enc.waitSemaphore(acquireSem, 0L, 65536L);
+            enc.execute(cmd);
+            enc.signalSemaphore(presentSem, 0L, 4096L);
+        }
     }
 
     /**

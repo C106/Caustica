@@ -1,10 +1,15 @@
 package dev.upscaler.mixin;
 
+import com.mojang.blaze3d.systems.CommandEncoderBackend;
+import com.mojang.blaze3d.textures.GpuTextureView;
+import com.mojang.blaze3d.vulkan.VulkanCommandEncoder;
 import com.mojang.blaze3d.vulkan.VulkanDevice;
 import com.mojang.blaze3d.vulkan.VulkanGpuSurface;
 import dev.upscaler.UpscalerConfig;
 import dev.upscaler.UpscalerMod;
+import dev.upscaler.rt.RtComposite;
 import dev.upscaler.rt.RtHdr;
+import it.unimi.dsi.fastutil.longs.LongList;
 import org.lwjgl.vulkan.VkSurfaceFormatKHR;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
@@ -47,6 +52,29 @@ public abstract class VulkanGpuSurfaceMixin {
 	@Final
 	private int swapchainImageFormat;
 
+	@Shadow
+	@Final
+	private LongList swapchainImages;
+
+	@Shadow
+	private int currentImageIndex;
+
+	@Shadow
+	private int swapchainWidth;
+
+	@Shadow
+	private int swapchainHeight;
+
+	@Shadow
+	@Final
+	private long[] acquireSemaphores;
+
+	@Shadow
+	private int currentAcquireSemaphore;
+
+	@Shadow
+	private long[] presentSemaphores;
+
 	@Unique
 	private int upscaler$colorSpace = 0;
 
@@ -87,5 +115,25 @@ public abstract class VulkanGpuSurfaceMixin {
 			index = 0)
 	private int upscaler$overrideColorSpace(int original) {
 		return this.upscaler$colorSpace != 0 ? this.upscaler$colorSpace : original;
+	}
+
+	/**
+	 * Step C — world-only HDR present. When the RT renderer has a fresh scRGB HDR image and the swapchain is
+	 * scRGB, blit that image straight into the swapchain instead of Minecraft's SDR main target. Replaces the
+	 * vanilla blit entirely (the SDR target + its UI are bypassed for now; UI compositing is a later step).
+	 */
+	@Inject(method = "blitFromTexture", at = @At("HEAD"), cancellable = true)
+	private void upscaler$presentHdr(CommandEncoderBackend commandEncoder, GpuTextureView textureView, CallbackInfo ci) {
+		if (this.currentImageIndex < 0) {
+			return;
+		}
+		RtComposite rt = RtComposite.INSTANCE;
+		if (!rt.isHdrPresentActive()) {
+			return;
+		}
+		long swapchainImage = this.swapchainImages.getLong(this.currentImageIndex);
+		rt.presentHdr((VulkanCommandEncoder) commandEncoder, swapchainImage, this.swapchainWidth, this.swapchainHeight,
+				this.acquireSemaphores[this.currentAcquireSemaphore], this.presentSemaphores[this.currentImageIndex]);
+		ci.cancel();
 	}
 }
