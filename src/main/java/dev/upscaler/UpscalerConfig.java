@@ -612,6 +612,12 @@ public final class UpscalerConfig {
             public static final FloatSetting PEAK_NITS =
                     clampedFloat("upscaler.rt.hdr.peakNits", 1000.0f, 80.0f, 10000.0f);
             public static final BooleanSetting FORCE_SDR = bool("upscaler.rt.hdr.forceSdr", false);
+            /**
+             * Phase 2 step A: render the vanilla GUI/HUD into a separate transparent overlay target and
+             * composite it back over the world. Default off. In SDR this should look identical to vanilla; it
+             * is the prerequisite for keeping UI out of the world tonemap once HDR presentation lands.
+             */
+            public static final BooleanSetting UI_OVERLAY = bool("upscaler.rt.hdr.uiOverlay", false);
 
             private Hdr() {
             }
