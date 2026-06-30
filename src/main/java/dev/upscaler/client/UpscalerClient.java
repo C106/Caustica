@@ -76,6 +76,8 @@ public final class UpscalerClient implements ClientModInitializer {
 			RtEntities.INSTANCE.shutdown();
 		}
 		RtComposite.INSTANCE.destroy();
+		// Shut NGX down once, after every feature (RR, later FG) has been released by the composite destroy.
+		dev.upscaler.ngx.NgxRuntime.INSTANCE.shutdown();
 		if (ctx != null) {
 			ctx.destroy();
 		}
