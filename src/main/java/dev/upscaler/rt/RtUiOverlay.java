@@ -110,6 +110,18 @@ public final class RtUiOverlay {
         return 0L;
     }
 
+    /** The overlay color image (0 if not available) — pairs with {@link #overlayColorView()} for callers
+     * (e.g. the DLSSG "ui" optional resource) that need both the view and the raw image. */
+    public static long overlayColorImage() {
+        if (overlay == null || overlay.getColorTexture() == null) {
+            return 0L;
+        }
+        if (overlay.getColorTexture() instanceof com.mojang.blaze3d.vulkan.VulkanGpuTexture t) {
+            return t.vkImage();
+        }
+        return 0L;
+    }
+
     /**
      * Prepare the overlay (sized to {@code main}, cleared transparent with depth cleared to 0.0) and return
      * it so {@code GuiRenderer.draw} renders the GUI into it instead of the main target. Called from the

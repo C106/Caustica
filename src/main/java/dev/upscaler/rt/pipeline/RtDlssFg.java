@@ -152,13 +152,18 @@ public final class RtDlssFg {
     /**
      * Record one DLSSG evaluation: generate interpolated frame {@code multiFrameIndex} of
      * {@code multiFrameCount} from the final {@code backbuffer} + HW {@code depth} + {@code mvec} into
-     * {@code outputInterp}. Optional resources (hudless/ui/outputReal) pass 0 handles to skip. Matrices are
-     * jitter-free (NGX left-multiply layout); pass {@code null} to leave one out. Returns false on failure.
+     * {@code outputInterp}. {@code hudless} (world+hand+screen-effects, no 2D GUI) and {@code ui}
+     * (premultiplied UI-only, from the {@code RtUiOverlay} redirect) help the driver avoid ghosting/smearing
+     * 2D UI in the generated frame; both are optional — pass 0 handles (view/image/format) to skip, same as
+     * {@code outputReal}. Matrices are jitter-free (NGX left-multiply layout); pass {@code null} to leave one
+     * out. Returns false on failure.
      */
     public boolean evaluate(long cmd,
             long backbufferView, long backbufferImage, int backbufferFormat,
             long depthView, long depthImage, int depthFormat,
             long mvecView, long mvecImage, int mvecFormat,
+            long hudlessView, long hudlessImage, int hudlessFormat,
+            long uiView, long uiImage, int uiFormat,
             long outputInterpView, long outputInterpImage, int outputInterpFormat,
             int width, int height, int mvecDepthWidth, int mvecDepthHeight,
             int multiFrameCount, int multiFrameIndex, float mvScaleX, float mvScaleY,
@@ -174,8 +179,8 @@ public final class RtDlssFg {
                     backbufferView, backbufferImage, backbufferFormat,
                     depthView, depthImage, depthFormat,
                     mvecView, mvecImage, mvecFormat,
-                    0L, 0L, 0, // hudless (skip for now)
-                    0L, 0L, 0, // ui (skip for now)
+                    hudlessView, hudlessImage, hudlessFormat, // 0/0/0 = skip (no hudless capture this frame)
+                    uiView, uiImage, uiFormat, // 0/0/0 = skip (UI overlay not active this frame)
                     outputInterpView, outputInterpImage, outputInterpFormat,
                     0L, 0L, 0, // outputReal (skip; MC presents the real frame itself)
                     width, height, mvecDepthWidth, mvecDepthHeight,

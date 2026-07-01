@@ -1,5 +1,6 @@
 package dev.upscaler.rt;
 
+import com.mojang.blaze3d.pipeline.RenderTarget;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.textures.GpuTexture;
 import com.mojang.blaze3d.textures.GpuTextureView;
@@ -187,6 +188,10 @@ public final class RtComposite {
     // Set true after this frame's display dispatch wrote hdrDisplayImage (HDR enabled + RT ran); gates the
     // HDR present blit so a frame where RT did not run falls back to the vanilla SDR present.
     private boolean hdrWrittenThisFrame;
+    // DLSS-FG "hudless" resource: a copy of the main render target (world+hand+screen-effects, no 2D GUI)
+    // taken in captureFgHudless right before the UI overlay composites the GUI back on top. Lazily allocated
+    // (only meaningful once FG + the UI overlay redirect are both active), resized on demand.
+    private RtImage fgHudlessImage;
         // Step C.2: composites the captured UI overlay over hdrDisplayImage at paper white, just before present.
     private RtHdrCompositePipeline hdrCompositePipeline;
     private long hdrUiSampler;
@@ -949,6 +954,10 @@ public final class RtComposite {
             hdrDisplayImage.destroy();
             hdrDisplayImage = null;
         }
+        if (fgHudlessImage != null) {
+            fgHudlessImage.destroy();
+            fgHudlessImage = null;
+        }
         if (output != null) {
             output.destroy();
             output = null;
@@ -1283,6 +1292,54 @@ public final class RtComposite {
     }
 
     /**
+     * DLSS Frame Generation quality: capture a copy of {@code main} (the main render target) into
+     * {@link #fgHudlessImage} for {@link #fgInterpolate} to feed DLSSG as the "hudless" resource. Call from
+     * {@code GameRendererMixin} right after {@code GuiRenderer.render()} but BEFORE
+     * {@link RtUiOverlay#compositeIfUsed()} — at that point, when the UI overlay redirect is active, {@code
+     * main} holds world+hand+screen-effects with no 2D GUI baked in yet (the GUI went to the overlay target
+     * instead), which is exactly DLSSG's "hudless" definition. No-op (and {@link #fgInterpolate} passes 0/0/0
+     * for hudless, same as always) unless both FG and the UI overlay redirect are active — capturing this
+     * without the redirect would just copy the ALREADY-composited backbuffer, which is useless as a distinct
+     * hudless input.
+     */
+    public void captureFgHudless(RenderTarget main) {
+        if (!RtDlssFg.enabled() || !RtUiOverlay.enabled() || main == null || main.getColorTexture() == null) {
+            return;
+        }
+        RtContext ctx = RtContext.currentOrNull();
+        if (ctx == null) {
+            return;
+        }
+        long srcImage;
+        try {
+            srcImage = vkImage(main.getColorTexture());
+        } catch (IllegalStateException e) {
+            return; // not a Vulkan-backed texture (shouldn't happen on this backend)
+        }
+        if (fgHudlessImage == null || fgHudlessImage.width != main.width || fgHudlessImage.height != main.height) {
+            if (fgHudlessImage != null) {
+                fgHudlessImage.destroy();
+            }
+            fgHudlessImage = ctx.createStorageImage(main.width, main.height, VK10.VK_FORMAT_R8G8B8A8_UNORM,
+                    "FG hudless capture " + main.width + "x" + main.height);
+        }
+        var encoder = (VulkanCommandEncoder) ((CommandEncoderAccessor) RenderSystem.getDevice().createCommandEncoder()).upscaler$getBackend();
+        VkCommandBuffer cmd = encoder.allocateAndBeginTransientCommandBuffer();
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            // Make the world/hand/screen-effects writes into `main` visible to the copy (the GUI hasn't
+            // touched `main` yet this frame — it went to the UI overlay target instead).
+            VulkanCommandEncoder.memoryBarrier(cmd, stack);
+            VK10.vkCmdCopyImage(cmd, srcImage, VK10.VK_IMAGE_LAYOUT_GENERAL,
+                    fgHudlessImage.image, VK10.VK_IMAGE_LAYOUT_GENERAL, copyRegion(stack, main.width, main.height));
+            VulkanCommandEncoder.memoryBarrier(cmd, stack);
+        }
+        if (VK10.vkEndCommandBuffer(cmd) != VK10.VK_SUCCESS) {
+            throw new IllegalStateException("vkEndCommandBuffer(fg hudless capture) failed");
+        }
+        encoder.execute(cmd);
+    }
+
+    /**
      * DLSS Frame Generation: record the DLSSG evaluate for generated frame {@code index} of {@code count}
      * (backbuffer = the final frame; HW depth = {@code gDepth}; motion = {@code gMotion}) into Minecraft's
      * command encoder, returning the interpolated output image (backbuffer size) for {@link RtFramePresenter}
@@ -1325,11 +1382,24 @@ public final class RtComposite {
                     "fgInterpolate index " + index + " out of range for fgInterp[" + fgInterp.length + "]");
         }
         RtImage out = fgInterp[index - 1];
+        // Only feed hudless/ui when they exist AND match this frame's backbuffer size — a stale or mismatched
+        // size (e.g. mid-resize) is worse than skipping, so fall back to 0/0/0 (DLSSG just does without).
+        boolean hudlessReady = fgHudlessImage != null
+                && fgHudlessImage.width == swapW && fgHudlessImage.height == swapH;
+        long hudlessView = hudlessReady ? fgHudlessImage.view : 0L;
+        long hudlessImg = hudlessReady ? fgHudlessImage.image : 0L;
+        boolean uiReady = RtUiOverlay.overlayWidth() == swapW && RtUiOverlay.overlayHeight() == swapH
+                && RtUiOverlay.overlayColorView() != 0L && RtUiOverlay.overlayColorImage() != 0L;
+        long uiView = uiReady ? RtUiOverlay.overlayColorView() : 0L;
+        long uiImg = uiReady ? RtUiOverlay.overlayColorImage() : 0L;
+
         VkCommandBuffer cmd = enc.allocateAndBeginTransientCommandBuffer();
         boolean ok = RtDlssFg.INSTANCE.evaluate(cmd.address(),
                 backbufferView, backbufferImage, fmt,
                 gDepth.view, gDepth.image, VK10.VK_FORMAT_R32_SFLOAT,
                 gMotion.view, gMotion.image, VK10.VK_FORMAT_R16G16_SFLOAT,
+                hudlessView, hudlessImg, hudlessReady ? fmt : 0,
+                uiView, uiImg, uiReady ? VK10.VK_FORMAT_R8G8B8A8_UNORM : 0,
                 out.view, out.image, fmt,
                 swapW, swapH, renderW, renderH, count, index, 1.0f, 1.0f,
                 true /* depthInverted (reversed-Z) */, false /* colorBuffersHDR (SDR path) */,

@@ -164,6 +164,9 @@ public abstract class GameRendererMixin {
 					target = "Lnet/minecraft/client/gui/render/GuiRenderer;render()V",
 					shift = At.Shift.AFTER))
 	private void upscaler$compositeUiOverlay(DeltaTracker deltaTracker, boolean advanceGameTime, CallbackInfo ci) {
+		// DLSS-FG quality: snapshot the world+hand+screen-effects (no 2D GUI yet — it rendered into the
+		// overlay target instead) BEFORE the overlay composites the GUI back onto mainRenderTarget below.
+		RtComposite.INSTANCE.captureFgHudless(this.mainRenderTarget);
 		dev.upscaler.rt.RtUiOverlay.compositeIfUsed();
 	}
 
