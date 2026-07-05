@@ -63,6 +63,11 @@ layout(binding = 2, set = 1) uniform sampler2D entitySpecTex[];
 // push-constant ceiling); only its 8-byte address is pushed. The hit shaders read just two table
 // addresses, so `pc` is a macro that lazily loads the needed field — no whole-struct copy per hit. The
 // std430 layout matches the CPU writer (RtComposite) and the raygen WorldPush exactly.
+//
+// Block-breaking overlay: xyz = the breaking block's position (rebased, matches gl_WorldRay*EXT
+// space), w = the bindless entityTex[] slot holding that block's destroy-stage texture (RtEntityTextures;
+// destroy_stage_N.png is a standalone Sampler0 texture, not a block-atlas sprite).
+struct BreakEntry { ivec4 posSlot; };
 struct WorldPush {
     mat4 invViewProj;
     vec3 camOffset;
@@ -73,7 +78,14 @@ struct WorldPush {
     vec2 jitter;
     uint64_t entityTableAddr;  // 184 entity geometry table
     uint flags;
-    vec4 sunDir; vec4 lightDir; vec4 lightRadiance;
+    vec4 sunDir; vec4 lightDir; vec4 lightRadiance; // 208/224/240
+    // Unused by this shader below — declared only to keep std430 offsets aligned with the CPU layout
+    // (a std430 buffer_reference struct can be a truncated PREFIX of the real layout, but can't skip a
+    // field in the middle of the prefix it does read).
+    vec4 moonDir; vec4 celestial; vec4 sunUv; vec4 moonUv; vec4 waterParams; vec4 waterAnchor; // 256..352
+    mat4 curViewProj; // 352
+    uint breakCount; uint breakPad0, breakPad1, breakPad2; // 416
+    BreakEntry breaking[8]; // 432
 };
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer WorldPushRef { WorldPush v; };
 layout(push_constant) uniform PushAddr { uint64_t worldPushAddr; } pcAddr;
@@ -186,6 +198,37 @@ vec3 perturbNormal(vec3 n, vec3 p0, vec3 p1, vec3 p2, vec2 t0, vec2 t1, vec2 t2,
     }
     ao = mix(1.0, ntex.b, NORMAL_AO_STRENGTH);
     return nm;
+}
+
+// Block-breaking overlay: shared by both opaque terrain AND stained-glass/ice (tint.w == 2 —
+// translucent blocks are breakable too), so it's a function rather than inlined twice — each call
+// site passes in the albedo it already computed (never re-fetches blockAtlas itself). Reconstructs the
+// hit position in the same rebased space the breaking list was pushed in, nudges it into the solid
+// block along -normal to get the block's integer coordinate, then decal-projects the local [0,1]
+// position onto whichever axis pair the normal is most aligned with (same idea as vanilla's
+// SheetedDecalTextureGenerator, which is how the real crumbling overlay tiles regardless of the
+// block's own UV) and multiply-blends the matching destroy-stage crack texture in, mirroring vanilla's
+// crumbling blend (DST_COLOR*SRC_COLOR, doubled — the destroy textures are mid-gray where uncracked).
+// Approximate orientation; acceptable for v1.
+vec3 applyBreaking(vec3 albedo, vec3 rayOrigin, vec3 rayDir, float hitT, vec3 n) {
+    if (pc.breakCount == 0u) {
+        return albedo;
+    }
+    vec3 hitPos = rayOrigin + rayDir * hitT;
+    ivec3 blockPos = ivec3(floor(hitPos - n * 0.01));
+    for (uint bi = 0u; bi < pc.breakCount; ++bi) {
+        ivec4 ps = pc.breaking[bi].posSlot;
+        if (all(equal(ps.xyz, blockPos))) {
+            vec3 local = hitPos - vec3(blockPos);
+            vec3 an = abs(n);
+            vec2 decalUv = (an.x >= an.y && an.x >= an.z) ? local.zy
+                         : (an.y >= an.z) ? local.xz
+                         : local.xy;
+            vec3 crack = texture(entityTex[nonuniformEXT(ps.w)], decalUv).rgb;
+            return clamp(crack * albedo, 0.0, 1.0);
+        }
+    }
+    return albedo;
 }
 
 void main() {
@@ -347,7 +390,10 @@ void main() {
     // a more opaque texel tints transmitted light more strongly.
     if (pr.tint.w > 1.5) {
         vec4 gtex = textureLod(blockAtlas, uv, 0.0);
-        payload.albedo = mix(vec3(1.0), gtex.rgb * tint * ao, gtex.a);
+        // Translucent blocks (glass, ice, …) are breakable too — apply the same overlay here, reusing
+        // gtex (already sampled above) rather than re-fetching blockAtlas.
+        payload.albedo = applyBreaking(mix(vec3(1.0), gtex.rgb * tint * ao, gtex.a),
+                gl_WorldRayOriginEXT, gl_WorldRayDirectionEXT, gl_HitTEXT, n);
         payload.normal = n;
         payload.hitT = gl_HitTEXT;
         payload.motionPrev = vec3(0.0);
@@ -368,6 +414,13 @@ void main() {
     payload.hitT = gl_HitTEXT;
     payload.motionPrev = vec3(0.0); // static terrain: camera-only motion vector
     payload.material = pr.tint.w;   // P5.2: 1 = water dielectric, 0 = opaque (set by extraction)
+
+    // Block-breaking overlay: opaque/cutout terrain (water skips — fluids aren't breakable, so
+    // breakCount==0 short-circuits it anyway; translucent glass/ice is handled at its own early-return
+    // above, reusing the gtex it already sampled instead of re-fetching blockAtlas here).
+    if (pr.tint.w < 0.5) {
+        payload.albedo = applyBreaking(payload.albedo, gl_WorldRayOriginEXT, gl_WorldRayDirectionEXT, gl_HitTEXT, n);
+    }
 
     // P6.1 heuristic defaults, overridden per-texel by LabPBR _s when present (P6.2a, flagged in mat.z).
     float rough = pr.mat.x;

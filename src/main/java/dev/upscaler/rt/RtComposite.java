@@ -15,6 +15,7 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.BiomeColors;
 import net.minecraft.client.renderer.texture.TextureAtlas;
 import net.minecraft.client.renderer.texture.TextureAtlasSprite;
+import net.minecraft.client.resources.model.ModelBakery;
 import net.minecraft.core.BlockPos;
 import net.minecraft.data.AtlasIds;
 import net.minecraft.resources.Identifier;
@@ -85,7 +86,13 @@ public final class RtComposite {
     // + dynamic sky (16-byte aligned vec4s): sunDir+dayFactor(@208) + lightDir(@224) + lightRadiance(@240)
     // + sky rewrite: moonDir+moonPhase(@256) + celestialAxis+starAngle(@272) + sunUv(@288) + moonUv(@304)
     // + W1/W2 water: waterParams(@320) xyz=camera-biome tint, w=wave time; waterAnchor(@336) xy=wave anchor
-    private static final int WORLD_PUSH_SIZE = 416;
+    // + curViewProj(@352, forward camera-relative view-projection)
+    // + block-breaking overlay (Tier 2): breakCount(@416) + pad(@420-428) + breaking[MAX_BREAKING](@432,
+    // 16B each: ivec3 blockPos rebased relative to terrain origin, int bindless entityTex slot for this
+    // block's destroy-stage texture; unused entries are simply not counted, not zeroed)
+    private static final int MAX_BREAKING = 8;
+    private static final int BREAKING_OFFSET = 432;
+    private static final int WORLD_PUSH_SIZE = BREAKING_OFFSET + MAX_BREAKING * 16;
     private static final int GUIDE_COUNT = 6; // RR guide buffers bound at world-pipeline bindings 3..8
     // Frames a retired per-frame TLAS must outlive before it's freed (> frames-in-flight); matches
     // RtTerrain's deferred-free horizon. The frame TLAS is built + traced this frame, then freed once
@@ -757,6 +764,11 @@ public final class RtComposite {
             RtEntities.FrameEntities fe = RtEntities.INSTANCE.beginFrame(ctx, terrain.staticInstances(),
                     terrain.blockX, terrain.blockY, terrain.blockZ, camX, camY, camZ, frameProjection, frameViewRotation);
             push.putLong(184, fe.geomTableAddr());
+            // Block-breaking overlay: resolves each destroy-stage RenderType's texture into the
+            // SAME bindless entity-texture array (destroy_stage_N.png is a standalone Sampler0 texture,
+            // not a block-atlas sprite — see ModelBakery.BREAKING_LOCATIONS/DESTROY_TYPES), so any newly
+            // resolved slot rides along with the uploadPending() call right below.
+            writeBreaking(push, terrain);
             // Upload any entity textures registered this frame into the bindless set before the trace.
             RtEntityTextures.INSTANCE.uploadPending(active, atlasSampler(ctx));
             // Re-upload the LabPBR _s atlas if extraction added sprites since the last frame (the
@@ -865,6 +877,41 @@ public final class RtComposite {
      * interpolated). {@code upscaler.rt.sunNoonSouthDeg} tilts the east-west arc toward south (+Z) at
      * noon.
      */
+    /**
+     * Block-breaking overlay: mirrors vanilla's {@code ClientLevel.destructionProgress()} (populated
+     * by network packets, independent of the cancelled {@code LevelRenderer.render()} — see
+     * [[rt-native-overlay-tier1]]) into the push's {@code breaking[]} list, so {@code world.rchit} can blend
+     * the matching destroy-stage crack texture into a hit terrain block's albedo. Each block's own
+     * destroy-stage texture ({@code minecraft:textures/block/destroy_stage_N.png}, resolved via
+     * {@link ModelBakery#DESTROY_TYPES}) is a standalone {@code Sampler0} texture, not a block-atlas sprite,
+     * so it rides the same bindless entity-texture array as entity textures ({@link RtEntityTextures}).
+     */
+    private void writeBreaking(ByteBuffer push, RtTerrain terrain) {
+        int count = 0;
+        var level = Minecraft.getInstance().level;
+        if (level != null) {
+            for (var entry : level.destructionProgress().long2ObjectEntrySet()) {
+                if (count >= MAX_BREAKING) {
+                    break;
+                }
+                var progresses = entry.getValue();
+                if (progresses == null || progresses.isEmpty()) {
+                    continue;
+                }
+                int stage = Mth.clamp(progresses.last().getProgress(), 0, 9);
+                BlockPos pos = BlockPos.of(entry.getLongKey());
+                int slot = RtEntityTextures.INSTANCE.slotFor(ModelBakery.DESTROY_TYPES.get(stage));
+                int off = BREAKING_OFFSET + count * 16;
+                push.putInt(off, pos.getX() - terrain.blockX);
+                push.putInt(off + 4, pos.getY() - terrain.blockY);
+                push.putInt(off + 8, pos.getZ() - terrain.blockZ);
+                push.putInt(off + 12, slot);
+                count++;
+            }
+        }
+        push.putInt(416, count);
+    }
+
     private void writeSky(ByteBuffer push) {
         float sunX, sunY, sunZ, dayFactor, lx, ly, lz, rr, rg, rb, lightRadius;
         float moonX, moonY, moonZ, moonPhase, starAngle, starBrightness;
