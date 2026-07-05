@@ -658,7 +658,7 @@ public final class UpscalerConfig {
                     finiteFloat("upscaler.rt.exposure.manualEv", "exposure.manual-ev", 0.0f);
             public static final FloatSetting KEY = exposureScale("upscaler.rt.exposure.key", "exposure.key", 0.18f);
             public static final FloatSetting MIN_EV =
-                    finiteFloat("upscaler.rt.exposure.minEv", "exposure.min-ev", -1.0f);
+                    finiteFloat("upscaler.rt.exposure.minEv", "exposure.min-ev", -1.5f);
             public static final FloatSetting MAX_EV =
                     finiteFloat("upscaler.rt.exposure.maxEv", "exposure.max-ev", 2.0f);
             public static final FloatSetting ADAPT_UP =
