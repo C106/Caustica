@@ -1,18 +1,10 @@
 $ErrorActionPreference = "Stop"
 
 $upscalerRoot = $PSScriptRoot
-$nativesDir = Join-Path $upscalerRoot "run\natives"
-
-$ngxShim = Join-Path $upscalerRoot "native\ngx_shim\out\Release\ngxshim.dll"
-if (Test-Path -LiteralPath $ngxShim) {
-	New-Item -ItemType Directory -Force -Path $nativesDir | Out-Null
-	Copy-Item -LiteralPath $ngxShim -Destination (Join-Path $nativesDir "ngxshim.dll") -Force
-	Write-Host "Copied rebuilt ngxshim.dll to $nativesDir"
-}
 
 Push-Location $upscalerRoot
 try {
-	$env:JAVA_TOOL_OPTIONS='-Xmx8G -Dupscaler.renderScale=0.5 -Dupscaler.rt.composite=true -Dupscaler.rt.output=rt -Dupscaler.rt.dlssRr=true -Dupscaler.rt.exposure.key=0.12 -Dupscaler.rt.exposure.maxEv=2.0 -Dupscaler.rt.exposure.minEv=0.0 -Dupscaler.rt.cancelVanillaWorld=true -Dupscaler.rt.workerThreads=4 -Dupscaler.rt.sunNoonSouthDeg=30 -Dupscaler.rt.hdr.mode=pq -Dupscaler.rt.hdr.pqSwapchain=true -Dupscaler.rt.fg=true -Dupscaler.rt.reflex=true -Dupscaler.rt.hdr.uiOverlay=true'
+	$env:JAVA_TOOL_OPTIONS='-Xmx8G -XX:+UseCompactObjectHeaders -XX:+AlwaysPreTouch -XX:+UseStringDeduplication -XX:+UseZGC -Dupscaler.rt.fg=false -Dupscaler.rt.reflex=false -Dupscaler.rt.frameStats=false -Dupscaler.rt.lodWorld=true -Dupscaler.rt.lodDebug=true -Dupscaler.rt.poolStats=false'
 	.\gradlew.bat --stop
 	.\gradlew.bat runClient --args="--renderDebugLabels --graphicsBackend VULKAN"
 } finally {
