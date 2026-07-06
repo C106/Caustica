@@ -169,9 +169,10 @@ public abstract class GameRendererMixin {
 					target = "Lnet/minecraft/client/gui/render/GuiRenderer;render()V",
 					shift = At.Shift.AFTER))
 	private void upscaler$compositeUiOverlay(DeltaTracker deltaTracker, boolean advanceGameTime, CallbackInfo ci) {
-		// Entity-glow outline is world-space content: composite it onto mainRenderTarget first, before the
-		// DLSS-FG hudless snapshot and the GUI composite (both below) so they see it already baked in.
-		RtComposite.INSTANCE.compositeGlowOutline(this.mainRenderTarget);
+		// World-space overlays (entity glow outline, future block outline/nametags) composite onto
+		// mainRenderTarget first, before the DLSS-FG hudless snapshot and the GUI composite (both below)
+		// so they see the overlays already baked in.
+		dev.upscaler.rt.overlay.RtWorldOverlay.INSTANCE.composite(this.mainRenderTarget);
 		// DLSS-FG quality: snapshot the world+hand+screen-effects (no 2D GUI yet — it rendered into the
 		// overlay target instead) BEFORE the overlay composites the GUI back onto mainRenderTarget below.
 		RtComposite.INSTANCE.captureFgHudless(this.mainRenderTarget);

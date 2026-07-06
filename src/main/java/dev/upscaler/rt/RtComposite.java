@@ -39,7 +39,6 @@ import org.lwjgl.vulkan.VkSamplerCreateInfo;
 
 import dev.upscaler.rt.accel.RtAccel;
 import dev.upscaler.rt.accel.RtBuffer;
-import dev.upscaler.rt.accel.RtBufferPool;
 import dev.upscaler.rt.accel.RtImage;
 import dev.upscaler.rt.entity.RtEntities;
 import dev.upscaler.rt.entity.RtEntityTextures;
@@ -48,7 +47,7 @@ import dev.upscaler.rt.material.RtEntityMaterials;
 import dev.upscaler.rt.pipeline.RtDisplayPipeline;
 import dev.upscaler.rt.pipeline.RtDlssFg;
 import dev.upscaler.rt.pipeline.RtDlssRr;
-import dev.upscaler.rt.pipeline.RtGlowOutline;
+import dev.upscaler.rt.overlay.RtWorldOverlay;
 import dev.upscaler.rt.pipeline.RtHdrCompositePipeline;
 import dev.upscaler.rt.pipeline.RtSdrPresentPipeline;
 import dev.upscaler.rt.pipeline.RtExposure;
@@ -57,9 +56,6 @@ import dev.upscaler.rt.terrain.RtTerrain;
 
 import java.nio.ByteBuffer;
 import java.nio.LongBuffer;
-import java.util.ArrayList;
-import java.util.Iterator;
-import java.util.List;
 
 /**
  * On-screen composite. Each frame, ray-trace into a render-res storage image (+ guide buffers), use
@@ -199,18 +195,6 @@ public final class RtComposite {
         // Step C.2: composites the captured UI overlay over hdrDisplayImage at paper white, just before present.
     private RtHdrCompositePipeline hdrCompositePipeline;
     private long hdrUiSampler;
-    // Entity-glow outline: full-res raster mask (RGBA8, lazily sized to the main target like
-    // fgHudlessImage) + the raster/Sobel-composite pipeline, both created on first use. glowPool/
-    // glowDeferred hold the per-frame merged vertex/index buffers on the same frames-in-flight-safe
-    // deferred-release convention RtEntities uses (a buffer is safe to reuse GLOW_KEEP_FRAMES frames
-    // after the frame that recorded its last GPU read).
-    private static final int GLOW_KEEP_FRAMES = 4;
-    private RtImage glowMaskImage;
-    private RtGlowOutline glowOutline;
-    private final RtBufferPool glowPool = new RtBufferPool();
-    private final List<GlowDeferred> glowDeferred = new ArrayList<>();
-    private record GlowDeferred(long freeFrame, RtBuffer vbo, RtBuffer ibo) {
-    }
     // Menu/non-RT present: converts the SDR main target (sRGB) to PQ-encoded at paper white so menus,
     // the title panorama and the loading screen present correctly to the PQ swapchain instead of being
     // raw-copied (misdisplayed). Lazily created; the image is sized to the swapchain.
@@ -328,6 +312,15 @@ public final class RtComposite {
         camY = cameraY;
         camZ = cameraZ;
         frameCaptured = true;
+    }
+
+    /**
+     * The frame's forward camera-relative view-projection (jitter-free), exactly what {@code world.rgen}
+     * traced with — overlay raster passes ({@code dev.upscaler.rt.overlay}) reuse it so their content lands
+     * pixel-exact on the RT image. Valid after {@code updateMotion} ran this frame; do not mutate.
+     */
+    public Matrix4fc currentViewProjection() {
+        return mvCurProjView;
     }
 
     /**
@@ -1049,20 +1042,7 @@ public final class RtComposite {
             fgHdrHudlessImage.destroy();
             fgHdrHudlessImage = null;
         }
-        for (GlowDeferred d : glowDeferred) {
-            glowPool.release(d.vbo);
-            glowPool.release(d.ibo);
-        }
-        glowDeferred.clear();
-        glowPool.destroyAll();
-        if (glowMaskImage != null) {
-            glowMaskImage.destroy();
-            glowMaskImage = null;
-        }
-        if (glowOutline != null) {
-            glowOutline.destroy();
-            glowOutline = null;
-        }
+        RtWorldOverlay.INSTANCE.destroy(); // overlay features/pipelines/scratch live on the same device lifetime
         if (output != null) {
             output.destroy();
             output = null;
@@ -1416,123 +1396,6 @@ public final class RtComposite {
         region.get(0).dstOffsets(1).set(dst.width, dst.height, 1);
         VK10.vkCmdBlitImage(cmd, src.image, VK10.VK_IMAGE_LAYOUT_GENERAL,
                 dst.image, VK10.VK_IMAGE_LAYOUT_GENERAL, region, VK10.VK_FILTER_LINEAR);
-    }
-
-    /**
-     * Entity-glow (Glowing effect) outline: re-rasterizes this frame's glowing entities (captured by
-     * {@link RtEntities} as a side effect of its normal RT capture) into a full-res mask, Sobel-edges it,
-     * and blends the ~2px boundary onto {@code main} in place — same silhouette-through-walls look as
-     * vanilla, without ever making the entity itself emissive or touching a depth buffer. Call from
-     * {@code GameRendererMixin} right after {@code GuiRenderer.render()}, before {@link #captureFgHudless}
-     * and {@code RtUiOverlay.compositeIfUsed()} — this is world-space content, so DLSS-FG's hudless capture
-     * and the GUI (drawn on top of it) must both see it already composited in.
-     */
-    private boolean glowFailed;
-
-    public void compositeGlowOutline(RenderTarget main) {
-        Iterator<GlowDeferred> it = glowDeferred.iterator();
-        while (it.hasNext()) {
-            GlowDeferred d = it.next();
-            if (d.freeFrame <= frameCounter()) {
-                glowPool.release(d.vbo);
-                glowPool.release(d.ibo);
-                it.remove();
-            }
-        }
-        if (glowFailed || !RtEntities.glowEnabled() || main == null || main.getColorTexture() == null) {
-            return;
-        }
-        List<RtEntities.GlowEntity> batches = RtEntities.INSTANCE.glowBatches();
-        if (batches.isEmpty()) {
-            return;
-        }
-        RtContext ctx = RtContext.currentOrNull();
-        if (ctx == null) {
-            return;
-        }
-        long mainView = vkImageView(main.getColorTextureView());
-        if (mainView == 0L) {
-            UpscalerMod.LOGGER.warn("Glow outline: main render target has no Vulkan image view; skipping");
-            return;
-        }
-        try {
-            recordGlowOutline(ctx, main, mainView, batches);
-        } catch (Throwable t) {
-            glowFailed = true;
-            UpscalerMod.LOGGER.error("Glow outline failed; disabling for this session", t);
-        }
-    }
-
-    private void recordGlowOutline(RtContext ctx, RenderTarget main, long mainView, List<RtEntities.GlowEntity> batches) {
-        int totalVerts = 0;
-        int totalIdx = 0;
-        for (RtEntities.GlowEntity e : batches) {
-            totalVerts += e.verts().length / 3;
-            totalIdx += e.idx().length;
-        }
-        float[] mergedVerts = new float[totalVerts * 3];
-        int[] mergedIdx = new int[totalIdx];
-        int[] firstIndex = new int[batches.size()];
-        int[] indexCount = new int[batches.size()];
-        float[] colorRgba = new float[batches.size() * 4];
-        int vOff = 0;
-        int iOff = 0;
-        int vBase = 0;
-        for (int i = 0; i < batches.size(); i++) {
-            RtEntities.GlowEntity e = batches.get(i);
-            float[] verts = e.verts();
-            System.arraycopy(verts, 0, mergedVerts, vOff, verts.length);
-            int[] idx = e.idx();
-            firstIndex[i] = iOff;
-            indexCount[i] = idx.length;
-            for (int j = 0; j < idx.length; j++) {
-                mergedIdx[iOff + j] = idx[j] + vBase;
-            }
-            int color = e.color();
-            colorRgba[i * 4] = ((color >> 16) & 0xFF) / 255f;
-            colorRgba[i * 4 + 1] = ((color >> 8) & 0xFF) / 255f;
-            colorRgba[i * 4 + 2] = (color & 0xFF) / 255f;
-            colorRgba[i * 4 + 3] = ((color >>> 24) & 0xFF) / 255f;
-            vOff += verts.length;
-            iOff += idx.length;
-            vBase += verts.length / 3;
-        }
-
-        if (glowOutline == null) {
-            glowOutline = RtGlowOutline.create(ctx);
-        }
-        if (glowMaskImage == null || glowMaskImage.width != main.width || glowMaskImage.height != main.height) {
-            if (glowMaskImage != null) {
-                glowMaskImage.destroy();
-            }
-            glowMaskImage = ctx.createStorageImage(main.width, main.height, VK10.VK_FORMAT_R8G8B8A8_UNORM,
-                    "glow outline mask " + main.width + "x" + main.height, VK10.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
-        }
-        glowOutline.setMaskImage(glowMaskImage.view);
-
-        int vboBytes = mergedVerts.length * Float.BYTES;
-        int iboBytes = mergedIdx.length * Integer.BYTES;
-        RtBuffer vbo = glowPool.acquire(ctx, vboBytes, VK10.VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, true, "glow vbo");
-        RtBuffer ibo = glowPool.acquire(ctx, iboBytes, VK10.VK_BUFFER_USAGE_INDEX_BUFFER_BIT, true, "glow ibo");
-        MemoryUtil.memFloatBuffer(vbo.mapped, mergedVerts.length).put(mergedVerts);
-        MemoryUtil.memIntBuffer(ibo.mapped, mergedIdx.length).put(mergedIdx);
-
-        var encoder = (VulkanCommandEncoder) ((CommandEncoderAccessor) RenderSystem.getDevice().createCommandEncoder()).upscaler$getBackend();
-        VkCommandBuffer cmd = encoder.allocateAndBeginTransientCommandBuffer();
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            VulkanCommandEncoder.memoryBarrier(cmd, stack); // vbo/ibo host writes visible to the raster pass
-            glowOutline.recordMask(cmd, glowMaskImage.view, main.width, main.height, mvCurProjView,
-                    RtEntities.INSTANCE.glowCamOffsetX(), RtEntities.INSTANCE.glowCamOffsetY(),
-                    RtEntities.INSTANCE.glowCamOffsetZ(), vbo, ibo, firstIndex, indexCount, colorRgba, batches.size());
-            VulkanCommandEncoder.memoryBarrier(cmd, stack); // mask writes + main's world writes visible to the composite
-            glowOutline.recordComposite(cmd, mainView, main.width, main.height);
-            VulkanCommandEncoder.memoryBarrier(cmd, stack); // composite's main writes visible to what reads it next
-        }
-        if (VK10.vkEndCommandBuffer(cmd) != VK10.VK_SUCCESS) {
-            throw new IllegalStateException("vkEndCommandBuffer(glow outline) failed");
-        }
-        encoder.execute(cmd);
-        glowDeferred.add(new GlowDeferred(frameCounter() + GLOW_KEEP_FRAMES, vbo, ibo));
     }
 
     /**

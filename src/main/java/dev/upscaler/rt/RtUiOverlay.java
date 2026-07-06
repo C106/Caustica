@@ -66,7 +66,7 @@ public final class RtUiOverlay {
 
     /**
      * Runs regardless of HDR mode (the GUI redirect + composite-back reproduces vanilla exactly in SDR —
-     * GPU-verified during HDR Phase 2 step A) since {@code RtGlowOutline}'s composite point is this same
+     * GPU-verified during HDR Phase 2 step A) since {@code RtWorldOverlay}'s composite point is this same
      * seam and needs it to fire every frame. Active only once the game has finished loading: the composite
      * pipeline lazily compiles its shaders, which are not available during the loading screen (would crash
      * with "Couldn't find source for core/screenquad"). Gating the redirect here keeps the loading-screen

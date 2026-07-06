@@ -9,8 +9,8 @@ import org.spongepowered.asm.mixin.injection.At;
 
 /**
  * Redirect the vanilla GUI/HUD into a transparent overlay target ({@code RtUiOverlay}), regardless of HDR
- * mode — in SDR the composite-back reproduces vanilla exactly, and {@code RtGlowOutline}'s entity-outline
- * composite runs at that same seam, so it needs to fire every frame. {@code GuiRenderer.draw} fetches the
+ * mode — in SDR the composite-back reproduces vanilla exactly, and {@code RtWorldOverlay}'s world-space
+ * overlay composite runs at that same seam, so it needs to fire every frame. {@code GuiRenderer.draw} fetches the
  * destination via {@code gameRenderer.mainRenderTarget()} once and uses it for every GUI draw range (and the
  * after-blur depth clear), so redirecting that single expression routes all GUI rendering into the overlay.
  * The overlay is composited back over the world after {@code GuiRenderer.render} returns (see {@code

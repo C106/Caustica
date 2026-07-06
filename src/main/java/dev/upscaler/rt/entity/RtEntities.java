@@ -190,7 +190,7 @@ public final class RtEntities {
     private Map<Integer, EntityPrev> curVerts = new HashMap<>(entityMapCapacity());
 
     // This frame's glowing entities (see GlowEntity) + the camera-relative offset (camera pos - rebase
-    // origin) their positions are captured against, for RtGlowOutline's raster pass. Rebuilt every frame.
+    // origin) their positions are captured against, for RtGlowOutlineFeature's raster pass. Rebuilt every frame.
     private final List<GlowEntity> glowBatches = new ArrayList<>();
     private float glowCamOffsetX, glowCamOffsetY, glowCamOffsetZ;
 
@@ -291,7 +291,7 @@ public final class RtEntities {
     }
 
     /** One glowing entity's body mesh (rebased-space positions, copied out of {@link #capture} before the
-     *  next entity resets it) plus its vanilla outline colour, for {@code RtGlowOutline}'s full-res raster
+     *  next entity resets it) plus its vanilla outline colour, for {@code RtGlowOutlineFeature}'s full-res raster
      *  mask pass. Captured as a side effect of the normal RT capture — no extra posing/animation work. */
     public record GlowEntity(float[] verts, int[] idx, int color) {
     }
