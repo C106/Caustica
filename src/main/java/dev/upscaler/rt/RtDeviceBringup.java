@@ -111,6 +111,7 @@ public final class RtDeviceBringup {
     private static volatile boolean presentIdEnabled; // VK_KHR_present_id actually enabled on the device
     private static volatile boolean wideLinesEnabled; // VkPhysicalDeviceFeatures.wideLines actually enabled
     private static volatile float maxLineWidth = 1.0f; // device's lineWidthRange[1]; 1.0 unless wideLinesEnabled
+    private static volatile int overlayMsaaSamples = VK10.VK_SAMPLE_COUNT_1_BIT; // capped to the device's framebufferColorSampleCounts
     private static volatile int maxOpacity4StateSubdivisionLevel;
     private static boolean loggedUnavailable;
 
@@ -152,6 +153,15 @@ public final class RtDeviceBringup {
      *  enabled (Vulkan mandates exactly 1.0 in that case). Callers must clamp their desired width to this. */
     public static float maxLineWidth() {
         return maxLineWidth;
+    }
+
+    /** {@code VK_SAMPLE_COUNT_4_BIT} capped down to whatever the device's {@code framebufferColorSampleCounts}
+     *  actually advertises (2x, or 1x/no MSAA on the rare device that lacks even that) — no device feature to
+     *  enable, just a raster/framebuffer property, unlike {@link #wideLinesEnabled()}. World-overlay passes
+     *  that need edge AA (e.g. the block outline's native wide line) use this as their pipeline's
+     *  {@code rasterizationSamples}. */
+    public static int overlayMsaaSamples() {
+        return overlayMsaaSamples;
     }
 
     /** Optional extensions the gate wants AND the device supports — added but never required. */
@@ -279,6 +289,17 @@ public final class RtDeviceBringup {
             maxLineWidth = 1.0f;
         }
 
+        // World-overlay MSAA (block outline edge AA): a framebuffer property, not a feature — no
+        // VulkanFeature entry needed, just cap the desired 4x down to what the device actually supports.
+        int colorSampleCounts = physicalDevice.vkPhysicalDeviceProperties().limits().framebufferColorSampleCounts();
+        if ((colorSampleCounts & VK10.VK_SAMPLE_COUNT_4_BIT) != 0) {
+            overlayMsaaSamples = VK10.VK_SAMPLE_COUNT_4_BIT;
+        } else if ((colorSampleCounts & VK10.VK_SAMPLE_COUNT_2_BIT) != 0) {
+            overlayMsaaSamples = VK10.VK_SAMPLE_COUNT_2_BIT;
+        } else {
+            overlayMsaaSamples = VK10.VK_SAMPLE_COUNT_1_BIT;
+        }
+
         // Optional: opacity micromaps (any-hit opt). Only when the gate is on AND the device advertises the
         // extension — its absence must not disable RT, so it is kept out of the mandatory feature set above.
         ommEnabled = ommRequested() && physicalDevice.hasDeviceExtension(VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME);
@@ -310,7 +331,7 @@ public final class RtDeviceBringup {
         UpscalerMod.LOGGER.info(
                 "Ray tracing: enabling {}{}{} + features [bufferDeviceAddress, accelerationStructure, rayTracingPipeline, rayQuery"
                         + (wideLinesEnabled ? ", wideLines(max=" + maxLineWidth + ")" : "")
-                        + (ommEnabled ? ", opacityMicromap" : "") + "] on [{}]",
+                        + (ommEnabled ? ", opacityMicromap" : "") + "] + overlayMsaa=" + overlayMsaaSamples + "x on [{}]",
                 RT_EXTENSIONS, ommEnabled ? " + " + OPTIONAL_RT_EXTENSIONS : "",
                 reflexEnabled ? " + " + REFLEX_EXTENSIONS : "", physicalDevice.deviceName());
     }

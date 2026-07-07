@@ -10,6 +10,7 @@ import dev.upscaler.mixin.CommandEncoderAccessor;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.KHRDynamicRendering;
 import org.lwjgl.vulkan.VK10;
+import org.lwjgl.vulkan.VK12;
 import org.lwjgl.vulkan.VkClearValue;
 import org.lwjgl.vulkan.VkCommandBuffer;
 import org.lwjgl.vulkan.VkOffset2D;
@@ -127,6 +128,41 @@ public final class RtWorldOverlay {
             clearValue.get(0).color().float32(stack.floats(0f, 0f, 0f, 0f));
             colorAttach.get(0).clearValue(clearValue.get(0));
         }
+        VkRect2D renderArea = VkRect2D.calloc(stack);
+        renderArea.offset(VkOffset2D.calloc(stack).set(0, 0));
+        renderArea.extent().set(width, height);
+        VkRenderingInfo renderingInfo = VkRenderingInfo.calloc(stack).sType$Default()
+                .renderArea(renderArea).layerCount(1).pColorAttachments(colorAttach);
+        KHRDynamicRendering.vkCmdBeginRenderingKHR(cmd, renderingInfo);
+
+        VkViewport.Buffer viewport = VkViewport.calloc(1, stack);
+        viewport.get(0).x(0).y(0).width(width).height(height).minDepth(0f).maxDepth(1f);
+        VK10.vkCmdSetViewport(cmd, 0, viewport);
+        VkRect2D.Buffer scissor = VkRect2D.calloc(1, stack);
+        scissor.get(0).offset(VkOffset2D.calloc(stack).set(0, 0));
+        scissor.get(0).extent().set(width, height);
+        VK10.vkCmdSetScissor(cmd, 0, scissor);
+    }
+
+    /**
+     * Begin a one-attachment dynamic-rendering pass on the multisample {@code msaaView}, always clearing to
+     * transparent black (mask passes only — there is nothing sensible to "load" into a fresh multisample
+     * image from a single-sample source). {@code resolveView} receives the driver's per-pixel sample average
+     * when the pass ends ({@link #endRendering}) — {@code VK_RESOLVE_MODE_AVERAGE_BIT} is the only mode
+     * color attachments support, which is exactly coverage-weighted anti-aliasing for a flat-colour mask.
+     */
+    static void beginMsaaColorRendering(VkCommandBuffer cmd, MemoryStack stack, long msaaView, long resolveView,
+                                        int width, int height) {
+        VkRenderingAttachmentInfo.Buffer colorAttach = VkRenderingAttachmentInfo.calloc(1, stack).sType$Default()
+                .imageView(msaaView).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
+                .resolveMode(VK12.VK_RESOLVE_MODE_AVERAGE_BIT)
+                .resolveImageView(resolveView).resolveImageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
+                .loadOp(VK10.VK_ATTACHMENT_LOAD_OP_CLEAR)
+                .storeOp(VK10.VK_ATTACHMENT_STORE_OP_DONT_CARE); // only the resolved target's contents matter
+        VkClearValue.Buffer clearValue = VkClearValue.calloc(1, stack);
+        clearValue.get(0).color().float32(stack.floats(0f, 0f, 0f, 0f));
+        colorAttach.get(0).clearValue(clearValue.get(0));
+
         VkRect2D renderArea = VkRect2D.calloc(stack);
         renderArea.offset(VkOffset2D.calloc(stack).set(0, 0));
         renderArea.extent().set(width, height);

@@ -10,6 +10,8 @@ import java.nio.ByteBuffer;
 
 import it.unimi.dsi.fastutil.floats.FloatArrayList;
 
+import com.mojang.blaze3d.vulkan.VulkanCommandEncoder;
+
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.state.level.BlockOutlineRenderState;
 import net.minecraft.core.BlockPos;
@@ -28,6 +30,7 @@ import dev.upscaler.rt.RtContext;
 import dev.upscaler.rt.RtDebugLabels;
 import dev.upscaler.rt.RtDeviceBringup;
 import dev.upscaler.rt.accel.RtBuffer;
+import dev.upscaler.rt.accel.RtImage;
 import dev.upscaler.rt.entity.RtEntities;
 import dev.upscaler.rt.terrain.RtTerrain;
 
@@ -52,6 +55,14 @@ import dev.upscaler.rt.terrain.RtTerrain;
  * mitred joints) but was reverted as unnecessary complexity for what a native wide line already solves;
  * revisit that approach only if wideLines turns out inadequate (unsupported hardware, joint artifacts at
  * large widths, etc.) — see the memory note for what was tried.
+ *
+ * <p>Edge AA follows {@link RtGlowOutlineFeature}'s mask/composite split rather than drawing straight onto
+ * {@code main}: the line list rasterizes at {@link RtDeviceBringup#overlayMsaaSamples()} into a transient
+ * MSAA scratch attachment that dynamic rendering resolve-averages into a single-sample mask, then a tiny
+ * composite pass alpha-blends that mask onto {@code main}. Since every line pixel is the same flat colour
+ * (rgb = 0,0,0), per-sample coverage averages straight into a fractional alpha with no colour-bleed risk —
+ * the occlusion {@code discard} in {@code block_outline.frag} still runs once per fragment (not per sample,
+ * no {@code sampleShading}), so occlusion itself stays pixel-rate; only the silhouette edges get antialiased.
  */
 final class RtBlockOutlineFeature implements RtOverlayFeature {
     // mat4 curViewProj (0, 64B) + vec3 camOffset (64, padded to 16B) + vec4 color (80, 16B) = 96B.
@@ -67,6 +78,10 @@ final class RtBlockOutlineFeature implements RtOverlayFeature {
     private RtContext ctxRef;
     private RtOverlayPipelines.Pipeline pipeline;
     private RtOverlayPipelines.AccelStructureSet accelSet;
+    private RtOverlayPipelines.Pipeline compositePipeline;
+    private RtOverlayPipelines.StorageImageSet compositeSet;
+    private RtImage msaaImage;
+    private RtImage resolvedMask;
 
     private final Matrix4f viewProj = new Matrix4f();
     private RtBuffer vbo;
@@ -123,7 +138,7 @@ final class RtBlockOutlineFeature implements RtOverlayFeature {
             return false;
         }
 
-        ensureResources(ctx);
+        ensureResources(ctx, width, height);
         float[] data = verts.toFloatArray();
         vbo = pool.acquireVertex(ctx, (long) data.length * Float.BYTES, "block outline vbo");
         MemoryUtil.memFloatBuffer(vbo.mapped, data.length).put(data);
@@ -164,42 +179,81 @@ final class RtBlockOutlineFeature implements RtOverlayFeature {
                 && (itemStack.canBreakBlockInAdventureMode(blockInWorld) || itemStack.canPlaceOnBlockInAdventureMode(blockInWorld));
     }
 
-    private void ensureResources(RtContext ctx) {
+    private void ensureResources(RtContext ctx, int width, int height) {
         this.ctxRef = ctx;
         if (pipeline == null) {
             accelSet = RtOverlayPipelines.accelStructureSet(ctx, VK10.VK_SHADER_STAGE_FRAGMENT_BIT, "block outline");
             pipeline = new RtOverlayPipelines.Spec("block_outline.vert.spv", "block_outline.frag.spv")
                     .vertex(RtOverlayPipelines.VertexFormat.POSITION)
                     .topology(VK10.VK_PRIMITIVE_TOPOLOGY_LINE_LIST)
-                    .blend(RtOverlayPipelines.Blend.ALPHA)
+                    // NONE (straight write), not ALPHA: ALPHA's blend factors (srcAlpha=ZERO, dstAlpha=ONE)
+                    // preserve the DESTINATION's alpha, which was fine composited straight onto opaque `main`
+                    // (only RGB mattered) but is wrong now that this pass writes into a transparent scratch
+                    // mask whose alpha IS the coverage signal the composite pass reads — ALPHA here would
+                    // leave every resolved pixel's alpha stuck at the clear value (0), invisible outline.
+                    .blend(RtOverlayPipelines.Blend.NONE)
                     .attachment(RtWorldOverlay.TARGET_FORMAT)
+                    .samples(RtDeviceBringup.overlayMsaaSamples())
                     .push(PUSH_BYTES, VK10.VK_SHADER_STAGE_VERTEX_BIT | VK10.VK_SHADER_STAGE_FRAGMENT_BIT)
                     .descriptorSetLayout(accelSet.layout)
                     .build(ctx, "block outline");
+            compositeSet = RtOverlayPipelines.storageImageSet(ctx, 1, VK10.VK_SHADER_STAGE_FRAGMENT_BIT, "block outline composite");
+            compositePipeline = new RtOverlayPipelines.Spec("entity_glow_composite.vert.spv", "block_outline_composite.frag.spv")
+                    .blend(RtOverlayPipelines.Blend.ALPHA)
+                    .attachment(RtWorldOverlay.TARGET_FORMAT)
+                    .descriptorSetLayout(compositeSet.layout)
+                    .build(ctx, "block outline composite");
         }
+        if (msaaImage == null || msaaImage.width != width || msaaImage.height != height) {
+            if (msaaImage != null) {
+                msaaImage.destroy();
+            }
+            msaaImage = ctx.createTransientMsaaColorImage(width, height, RtWorldOverlay.TARGET_FORMAT,
+                    RtDeviceBringup.overlayMsaaSamples(), "block outline msaa " + width + "x" + height);
+        }
+        if (resolvedMask == null || resolvedMask.width != width || resolvedMask.height != height) {
+            if (resolvedMask != null) {
+                resolvedMask.destroy();
+            }
+            resolvedMask = ctx.createStorageImage(width, height, RtWorldOverlay.TARGET_FORMAT,
+                    "block outline resolved mask " + width + "x" + height, VK10.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+        }
+        compositeSet.bind(ctx, 0, resolvedMask.view);
     }
 
     @Override
     public void record(VkCommandBuffer cmd, long targetView, int width, int height) {
-        try (MemoryStack stack = MemoryStack.stackPush();
-             RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctxRef, cmd, "block outline")) {
-            RtWorldOverlay.beginColorRendering(cmd, stack, targetView, width, height, false);
-            VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.handle);
-            VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.layout, 0,
-                    stack.longs(boundSet), null);
-            VK10.vkCmdBindVertexBuffers(cmd, 0, stack.longs(vbo.handle), stack.longs(0L));
-            float desiredWidthPx = LINE_WIDTH_PX_AT_REFERENCE * (height / REFERENCE_HEIGHT);
-            VK10.vkCmdSetLineWidth(cmd, Math.min(desiredWidthPx, RtDeviceBringup.maxLineWidth()));
-            ByteBuffer push = stack.malloc(PUSH_BYTES);
-            viewProj.get(0, push);
-            RtEntities entities = RtEntities.INSTANCE;
-            push.putFloat(64, entities.glowCamOffsetX()).putFloat(68, entities.glowCamOffsetY())
-                    .putFloat(72, entities.glowCamOffsetZ());
-            push.putFloat(80, 0f).putFloat(84, 0f).putFloat(88, 0f).putFloat(92, OUTLINE_ALPHA);
-            VK10.vkCmdPushConstants(cmd, pipeline.layout,
-                    VK10.VK_SHADER_STAGE_VERTEX_BIT | VK10.VK_SHADER_STAGE_FRAGMENT_BIT, 0, push);
-            VK10.vkCmdDraw(cmd, vertexCount, 1, 0, 0);
-            RtWorldOverlay.endRendering(cmd);
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctxRef, cmd, "block outline mask")) {
+                RtWorldOverlay.beginMsaaColorRendering(cmd, stack, msaaImage.view, resolvedMask.view, width, height);
+                VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.handle);
+                VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.layout, 0,
+                        stack.longs(boundSet), null);
+                VK10.vkCmdBindVertexBuffers(cmd, 0, stack.longs(vbo.handle), stack.longs(0L));
+                float desiredWidthPx = LINE_WIDTH_PX_AT_REFERENCE * (height / REFERENCE_HEIGHT);
+                VK10.vkCmdSetLineWidth(cmd, Math.min(desiredWidthPx, RtDeviceBringup.maxLineWidth()));
+                ByteBuffer push = stack.malloc(PUSH_BYTES);
+                viewProj.get(0, push);
+                RtEntities entities = RtEntities.INSTANCE;
+                push.putFloat(64, entities.glowCamOffsetX()).putFloat(68, entities.glowCamOffsetY())
+                        .putFloat(72, entities.glowCamOffsetZ());
+                push.putFloat(80, 0f).putFloat(84, 0f).putFloat(88, 0f).putFloat(92, OUTLINE_ALPHA);
+                VK10.vkCmdPushConstants(cmd, pipeline.layout,
+                        VK10.VK_SHADER_STAGE_VERTEX_BIT | VK10.VK_SHADER_STAGE_FRAGMENT_BIT, 0, push);
+                VK10.vkCmdDraw(cmd, vertexCount, 1, 0, 0);
+                RtWorldOverlay.endRendering(cmd);
+            }
+
+            VulkanCommandEncoder.memoryBarrier(cmd, stack); // resolved mask writes visible to the composite's reads
+
+            try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctxRef, cmd, "block outline composite")) {
+                RtWorldOverlay.beginColorRendering(cmd, stack, targetView, width, height, false);
+                VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, compositePipeline.handle);
+                VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, compositePipeline.layout, 0,
+                        stack.longs(compositeSet.set), null);
+                VK10.vkCmdDraw(cmd, 3, 1, 0, 0);
+                RtWorldOverlay.endRendering(cmd);
+            }
         }
     }
 
@@ -215,6 +269,22 @@ final class RtBlockOutlineFeature implements RtOverlayFeature {
         if (accelSet != null) {
             accelSet.destroy(ctxRef.vk());
             accelSet = null;
+        }
+        if (compositePipeline != null) {
+            compositePipeline.destroy(ctxRef.vk());
+            compositePipeline = null;
+        }
+        if (compositeSet != null) {
+            compositeSet.destroy(ctxRef.vk());
+            compositeSet = null;
+        }
+        if (msaaImage != null) {
+            msaaImage.destroy();
+            msaaImage = null;
+        }
+        if (resolvedMask != null) {
+            resolvedMask.destroy();
+            resolvedMask = null;
         }
         ctxRef = null;
     }

@@ -107,6 +107,7 @@ public final class RtOverlayPipelines {
         private int topology = VK10.VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
         private Blend blend = Blend.NONE;
         private int attachmentFormat;
+        private int samples = VK10.VK_SAMPLE_COUNT_1_BIT;
         private int pushBytes;
         private int pushStages;
         private long descriptorSetLayout;
@@ -134,6 +135,14 @@ public final class RtOverlayPipelines {
         /** The colour attachment's VkFormat — {@link RtWorldOverlay#TARGET_FORMAT} for composite passes. */
         public Spec attachment(int vkFormat) {
             this.attachmentFormat = vkFormat;
+            return this;
+        }
+
+        /** Rasterization sample count (default {@code VK_SAMPLE_COUNT_1_BIT}) — pass {@link
+         *  dev.upscaler.rt.RtDeviceBringup#overlayMsaaSamples()} for a multisampled mask pass that gets
+         *  dynamic-rendering-resolved into a single-sample target afterwards. */
+        public Spec samples(int sampleCount) {
+            this.samples = sampleCount;
             return this;
         }
 
@@ -199,7 +208,7 @@ public final class RtOverlayPipelines {
                     .frontFace(VK10.VK_FRONT_FACE_COUNTER_CLOCKWISE).lineWidth(1.0f);
 
             VkPipelineMultisampleStateCreateInfo multisample = VkPipelineMultisampleStateCreateInfo.calloc(stack)
-                    .sType$Default().rasterizationSamples(VK10.VK_SAMPLE_COUNT_1_BIT);
+                    .sType$Default().rasterizationSamples(spec.samples);
 
             VkPipelineColorBlendAttachmentState.Buffer blendAttach = VkPipelineColorBlendAttachmentState.calloc(1, stack);
             blendAttach.get(0).colorWriteMask(
