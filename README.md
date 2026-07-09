@@ -1,10 +1,10 @@
-# Candela
+# Caustica
 
-Candela is an experimental ray-traced renderer for Minecraft 26.2's Vulkan backend.
+Caustica is an experimental ray-traced renderer for Minecraft 26.2's Vulkan backend.
 It replaces the vanilla world view with hardware ray tracing and NVIDIA DLSS
 features while keeping Minecraft's familiar UI and gameplay intact.
 
-Candela is early software. Expect bugs, missing visual cases, and frequent
+Caustica is early software. Expect bugs, missing visual cases, and frequent
 changes while the renderer is being built.
 
 ## Features
@@ -29,13 +29,13 @@ changes while the renderer is being built.
 
 1. Install Fabric Loader for Minecraft `26.2`.
 2. Install Fabric API.
-3. Put the Candela jar in your Minecraft `mods` folder.
+3. Put the Caustica jar in your Minecraft `mods` folder.
 4. Launch the game with the Vulkan graphics backend.
-5. Open Video Settings to adjust Candela's renderer options.
+5. Open Video Settings to adjust Caustica's renderer options.
 
 ## Usage Notes
 
-- Candela is client-side only.
+- Caustica is client-side only.
 - DLSS Ray Reconstruction and Frame Generation require supported NVIDIA
   hardware and drivers.
 - Use Java args to improve performance. Minecraft Launcher default:
@@ -43,23 +43,23 @@ changes while the renderer is being built.
 - Frame Generation is experimental and needs to be enabled by modifying the configuration file.
 - HDR output requires an HDR swapchain and a correctly configured HDR display.
 - If Minecraft falls back to OpenGL after a crash, re-enable the Vulkan backend
-  before using Candela again.
+  before using Caustica again.
 
 ## Compatibility
 
-Candela takes over the world renderer, so other mods that heavily modify world
+Caustica takes over the world renderer, so other mods that heavily modify world
 rendering, shader pipelines, post-processing, or the Vulkan backend may conflict.
 UI-only mods are more likely to work.
 
 ## Status
 
-Candela is not a finished renderer yet. Current work focuses on visual
+Caustica is not a finished renderer yet. Current work focuses on visual
 correctness, world coverage, stability, and making the SDR/HDR presentation
 paths behave consistently.
 
 ## License
 
-Candela is licensed under the MIT License. See [LICENSE.md](LICENSE.md).
+Caustica is licensed under the MIT License. See [LICENSE.md](LICENSE.md).
 
 ## TODO List
 

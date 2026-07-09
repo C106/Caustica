@@ -1,8 +1,8 @@
 {
 	"schemaVersion": 1,
-	"id": "candela",
+	"id": "caustica",
 	"version": "${version}",
-	"name": "Candela",
+	"name": "Caustica",
 	"description": "Hardware-ray-traced renderer with DLSS Ray Reconstruction for the Minecraft Vulkan backend.",
 	"authors": [
 		"i"
@@ -11,14 +11,14 @@
 	"environment": "client",
 	"entrypoints": {
 		"main": [
-			"dev.comfyfluffy.candela.CandelaMod"
+			"dev.comfyfluffy.caustica.CausticaMod"
 		],
 		"client": [
-			"dev.comfyfluffy.candela.client.CandelaClient"
+			"dev.comfyfluffy.caustica.client.CausticaClient"
 		]
 	},
 	"mixins": [
-		"candela.mixins.json"
+		"caustica.mixins.json"
 	],
 	"depends": {
 		"fabricloader": ">=0.19.3",

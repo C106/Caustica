@@ -40,7 +40,7 @@ jobs:
     runs-on: windows-2022
 
     steps:
-      - name: Checkout Candela
+      - name: Checkout Caustica
         uses: actions/checkout@v4
 
       - name: Checkout DLSS SDK
@@ -83,7 +83,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Candela
+      - name: Checkout Caustica
         uses: actions/checkout@v4
 
       - name: Checkout DLSS SDK
@@ -126,7 +126,7 @@ jobs:
       - native-linux
 
     steps:
-      - name: Checkout Candela
+      - name: Checkout Caustica
         uses: actions/checkout@v4
 
       - name: Checkout DLSS SDK
@@ -180,7 +180,7 @@ jobs:
       - name: Upload bundled jar
         uses: actions/upload-artifact@v4
         with:
-          name: candela-bundled-jar
+          name: caustica-bundled-jar
           path: |
             build/libs/*.jar
             !build/libs/*-sources.jar

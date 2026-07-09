@@ -58,7 +58,7 @@ dependencies {
 	implementation "net.fabricmc:fabric-loader:${project.loader_version}"
 	implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
 
-	// Layered TOML config (config/candela.toml) — NightConfig, the same library NeoForge's
+	// Layered TOML config (config/caustica.toml) — NightConfig, the same library NeoForge's
 	// ModConfigSpec is built on.
 	include implementation("com.electronwill.night-config:core:3.8.3")
 	include implementation("com.electronwill.night-config:toml:3.8.3")
@@ -76,7 +76,7 @@ processResources {
 // The .spv are pure build output of the GLSL; generating them here makes stale binaries impossible
 // and gives incremental up-to-date checks. Requires the Vulkan SDK's glslangValidator (+ spirv-val);
 // located via the VULKAN_SDK env var (set by the SDK installer) with a PATH fallback.
-def shaderGenRoot = layout.buildDirectory.dir("generated/shaders") // classpath root -> /candela/rt/*.spv
+def shaderGenRoot = layout.buildDirectory.dir("generated/shaders") // classpath root -> /caustica/rt/*.spv
 
 def resolveVulkanTool = { String name ->
 	def exe = org.gradle.internal.os.OperatingSystem.current().windows ? ".exe" : ""
@@ -132,7 +132,7 @@ abstract class CompileShaders extends DefaultTask {
 			def spv = new File(outDirFile, "${src.name}.spv")
 			compileOne(src, spv, [])
 			if (src.name == "world.rgen") {
-				compileOne(src, new File(outDirFile, "world_nv.rgen.spv"), ["-DCANDELA_SER_NV=1"])
+				compileOne(src, new File(outDirFile, "world_nv.rgen.spv"), ["-DCAUSTICA_SER_NV=1"])
 			}
 		}
 	}
@@ -142,13 +142,13 @@ def compileShaders = tasks.register("compileShaders", CompileShaders) {
 	group = "build"
 	description = "Compiles shaders/** shader sources to SPIR-V and validates them."
 	srcDir = file("shaders")
-	outDir = layout.buildDirectory.dir("generated/shaders/candela/rt")
+	outDir = layout.buildDirectory.dir("generated/shaders/caustica/rt")
 	glslang = resolveVulkanTool("glslangValidator")
 	spirvVal = resolveVulkanTool("spirv-val")
 }
 
 // Emit the .spv into the main resources so they land in the jar / on the runClient classpath at the
-// same /candela/rt/ path the loader (RtPipeline/RtBlendPipeline) reads. builtBy wires the dependency.
+// same /caustica/rt/ path the loader (RtPipeline/RtBlendPipeline) reads. builtBy wires the dependency.
 sourceSets.main.resources.srcDir(files(shaderGenRoot).builtBy(compileShaders))
 
 def ngxNativeGenRoot = layout.buildDirectory.dir("generated/ngx-natives")
@@ -286,11 +286,11 @@ def bundleNgxNatives = tasks.register("bundleNgxNatives") {
 				from(fileTree(ngxShimOutDir) {
 					include platform.shimIncludes
 				}) {
-					into "candela/natives/${platform.name}"
+					into "caustica/natives/${platform.name}"
 				}
 				from(fileTree(platform.vendorRoot(dlssSdkRoot, ngxVendorConfig))) {
 					include platform.vendorIncludes
-					into "candela/natives/${platform.name}"
+					into "caustica/natives/${platform.name}"
 				}
 			}
 			into ngxNativeGenRoot

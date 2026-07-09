@@ -9,4 +9,4 @@ pluginManagement {
 	}
 }
 
-rootProject.name = "candela"
+rootProject.name = "caustica"

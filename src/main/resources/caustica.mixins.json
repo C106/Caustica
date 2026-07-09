@@ -1,0 +1,34 @@
+{
+	"required": true,
+	"minVersion": "0.8",
+	"package": "dev.comfyfluffy.caustica.mixin",
+	"compatibilityLevel": "JAVA_21",
+	"client": [
+		"BlockModelRenderStateMixin",
+		"BlockModelResolverMixin",
+		"CommandEncoderAccessor",
+		"GameRendererMixin",
+		"GpuDeviceAccessor",
+		"GuiRendererMixin",
+		"LevelRendererMixin",
+		"LevelExtractorMixin",
+		"MinecraftMixin",
+		"MinecraftReloadMixin",
+		"OptionsMixin",
+		"OptionsSubScreenAccessor",
+		"ParticleEngineAccessor",
+		"RenderSetupAccessor",
+		"RenderTypeAccessor",
+		"TextureAtlasAccessor",
+		"ParticleGroupAccessor",
+		"SpriteContentsAccessor",
+		"VideoSettingsScreenMixin",
+		"VulkanBackendMixin",
+		"VulkanGpuSurfaceMixin",
+		"VulkanInstanceMixin",
+		"VulkanGpuTextureAccessor"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	}
+}

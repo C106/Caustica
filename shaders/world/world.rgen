@@ -5,9 +5,9 @@
 #extension GL_EXT_buffer_reference_uvec2 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 // SER builds two SPIR-V variants from this source. The shader body uses the EXT spelling everywhere; the
-// CANDELA_SER_NV variant aliases that spelling to GL_NV_shader_invocation_reorder and expands the EXT fused
+// CAUSTICA_SER_NV variant aliases that spelling to GL_NV_shader_invocation_reorder and expands the EXT fused
 // trace/reorder/execute helper into the equivalent NV three-step sequence.
-#ifdef CANDELA_SER_NV
+#ifdef CAUSTICA_SER_NV
 #extension GL_NV_shader_invocation_reorder : require
 #define hitObjectEXT hitObjectNV
 #define hitObjectTraceRayEXT hitObjectTraceRayNV

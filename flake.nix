@@ -1,5 +1,5 @@
 {
-  description = "Development environment for the Minecraft DLSS/Candela mod";
+  description = "Development environment for the Minecraft DLSS/Caustica mod";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -103,7 +103,7 @@
               export DLSS_SDK="${dlssSdk}"
               export PATH="$VULKAN_SDK/bin:$PATH"
 
-              echo "candela dev shell"
+              echo "caustica dev shell"
               echo "  Java:       $JAVA_HOME"
               echo "  C compiler: $CC"
               echo "  C++ compiler: $CXX"
