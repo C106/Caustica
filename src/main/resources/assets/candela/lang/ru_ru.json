@@ -1,0 +1,60 @@
+{
+	"candela.options.rt.header": "Трассировка лучей",
+
+	"candela.options.rt.exposureMode": "Экспозиция",
+	"candela.options.rt.exposureMode.tooltip": "Как изображение с трассировкой лучей сопоставляется с яркостью дисплея. Авто адаптируется к яркости сцены; Вручную использует значение экспозиции напрямую.",
+	"candela.options.rt.exposureMode.auto": "Авто",
+	"candela.options.rt.exposureMode.manual": "Вручную",
+
+	"candela.options.rt.manualEv": "Экспозиция EV",
+	"candela.options.rt.manualEv.tooltip": "Коррекция экспозиции в стопах. В ручном режиме это фиксированная экспозиция. В автоматическом режиме она сдвигает автоэкспозицию светлее или темнее.",
+
+	"candela.options.rt.spp": "Сэмплов на пиксель",
+	"candela.options.rt.spp.tooltip": "Сэмплы path tracing на пиксель в каждом кадре. Чем выше значение, тем чище изображение, но тем выше нагрузка.",
+
+	"candela.options.rt.maxBounces": "Отскоки пути",
+	"candela.options.rt.maxBounces.tooltip": "Максимальное число вторичных отскоков path tracing после первичного попадания. Более высокие значения захватывают больше непрямого света, но обходятся дороже.",
+
+	"candela.options.rt.sunSize": "Размер солнца",
+	"candela.options.rt.sunSize.tooltip": "Угловой радиус диска солнца и луны. Более крупные диски дают более мягкие полутени.",
+
+	"candela.options.rt.entities": "Трассируемые сущности",
+	"candela.options.rt.entities.tooltip": "Включает сущности и блочные сущности в сцену с трассировкой лучей.",
+
+	"candela.options.rt.particles": "Трассируемые частицы",
+	"candela.options.rt.particles.tooltip": "Рисует частицы как билборды вдоль лучей камеры внутри трассируемой сцены.",
+
+	"candela.options.rt.glow": "Контур свечения сущностей",
+	"candela.options.rt.glow.tooltip": "Рисует ванильный контур эффекта свечения (сквозь стены) вокруг светящихся сущностей.",
+
+	"candela.options.rt.waterWaves": "Анимированная вода",
+	"candela.options.rt.waterWaves.tooltip": "Анимирует нормали поверхности воды для движущихся бликов волн.",
+
+	"candela.options.rt.hdr": "Вывод HDR",
+	"candela.options.rt.hdr.tooltip": "Отображает в HDR (ST.2084/PQ) вместо SDR, если дисплей поддерживает это. Вступает в силу после перезапуска игры.",
+
+	"candela.options.rt.hdrPaperWhite": "HDR Paper White",
+	"candela.options.rt.hdrPaperWhite.tooltip": "Абсолютная яркость (в нитах), к которой сопоставляется SDR-эквивалентная яркость сцены на HDR-дисплее.",
+
+	"candela.options.rt.hdrPeak": "Пиковая яркость HDR",
+	"candela.options.rt.hdrPeak.tooltip": "Абсолютная яркость (в нитах), к которой сходятся яркие участки. Установите пиковую HDR-яркость вашего дисплея.",
+
+	"candela.options.rt.dlssQuality": "Качество DLSS",
+	"candela.options.rt.dlssQuality.tooltip": "Режим качества DLSS Ray Reconstruction. Режимы более низкого качества рендерят меньше пикселей и агрессивнее масштабируют изображение для более высокой частоты кадров; режимы более высокого качества рендерят больше пикселей для более резкого изображения. Влияет на изображение только при включенном DLSS Ray Reconstruction.",
+	"candela.options.rt.dlssQuality.3": "Ультра-производительность",
+	"candela.options.rt.dlssQuality.0": "Производительность",
+	"candela.options.rt.dlssQuality.1": "Баланс",
+	"candela.options.rt.dlssQuality.2": "Качество",
+	"candela.options.rt.dlssQuality.5": "DLAA",
+
+	"candela.options.rt.debugView": "Отладочный вид",
+	"candela.options.rt.debugView.tooltip": "Показывает промежуточный буфер трассировки лучей вместо финального изображения.",
+	"candela.options.rt.debugView.0": "Выкл.",
+	"candela.options.rt.debugView.1": "Нормали",
+	"candela.options.rt.debugView.2": "Альбедо",
+	"candela.options.rt.debugView.3": "Глубина",
+	"candela.options.rt.debugView.4": "Шероховатость",
+	"candela.options.rt.debugView.5": "Движение",
+	"candela.options.rt.debugView.6": "Зеркальность",
+	"candela.options.rt.debugView.7": "Зеркальное движение"
+}
