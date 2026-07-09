@@ -90,8 +90,8 @@ public final class RtOverlayPipelines {
          * recipe, so the shared buffer ends up PREMULTIPLIED (`rgb = trueColour * accumulatedAlpha`) after
          * more than one layer, even though every individual draw's OWN fragment output was straight. Anyone
          * reading the shared buffer back as a SOURCE (not drawing straight colour onto it) must treat it as
-         * premultiplied — see {@link #PREMULTIPLIED_ALPHA} and {@code hdr_world_overlay_composite.comp}'s
-         * un-premultiply step.
+         * premultiplied — see {@link #PREMULTIPLIED_ALPHA} and {@code hdr_ui_composite.comp}'s
+         * un-premultiply step on the final combined UI image.
          */
         ALPHA,
         /**

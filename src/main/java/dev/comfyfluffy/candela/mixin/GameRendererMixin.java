@@ -10,6 +10,7 @@ import dev.comfyfluffy.candela.client.WorldRenderScaler;
 import dev.comfyfluffy.candela.rt.RtComposite;
 import dev.comfyfluffy.candela.rt.RtReflex;
 import dev.comfyfluffy.candela.rt.RtUiOverlay;
+import dev.comfyfluffy.candela.rt.overlay.RtWorldOverlay;
 import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.renderer.GameRenderer;
 import net.minecraft.client.renderer.SubmitNodeStorage;
@@ -159,6 +160,9 @@ public abstract class GameRendererMixin {
 					shift = At.Shift.AFTER))
 	private void candela$endWorldScaleBeforeHand(DeltaTracker deltaTracker, CallbackInfo ci) {
 		WorldRenderScaler.INSTANCE.end(this.mainRenderTarget);
+		// Fold RT world overlays into the shared transparent UI image before hand/screen effects and the GUI
+		// add their own layers. RtUiOverlay then performs the single final blend to SDR/HDR.
+		RtWorldOverlay.INSTANCE.compositeIntoUiOverlay(this.mainRenderTarget);
 	}
 
 	// Composite the redirected UI overlay back over the world once the GUI has fully rendered into it.
@@ -169,12 +173,8 @@ public abstract class GameRendererMixin {
 					target = "Lnet/minecraft/client/gui/render/GuiRenderer;render()V",
 					shift = At.Shift.AFTER))
 	private void candela$compositeUiOverlay(DeltaTracker deltaTracker, boolean advanceGameTime, CallbackInfo ci) {
-		// World-space overlays (entity glow outline, future block outline/nametags) composite onto
-		// mainRenderTarget first, before the DLSS-FG hudless snapshot and the GUI composite (both below)
-		// so they see the overlays already baked in.
-		dev.comfyfluffy.candela.rt.overlay.RtWorldOverlay.INSTANCE.composite(this.mainRenderTarget);
-		// DLSS-FG quality: snapshot the world+hand+screen-effects (no 2D GUI yet — it rendered into the
-		// overlay target instead) BEFORE the overlay composites the GUI back onto mainRenderTarget below.
+		// DLSS-FG quality: snapshot the world+hand+screen-effects before the combined UI overlay composites
+		// back onto mainRenderTarget below. The optional DLSSG UI resource carries that combined overlay.
 		RtComposite.INSTANCE.captureFgHudless(this.mainRenderTarget);
 		dev.comfyfluffy.candela.rt.RtUiOverlay.compositeIfUsed();
 	}

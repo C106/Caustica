@@ -188,23 +188,23 @@ public final class RtComposite {
     private RtImage output;
     private RtImage displayImage;
     // Parallel PQ-encoded ([0,1], ST.2084) HDR display image. Written alongside displayImage when HDR is
-    // enabled. When the PQ swapchain is active, this is blitted straight to the swapchain (world-only;
-    // bypasses the SDR main target + its UI). UI compositing over it is a later sub-step.
+    // enabled. When the PQ swapchain is active, the combined UI overlay is composited over this image, then
+    // this image is blitted straight to the swapchain.
     private RtImage hdrDisplayImage;
     // Set true after this frame's display dispatch wrote hdrDisplayImage (HDR enabled + RT ran); gates the
     // HDR present blit so a frame where RT did not run falls back to the vanilla SDR present.
     private boolean hdrWrittenThisFrame;
-    // DLSS-FG "hudless" resource: a copy of the main render target (world+hand+screen-effects, no 2D GUI)
-    // taken in captureFgHudless right before the UI overlay composites the GUI back on top. Lazily allocated
-    // (only meaningful once FG + the UI overlay redirect are both active), resized on demand.
+    // DLSS-FG "hudless" resource: a copy of the main render target before the combined UI overlay
+    // composites back on top. Lazily allocated (only meaningful once FG + the UI overlay redirect are both
+    // active), resized on demand.
     private RtImage fgHudlessImage;
     // Same idea as fgHudlessImage but for the HDR present path: a copy of hdrDisplayImage taken in
-    // presentHdr right before its own UI-overlay composite dispatch overwrites it in place (see
+    // presentHdr right before its own combined-UI composite dispatch overwrites it in place (see
     // captureFgHdrHudless). Already PQ-encoded (same as hdrDisplayImage), so this is a plain image copy, not
     // a format conversion — DLSS-FG requires a display-ready EOTF-encoded [0,1] signal (its programming
     // guide explicitly disallows scRGB), and PQ is exactly that.
     private RtImage fgHdrHudlessImage;
-        // Step C.2: composites the captured UI overlay over hdrDisplayImage at paper white, just before present.
+    // Step C.2: composites the combined UI overlay over hdrDisplayImage at paper white, just before present.
     private RtHdrCompositePipeline hdrCompositePipeline;
     private long hdrUiSampler;
     // Menu/non-RT present: converts the SDR main target (sRGB) to PQ-encoded at paper white so menus,
@@ -1185,7 +1185,7 @@ public final class RtComposite {
         return region;
     }
 
-    /** Whether the world-only HDR present (HDR image -> PQ swapchain) should replace the vanilla SDR blit. */
+    /** Whether the HDR present path (HDR image + combined UI -> PQ swapchain) should replace the vanilla SDR blit. */
     public boolean isHdrPresentActive() {
         return CandelaConfig.Rt.Hdr.enabled()
                 && hdrWrittenThisFrame
@@ -1211,9 +1211,9 @@ public final class RtComposite {
      * Blit this frame's PQ-encoded HDR image straight into the swapchain image, replacing Minecraft's SDR
      * blit. Replicates {@code VulkanGpuSurface.blitFromTexture}'s barrier + acquire-wait/present-signal
      * sequence with the HDR {@link RtImage} as the (GENERAL-layout) source; an added memory barrier makes the
-     * display-compute writes visible to the blit read. World-only — the SDR main target (and its UI) is
-     * bypassed (UI compositing over the HDR image is a later sub-step). The magic stage/access values mirror
-     * vanilla {@code blitFromTexture} exactly. Y is flipped to match the vanilla swapchain blit.
+     * display-compute writes visible to the blit read. The SDR main target is bypassed; the combined UI image
+     * is blended over the HDR image here at paper white before the swapchain blit. The magic stage/access
+     * values mirror vanilla {@code blitFromTexture} exactly. Y is flipped to match the vanilla swapchain blit.
      */
     public void presentHdr(VulkanCommandEncoder enc, long swapchainImage, int swapW, int swapH, long acquireSem, long presentSem) {
         RtImage src = hdrDisplayImage;
@@ -1222,19 +1222,19 @@ public final class RtComposite {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkCommandBuffer cmd = enc.allocateAndBeginTransientCommandBuffer();
 
-            // DLSS-FG "hudless" capture: hdrDisplayImage right now holds exactly what composite() wrote this
-            // frame — world+hand+screen-effects, no UI — since the UI-overlay composite below hasn't run yet.
-            // Snapshot it before that composite overwrites it in place, mirroring captureFgHudless's SDR
-            // pattern (pre-UI copy) but reusing this frame's already-open command buffer.
+            // DLSS-FG "hudless" capture: hdrDisplayImage right now holds the RT world before the combined
+            // UI overlay is blended in. Snapshot it before that composite overwrites it in place, mirroring
+            // captureFgHudless's SDR pattern (pre-UI copy) but reusing this frame's already-open command
+            // buffer.
             if (RtDlssFg.enabled()) {
                 captureFgHdrHudless(cmd, stack, src);
             }
 
-            // Step C.2: composite the captured UI overlay over the HDR world image (in place) at paper white,
+            // Step C.2: composite the combined UI overlay over the HDR world image (in place) at paper white,
             // before the swapchain blit. The overlay is an MC render target kept in GENERAL layout, sampled by
-            // the compute pass. A memory barrier first makes the GUI overlay writes + the world HDR writes
-            // visible to the compute; the dep1 barrier below (ALL writes -> transfer read) then covers the
-            // compute's HDR write for the blit.
+            // the compute pass. A memory barrier first makes the overlay writes + the world HDR writes visible
+            // to the compute; the dep1 barrier below (ALL writes -> transfer read) then covers the compute's
+            // HDR write for the blit.
             long overlayView = RtUiOverlay.populatedThisFrame() ? RtUiOverlay.overlayColorView() : 0L;
             if (overlayView != 0L) {
                 ensureHdrUiResources();
@@ -1435,11 +1435,10 @@ public final class RtComposite {
      * {@link #fgHudlessImage} for {@link #fgInterpolate} to feed DLSSG as the "hudless" resource. Call from
      * {@code GameRendererMixin} right after {@code GuiRenderer.render()} but BEFORE
      * {@link RtUiOverlay#compositeIfUsed()} — at that point, when the UI overlay redirect is active, {@code
-     * main} holds world+hand+screen-effects with no 2D GUI baked in yet (the GUI went to the overlay target
-     * instead), which is exactly DLSSG's "hudless" definition. No-op (and {@link #fgInterpolate} passes 0/0/0
-     * for hudless, same as always) unless both FG and the UI overlay redirect are active — capturing this
-     * without the redirect would just copy the ALREADY-composited backbuffer, which is useless as a distinct
-     * hudless input.
+     * main} still has no combined UI baked in (world overlays + GUI went to the overlay target instead).
+     * No-op (and {@link #fgInterpolate} passes 0/0/0 for hudless, same as always) unless both FG and the UI
+     * overlay redirect are active — capturing this without the redirect would just copy the ALREADY-composited
+     * backbuffer, which is useless as a distinct hudless input.
      */
     public void captureFgHudless(RenderTarget main) {
         if (!RtDlssFg.enabled() || !RtUiOverlay.enabled() || main == null || main.getColorTexture() == null) {
@@ -1465,8 +1464,8 @@ public final class RtComposite {
         var encoder = (VulkanCommandEncoder) ((CommandEncoderAccessor) RenderSystem.getDevice().createCommandEncoder()).candela$getBackend();
         VkCommandBuffer cmd = encoder.allocateAndBeginTransientCommandBuffer();
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            // Make the world/hand/screen-effects writes into `main` visible to the copy (the GUI hasn't
-            // touched `main` yet this frame — it went to the UI overlay target instead).
+            // Make writes into `main` visible to the copy (the combined UI has not touched `main` yet this
+            // frame — it went to the UI overlay target instead).
             VulkanCommandEncoder.memoryBarrier(cmd, stack);
             VK10.vkCmdCopyImage(cmd, srcImage, VK10.VK_IMAGE_LAYOUT_GENERAL,
                     fgHudlessImage.image, VK10.VK_IMAGE_LAYOUT_GENERAL, copyRegion(stack, main.width, main.height));
@@ -1480,11 +1479,12 @@ public final class RtComposite {
 
     /**
      * HDR counterpart of {@link #captureFgHudless} — copies {@code src} (this frame's {@code hdrDisplayImage},
-     * world+hand+screen-effects only, no UI yet) into {@link #fgHdrHudlessImage} for {@link #fgInterpolate}'s
-     * HDR path to feed DLSSG as the "hudless" resource. A plain copy, not a format conversion: both images are
+     * before the combined UI overlay is blended in) into {@link #fgHdrHudlessImage} for {@link
+     * #fgInterpolate}'s HDR path to feed DLSSG as the "hudless" resource. A plain copy, not a format
+     * conversion: both images are
      * already PQ-encoded (the display-ready EOTF-encoded [0,1] signal DLSS-FG's programming guide requires),
      * so no encode step is needed. Called from {@link #presentHdr} using its already-open {@code cmd}/
-     * {@code stack}, right before that method's own UI-overlay composite dispatch overwrites
+     * {@code stack}, right before that method's own combined-UI composite dispatch overwrites
      * {@code hdrDisplayImage} in place — same "capture before the UI gets baked back in" timing as the SDR
      * version, just within a single method instead of split across a mixin hook.
      */
@@ -1535,8 +1535,8 @@ public final class RtComposite {
      * #presentHdr} <em>before</em> its own UI composite ran, mirroring {@link #captureFgHudless}'s pre-UI
      * timing); and DLSSG's own (also PQ-encoded) output is returned as-is, since the swapchain itself is
      * PQ-native and can blit it directly. The UI resource itself needs no HDR-specific handling — it's the
-     * same {@link RtUiOverlay} texture used by both present paths (only the *compositing* math that consumes
-     * it differs, done separately by {@code presentHdr}/{@code RtUiOverlay}, not here).
+     * same combined {@link RtUiOverlay} texture used by both present paths (only the *compositing* math that
+     * consumes it differs, done separately by {@code presentHdr}/{@code RtUiOverlay}, not here).
      */
     public RtImage fgInterpolate(VulkanCommandEncoder enc, long backbufferView, long backbufferImage,
             int swapW, int swapH, int index, int count, boolean hdrBackbuffer) {

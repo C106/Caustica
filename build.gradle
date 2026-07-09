@@ -102,6 +102,7 @@ abstract class CompileShaders extends DefaultTask {
 	void compile() {
 		def outDirFile = outDir.get().asFile
 		outDirFile.mkdirs()
+		outDirFile.listFiles().findAll { it.isFile() && it.name.endsWith(".spv") }.each { it.delete() }
 		def stages = ~/.*\.(rgen|rchit|rahit|rmiss|rcall|comp|vert|frag)$/
 		def compileOne = { File src, File spv, List<String> defines ->
 			execOps.exec {

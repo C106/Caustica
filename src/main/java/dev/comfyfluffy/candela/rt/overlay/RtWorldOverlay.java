@@ -22,35 +22,31 @@ import org.lwjgl.vulkan.VkViewport;
 import java.util.ArrayList;
 import java.util.List;
 
-import dev.comfyfluffy.candela.CandelaConfig;
 import dev.comfyfluffy.candela.rt.RtComposite;
 import dev.comfyfluffy.candela.rt.RtContext;
 import dev.comfyfluffy.candela.rt.RtDebugLabels;
+import dev.comfyfluffy.candela.rt.RtUiOverlay;
 import dev.comfyfluffy.candela.rt.accel.RtImage;
 
 /**
- * The world-space overlay seam: full-res raster content composited over the RT world AFTER upscaling
- * (nothing thin/crisp survives DLSS-RR, so overlays must not be traced/rastered at render res) but BEFORE
- * DLSS-FG's hudless capture and the GUI composite — world-locked content has to be interpolated with the
- * world, unlike the GUI. Called once per frame from {@code GameRendererMixin} right after
- * {@code GuiRenderer.render()}.
+ * The world-space overlay seam: full-res raster content prepared after the RT world has been upscaled
+ * (nothing thin/crisp survives DLSS-RR, so overlays must not be traced/rastered at render res) and folded
+ * into the shared transparent UI image before the hand/screen-effects/GUI layers draw over it. Called once
+ * per frame from {@code GameRendererMixin} at the before-hand seam.
  *
  * <p>This class owns the questions every overlay feature would otherwise re-answer: which image to
- * composite onto (a shared mod-owned overlay buffer — every feature draws into THAT, not the presented
- * image directly, see {@link #overlayImage} below), the transient command buffer + inter-feature barriers,
+ * composite onto (a shared mod-owned overlay buffer — every feature draws into THAT, not the final UI
+ * overlay directly, see {@link #overlayImage} below), the transient command buffer + inter-feature barriers,
  * per-frame vertex scratch ({@link RtOverlayFramePool}), and the failure latch. Features implement
  * {@link RtOverlayFeature}; pipelines come from {@link RtOverlayPipelines}.
  *
  * <p>Routing every feature through one shared buffer instead of blending straight onto vanilla's SDR
- * {@code main} is what makes HDR support possible: {@code RtUiOverlay} already solves the identical "content
- * authored once, composited differently per present mode" problem for the GUI (a straight blend onto
- * {@code main} in SDR vs. a dedicated paper-white-aware compute pass, {@code hdr_ui_composite.comp}, onto
- * the HDR display image) — {@link #record} does the same thing here: SDR blends {@link #overlayImage} onto
- * {@code main} via a graphics pipeline, HDR instead dispatches {@link RtWorldOverlayHdrComposite} onto
- * {@code RtComposite}'s HDR display image, gated on {@code RtComposite.INSTANCE.isHdrPresentActive()}.
- * (Block outline's own private MSAA-mask-resolve path predates this buffer and still runs before its result
- * ever reaches {@code overlayImage} — an FXAA pass over the shared buffer was tried and removed as looking
- * worse than expected; MSAA remains the only edge-AA mechanism today.)
+ * {@code main} is what keeps SDR/HDR presentation unified: {@link #record} now folds that buffer into
+ * {@link RtUiOverlay}'s transparent overlay before the vanilla GUI renders, so the GUI remains topmost and
+ * the final present path only has one UI image to blend. (Block outline's own private MSAA-mask-resolve path
+ * predates this buffer and still runs before its result ever reaches {@code overlayImage} — an FXAA pass over
+ * the shared buffer was tried and removed as looking worse than expected; MSAA remains the only edge-AA
+ * mechanism today.)
  */
 public final class RtWorldOverlay {
     public static final RtWorldOverlay INSTANCE = new RtWorldOverlay();
@@ -64,34 +60,32 @@ public final class RtWorldOverlay {
     private boolean failed;
 
     // Shared world-overlay buffer every feature composites into (lazily sized to main's width/height, same
-    // lazy-resize convention as e.g. RtGlowOutlineFeature's own private mask image). sdrComposite* blends it
-    // straight onto vanilla's main target (SDR path); hdrComposite dispatches instead when HDR is active.
+    // lazy-resize convention as e.g. RtGlowOutlineFeature's own private mask image). uiComposite* blends it
+    // into RtUiOverlay's transparent target; RtUiOverlay owns the one final SDR/HDR blend to the real target.
     private RtContext ctxRef;
     private RtImage overlayImage;
-    private RtOverlayPipelines.Pipeline sdrCompositePipeline;
-    private RtOverlayPipelines.StorageImageSet sdrCompositeSet;
-    private RtWorldOverlayHdrComposite hdrComposite;
+    private RtOverlayPipelines.Pipeline uiCompositePipeline;
+    private RtOverlayPipelines.StorageImageSet uiCompositeSet;
 
     private RtWorldOverlay() {
     }
 
-    /** Render + composite every active overlay feature onto {@code main}. Never throws (session latch). */
-    public void composite(RenderTarget main) {
+    /**
+     * Render every active world-overlay feature and fold it into {@link RtUiOverlay}'s shared transparent
+     * target. Called after the RT world composite and before the vanilla hand/screen-effects/GUI path can draw
+     * more UI layers into that same target.
+     */
+    public void compositeIntoUiOverlay(RenderTarget main) {
         long frame = RtComposite.frameCounter();
         framePool.beginFrame(frame);
-        if (failed || main == null || main.getColorTexture() == null) {
-            return;
-        }
-        RtContext ctx = RtContext.currentOrNull();
-        if (ctx == null) {
-            return;
-        }
-        long targetView = vkImageView(main.getColorTextureView());
-        if (targetView == 0L) {
-            CandelaMod.LOGGER.warn("World overlay: main render target has no Vulkan image view; skipping");
-            return;
-        }
         try {
+            if (failed || main == null || main.getColorTexture() == null || !RtUiOverlay.enabled()) {
+                return;
+            }
+            RtContext ctx = RtContext.currentOrNull();
+            if (ctx == null) {
+                return;
+            }
             List<RtOverlayFeature> ready = new ArrayList<>(features.size());
             for (RtOverlayFeature f : features) {
                 if (f.prepare(ctx, framePool, main.width, main.height)) {
@@ -100,6 +94,12 @@ public final class RtWorldOverlay {
             }
             if (!ready.isEmpty()) {
                 ensureOverlayBuffer(ctx, main.width, main.height);
+                RenderTarget uiTarget = RtUiOverlay.beginCompositeLayer(main);
+                long targetView = vkImageView(uiTarget.getColorTextureView());
+                if (targetView == 0L) {
+                    CandelaMod.LOGGER.warn("World overlay: UI overlay target has no Vulkan image view; skipping");
+                    return;
+                }
                 record(ctx, ready, targetView, main.width, main.height);
             }
         } catch (Throwable t) {
@@ -112,16 +112,16 @@ public final class RtWorldOverlay {
 
     private void ensureOverlayBuffer(RtContext ctx, int width, int height) {
         this.ctxRef = ctx;
-        if (sdrCompositePipeline == null) {
-            sdrCompositeSet = RtOverlayPipelines.storageImageSet(ctx, 1, VK10.VK_SHADER_STAGE_FRAGMENT_BIT, "world overlay composite");
+        if (uiCompositePipeline == null) {
+            uiCompositeSet = RtOverlayPipelines.storageImageSet(ctx, 1, VK10.VK_SHADER_STAGE_FRAGMENT_BIT, "world overlay UI composite");
             // PREMULTIPLIED_ALPHA, not ALPHA: overlayImage ends up holding premultiplied content once more
-            // than one feature has drawn into it (see Blend.ALPHA's doc) — blending it onto main with the
-            // straight-alpha recipe would double-multiply by alpha (dim/incorrect semi-transparent colour).
-            sdrCompositePipeline = new RtOverlayPipelines.Spec("overlay_fullscreen_triangle.vert.spv", "overlay_passthrough_composite.frag.spv")
+            // than one feature has drawn into it (see Blend.ALPHA's doc) — blending it into the shared UI
+            // image with the straight-alpha recipe would double-multiply by alpha.
+            uiCompositePipeline = new RtOverlayPipelines.Spec("overlay_fullscreen_triangle.vert.spv", "overlay_passthrough_composite.frag.spv")
                     .blend(RtOverlayPipelines.Blend.PREMULTIPLIED_ALPHA)
                     .attachment(TARGET_FORMAT)
-                    .descriptorSetLayout(sdrCompositeSet.layout)
-                    .build(ctx, "world overlay composite");
+                    .descriptorSetLayout(uiCompositeSet.layout)
+                    .build(ctx, "world overlay UI composite");
         }
         if (overlayImage == null || overlayImage.width != width || overlayImage.height != height) {
             if (overlayImage != null) {
@@ -130,13 +130,7 @@ public final class RtWorldOverlay {
             overlayImage = ctx.createStorageImage(width, height, TARGET_FORMAT,
                     "world overlay " + width + "x" + height, VK10.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
         }
-        sdrCompositeSet.bind(ctx, 0, overlayImage.view);
-    }
-
-    private void ensureHdrComposite(RtContext ctx) {
-        if (hdrComposite == null) {
-            hdrComposite = RtWorldOverlayHdrComposite.create(ctx);
-        }
+        uiCompositeSet.bind(ctx, 0, overlayImage.view);
     }
 
     private void record(RtContext ctx, List<RtOverlayFeature> ready, long targetView, int width, int height) {
@@ -155,22 +149,13 @@ public final class RtWorldOverlay {
                 VulkanCommandEncoder.memoryBarrier(cmd, stack); // this feature's writes visible to the next / final composite
             }
 
-            if (RtComposite.INSTANCE.isHdrPresentActive()) {
-                long hdrView = RtComposite.INSTANCE.hdrBackbufferView();
-                if (hdrView != 0L) {
-                    ensureHdrComposite(ctx);
-                    hdrComposite.setImages(hdrView, overlayView);
-                    hdrComposite.dispatch(cmd, width, height, CandelaConfig.Rt.Hdr.paperWhiteNits());
-                }
-            } else {
-                try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "world overlay composite")) {
-                    beginColorRendering(cmd, stack, targetView, width, height, false); // LOAD the presented image
-                    VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, sdrCompositePipeline.handle);
-                    VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, sdrCompositePipeline.layout, 0,
-                            stack.longs(sdrCompositeSet.set), null);
-                    VK10.vkCmdDraw(cmd, 3, 1, 0, 0);
-                    endRendering(cmd);
-                }
+            try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "world overlay UI composite")) {
+                beginColorRendering(cmd, stack, targetView, width, height, false); // LOAD the transparent UI image
+                VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, uiCompositePipeline.handle);
+                VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, uiCompositePipeline.layout, 0,
+                        stack.longs(uiCompositeSet.set), null);
+                VK10.vkCmdDraw(cmd, 3, 1, 0, 0);
+                endRendering(cmd);
             }
             VulkanCommandEncoder.memoryBarrier(cmd, stack); // this composite's writes visible to whatever presents next
         }
@@ -185,16 +170,12 @@ public final class RtWorldOverlay {
         for (RtOverlayFeature f : features) {
             f.destroy();
         }
-        if (sdrCompositePipeline != null && ctxRef != null) {
-            sdrCompositePipeline.destroy(ctxRef.vk());
-            sdrCompositeSet.destroy(ctxRef.vk());
+        if (uiCompositePipeline != null && ctxRef != null) {
+            uiCompositePipeline.destroy(ctxRef.vk());
+            uiCompositeSet.destroy(ctxRef.vk());
         }
-        sdrCompositePipeline = null;
-        sdrCompositeSet = null;
-        if (hdrComposite != null) {
-            hdrComposite.destroy();
-            hdrComposite = null;
-        }
+        uiCompositePipeline = null;
+        uiCompositeSet = null;
         if (overlayImage != null) {
             overlayImage.destroy();
             overlayImage = null;

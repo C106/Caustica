@@ -21,12 +21,12 @@ import net.minecraft.client.renderer.BindGroupLayouts;
 import net.minecraft.client.renderer.RenderPipelines;
 
 /**
- * HDR Phase 2 (step A) — transparent vanilla-UI overlay. The vanilla GUI/HUD is redirected (via
- * {@code GuiRendererMixin}) into a separate transparent {@code RGBA8} target instead of the main render
- * target, then composited back over the world (from {@code GameRendererMixin}, right after
- * {@code GuiRenderer.render} returns). In SDR this reproduces vanilla; the point is to keep 2D SDR-authored
- * UI out of the world's HDR tonemap once HDR presentation lands (the compositor will then blend this same
- * overlay over the HDR world at paper white rather than over the SDR main target).
+ * HDR Phase 2 (step A) — transparent final-UI overlay. World-space overlay features and the vanilla GUI/HUD
+ * are routed into one transparent {@code RGBA8} target, then that single image is composited back over the
+ * world (from {@code GameRendererMixin}, right after {@code GuiRenderer.render} returns). In SDR this
+ * reproduces vanilla; the point is to keep SDR-authored UI out of the world's HDR tonemap once HDR
+ * presentation lands (the compositor will then blend this same overlay over the HDR world at paper white
+ * rather than over the SDR main target).
  *
  * <p>Composite blend: vanilla GUI pipelines use {@code BlendFunction.TRANSLUCENT} (colour {@code SRC_ALPHA,
  * ONE_MINUS_SRC_ALPHA}; alpha {@code ONE, ONE_MINUS_SRC_ALPHA}), so drawing onto a cleared target
@@ -57,8 +57,9 @@ public final class RtUiOverlay {
     private static TextureTarget overlay;
     private static boolean usedThisFrame;
     private static boolean compositeFailed;
-    // The overlay is cleared once per frame, before the first thing that renders into it (the hand in HDR
-    // mode, otherwise the GUI). Reset at the start of GameRenderer.render via beginFrame().
+    // The overlay is cleared once per frame, before the first thing that renders into it (RT world overlays,
+    // the hand/screen-effects redirects in HDR mode, or the GUI). Reset at the start of GameRenderer.render
+    // via beginFrame().
     private static boolean overlayClearedThisFrame;
 
     private RtUiOverlay() {
@@ -123,6 +124,14 @@ public final class RtUiOverlay {
      * {@code GuiRendererMixin} redirect on the render thread.
      */
     public static RenderTarget beginAndRedirect(RenderTarget main) {
+        return prepare(main);
+    }
+
+    /**
+     * Prepare the shared transparent overlay for non-GUI contributors such as RT world overlays. Call before
+     * the GUI redirect so the GUI draws over those contributors in the same image.
+     */
+    public static RenderTarget beginCompositeLayer(RenderTarget main) {
         return prepare(main);
     }
 
