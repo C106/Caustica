@@ -111,7 +111,7 @@ struct Payload {
     uint rayCone;     // packHalf2x16(vec2(width, spread))
 };
 layout(location = 0) rayPayloadEXT Payload payload;
-layout(location = 1) rayPayloadEXT vec4 shadowVis; // rgb = transmittance; a is unused by hit-object visibility
+layout(location = 1) rayPayloadEXT vec4 shadowVis; // rgb = transmittance; a = nearest water-crossing t (-1 = none)
 
 const uint MATERIAL_OPAQUE = 0u;
 const uint MATERIAL_WATER = 1u;
@@ -177,26 +177,48 @@ vec3 waterExtinction(vec3 tint) {
     return WATER_ABSORB_FLOOR + WATER_DENSITY * (vec3(1.0) - clamp(tint, 0.0, 1.0));
 }
 
-// Animated surface waves. A sum of directional sine waves; only its analytic gradient (surface slope)
-// is needed to perturb the normal — cheap, exact, and denoiser-friendly under DLSS-RR. The components fan
-// out by the golden angle with non-harmonic frequencies, so they share no common period and the surface
-// does not visibly tile. The domain is world-anchored (see applyWaterWaves) so the ripple pattern is
-// pinned in world space and does not swim/jump as the player (and the terrain rebase origin) moves.
-const float WATER_WAVE_STRENGTH = 0.3; // slope scale (higher = choppier glints / more broken reflections)
+// Animated surface waves — a directional wave spectrum, gradient-only (the surface stays geometrically
+// flat; only the normal tilts). Three things make it read as water rather than animated glass:
+//  * Sharp-crested profile: each component is h = a·exp(S·(sin φ − 1)) — peaked crests, wide flat
+//    troughs (pure sines look like rolling jelly). Still C∞ smooth with an exact analytic gradient.
+//  * Real deep-water dispersion ω = √(g·k): long swell strides past (λ=14 m → ~4.7 m/s) while short
+//    chop flutters nearly in place — wrong relative speeds are the biggest tell of fake water.
+//  * Wind + meander: headings spread around a fixed wind direction (tight for the swell, wide for the
+//    chop), and the largest components' phase is modulated along their crest (chain-ruled into the
+//    gradient) so wavefronts wander instead of ruling straight periodic lines across the sea.
+// The domain is world-anchored (see applyWaterWaves) so the pattern is pinned in world space, and the
+// caustics (waterCaustic) differentiate this same field, so they stay in sync with the visible ripples.
+const float WATER_WAVE_STRENGTH = 0.3;  // slope scale (higher = choppier glints / more broken reflections)
+const float WAVE_SPEED = 0.8;           // global time scale; dispersion keeps relative speeds physical
+const int   WAVE_COUNT = 10;            // λ = 14 m … 0.38 m (each octave 1.5× shorter)
+const float WAVE_G = 9.81;
+const vec2  WAVE_WIND = normalize(vec2(1.0, 0.35)); // dominant travel direction
+const float WAVE_MEANDER = 1.1;         // crest phase-wobble amplitude (rad) on the long components
 vec2 waterWaveGrad(vec2 p, float t) {
+    // Per-wave steepness a·k: gentle in the long swell, concentrated in the mid/short chop.
+    const float Q[WAVE_COUNT] = float[](0.030, 0.035, 0.042, 0.050, 0.060, 0.065, 0.065, 0.058, 0.048, 0.038);
+    t *= WAVE_SPEED;
     vec2 g = vec2(0.0);
-    float f = 0.55;  // base spatial frequency
-    float a = 0.075; // base amplitude (per-wave slope ≈ a*f)
-    float ang = 0.0;
-    const float GOLDEN = 2.39996323; // ~137.5°: an irrational turn → wave directions never realign
-    for (int i = 0; i < 7; i++) {
-        vec2 d = vec2(cos(ang), sin(ang));
-        float s = 1.0 + 0.37 * float(i); // each component drifts at its own speed (kills standing patterns)
-        // height term a*sin(dot(p,d)*f + t*s); slope = d/dp = a*f*cos(...)*d.
-        g += a * f * cos(dot(p, d) * f + t * s) * d;
-        ang += GOLDEN;
-        f *= 1.37; // non-integer frequency growth → incommensurate periods
-        a *= 0.82; // gently decaying amplitude
+    float lambda = 14.0;
+    for (int i = 0; i < WAVE_COUNT; i++) {
+        float k = 2.0 * PI / lambda;
+        float w = sqrt(WAVE_G * k);   // deep-water dispersion: phase speed √(g/k)
+        // Heading: deterministic irregular spread about the wind, widening down the spectrum.
+        float spread = (0.15 + 0.11 * float(i)) * sin(float(i) * 2.4 + 1.3);
+        float cs = cos(spread), sn = sin(spread);
+        vec2 d = vec2(WAVE_WIND.x * cs - WAVE_WIND.y * sn, WAVE_WIND.x * sn + WAVE_WIND.y * cs);
+        float ph = k * dot(d, p) - w * t + 1.7 * float(i) * float(i);
+        vec2 dph = k * d;
+        if (i < 4) { // meander only the components whose fronts are long enough to read as lines
+            vec2 pd = vec2(-d.y, d.x);
+            float wph = 0.4 * k * dot(pd, p) + 0.5 * w * t;
+            ph += WAVE_MEANDER * sin(wph);
+            dph += (WAVE_MEANDER * cos(wph) * 0.4 * k) * pd;
+        }
+        float S = 1.2 + 0.12 * float(i); // crest sharpness: the short chop is choppier
+        float e = exp(S * (sin(ph) - 1.0));
+        g += (Q[i] / k) * (S * cos(ph) * e) * dph; // a = Q/k; ∇h = a·S·cos φ·e^{S(sin φ−1)}·∇φ
+        lambda /= 1.5;
     }
     return g * WATER_WAVE_STRENGTH;
 }
@@ -210,6 +232,46 @@ vec3 applyWaterWaves(vec3 nGeo, vec2 worldXZ, float t) {
     vec2 grad = waterWaveGrad(worldXZ, t);
     vec3 up = normalize(vec3(-grad.x, 1.0, -grad.y));
     return nGeo.y >= 0.0 ? up : -up;
+}
+
+// ---- Water caustics. Sunlight refracting through the waved surface converges/diverges before it
+// reaches an underwater receiver; the analytic wave field makes the true focusing factor computable
+// instead of faked with a scrolling texture. Where the shadow ray of an underwater NEE vertex crossed
+// water (recorded by world.rahit in shadowVis.a), evaluate the horizontal landing position of the
+// refracted sun ray as a function of surface position and finite-difference it: the caustic intensity is
+// the inverse Jacobian determinant of that surface→floor mapping (area compression = brightening, real
+// fold caustics where det → 0). Because this uses the SAME wave field as the visible surface normals,
+// the caustic pattern stays in sync with the ripples, and the per-sample sun-quad jitter (sampleSquare)
+// shifts the pattern per sample → caustics physically blur with depth under DLSS-RR accumulation.
+const float CAUSTIC_EPS = 0.25; // finite-difference step (m); also low-passes sub-step wave detail
+const float CAUSTIC_MAX = 6.0;  // focusing clamp: keeps fold-line singularities from becoming fireflies
+
+// Horizontal landing offset of a refracted sun ray entering the surface at world-stable xz, intersected
+// with the receiver plane h metres below. inc = sunlight travel direction (downward, unit).
+vec2 causticLanding(vec2 xz, float t, vec3 inc, float h) {
+    vec2 g = waterWaveGrad(xz, t);
+    vec3 nw = normalize(vec3(-g.x, 1.0, -g.y));
+    vec3 rdw = refract(inc, nw, 1.0 / WATER_IOR); // air→water: never TIR
+    return xz + rdw.xz * (h / max(-rdw.y, 0.05));
+}
+
+float waterCaustic(vec3 exitPos, vec3 lightDir, float waterDist) {
+    // Grazing light: the receiver-plane intersection degenerates and caustics vanish in reality anyway
+    // (long slant paths absorb + the pattern smears out) — fade the effect to neutral 1.0.
+    float fade = smoothstep(0.06, 0.18, lightDir.y);
+    if (fade <= 0.0) return 1.0;
+    float h = max(waterDist * lightDir.y, 0.05); // vertical depth of the receiver below the exit point
+    float t = pc.waterParams.w;
+    vec3 inc = -lightDir;
+    vec2 base = exitPos.xz + pc.waterAnchor.xy;  // world-stable wave domain (same as applyWaterWaves)
+    vec2 p0 = causticLanding(base, t, inc, h);
+    vec2 px = causticLanding(base + vec2(CAUSTIC_EPS, 0.0), t, inc, h);
+    vec2 pz = causticLanding(base + vec2(0.0, CAUSTIC_EPS), t, inc, h);
+    float det = abs((px.x - p0.x) * (pz.y - p0.y) - (px.y - p0.y) * (pz.x - p0.x));
+    // Flat water ⇒ all landings displace identically ⇒ det = eps² ⇒ focus = 1 (energy-neutral); the
+    // clamp bounds the fold-line spikes whose energy the surrounding darkening already paid for.
+    float focus = (CAUSTIC_EPS * CAUSTIC_EPS) / max(det, 1.0e-5);
+    return mix(1.0, min(focus, CAUSTIC_MAX), fade);
 }
 
 // GGX BRDF. Roughness is clamped away from 0 so the delta sun's specular highlight stays finite
@@ -391,7 +453,7 @@ const uint SBT_SHADOW = TERRAIN_BUCKETS;
 const uint SBT_STRIDE_BUCKET = 1u;
 
 vec3 visibility(vec3 origin, vec3 dir, float tmax) {
-    shadowVis = vec4(1.0, 1.0, 1.0, 0.0);
+    shadowVis = vec4(1.0, 1.0, 1.0, -1.0); // a = water-crossing sentinel, filled by the water any-hit
     // Shadow SBT records run any-hit only for cutout/translucent/water. Cutout alpha-tests; translucent
     // and water tint shadowVis.rgb and pass through. Solid blocks terminate traversal. There is no closest
     // or miss shader worth executing, so use a hit object only as the traversal result.
@@ -769,6 +831,12 @@ vec3 tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) {
         float ndl = max(0.0, dot(n, lightDir));
         if (ndl > 0.0) {
             vec3 vis = visibility(p, lightDir, 10000.0);
+            // Underwater receiver whose shadow ray crossed a water surface: scale the direct light by
+            // the wave-refraction caustic at the exit point. Focusing scales the incident irradiance,
+            // so it applies to the whole NEE term (diffuse + specular).
+            if (inWater && waterWaves && shadowVis.a > 0.0) {
+                vis *= waterCaustic(p + lightDir * shadowVis.a, lightDir, shadowVis.a);
+            }
             if (max(vis.r, max(vis.g, vis.b)) > 0.0) {
                 vec3 brdf = diffAlb * INV_PI; // Lambertian diffuse (f = albedo/PI)
                 if (pbr) {
@@ -795,6 +863,11 @@ vec3 tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) {
             float backNdl = max(0.0, dot(-n, lightDir));
             if (backNdl > 0.0) {
                 vec3 visB = visibility(hitPos - n * SURF_BIAS, lightDir, 10000.0);
+                // Same caustic as the front-face NEE — underwater kelp/seagrass transmission should
+                // flicker with the same light bands as the floor around it.
+                if (inWater && waterWaves && shadowVis.a > 0.0) {
+                    visB *= waterCaustic(hitPos + lightDir * shadowVis.a, lightDir, shadowVis.a);
+                }
                 if (max(visB.r, max(visB.g, visB.b)) > 0.0) {
                     float cosT = dot(lightDir, rd);
                     L += throughput * diffAlb * sss * SSS_STRENGTH * hg(cosT, SSS_G) * backNdl * pc.lightRadiance.xyz * visB;

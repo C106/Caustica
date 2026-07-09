@@ -133,6 +133,10 @@ void main() {
     if (bucket == BUCKET_WATER) {
         Prim pr = Prims(sec.primAddr).p[tri];
         shadowVis.rgb *= mix(vec3(1.0), pr.tint.rgb, WATER_SHADOW_TINT);
+        // Record the NEAREST water crossing (any-hit order is arbitrary) in the otherwise-unused alpha
+        // lane. For an underwater shading point this is the exit point of its sun shadow ray, where
+        // world.rgen evaluates the wave-refraction caustic. visibility() seeds the -1 sentinel.
+        shadowVis.a = shadowVis.a < 0.0 ? gl_HitTEXT : min(shadowVis.a, gl_HitTEXT);
         ignoreIntersectionEXT;
         return;
     }
