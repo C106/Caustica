@@ -122,10 +122,12 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Install packaging dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y glslang-tools spirv-tools libvulkan-dev
+      - name: Setup Vulkan SDK
+        uses: humbletim/setup-vulkan-sdk@v1.2.1
+        with:
+          vulkan-query-version: ${{ env.VULKAN_SDK_VERSION }}
+          vulkan-components: Vulkan-Headers, Vulkan-Loader, Glslang, SPIRV-Tools
+          vulkan-use-cache: true
 
       - name: Download NGX shims
         uses: actions/download-artifact@v4
@@ -137,7 +139,6 @@ jobs:
       - name: Build bundled jar
         env:
           DLSS_SDK: ${{ github.workspace }}/${{ env.DLSS_SDK_PATH }}
-          VULKAN_SDK: /usr
         run: >
           bash ./gradlew build
           -PngxPlatforms=windows-x64,linux-x64
