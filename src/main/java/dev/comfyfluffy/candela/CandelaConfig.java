@@ -25,7 +25,7 @@ import org.slf4j.LoggerFactory;
  * the property namespace stays flat and dotted for convenient one-off {@code -D} overrides.
  */
 public final class CandelaConfig {
-    private static final Logger LOGGER = LoggerFactory.getLogger("candela-config");
+    private static final Logger LOGGER = LoggerFactory.getLogger("Candela");
     private static final List<RuntimeSetting<?>> SETTINGS = new CopyOnWriteArrayList<>();
 
     private static final Path CONFIG_PATH = resolveConfigPath();

@@ -207,7 +207,7 @@ public final class RtUiOverlay {
             pass.draw(3, 1, 0, 0);
         } catch (Throwable t) {
             compositeFailed = true;
-            org.slf4j.LoggerFactory.getLogger("candela-ui-overlay")
+            org.slf4j.LoggerFactory.getLogger("Candela")
                     .error("UI overlay composite failed; disabling overlay", t);
         }
     }
