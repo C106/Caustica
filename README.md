@@ -67,7 +67,12 @@ paths behave consistently.
 
 ## License
 
-Caustica is licensed under the MIT License. See [LICENSE.md](LICENSE.md).
+Caustica's project-owned source code and documentation are licensed under the
+GNU Lesser General Public License v3.0 or later. See [LICENSE.md](LICENSE.md),
+[COPYING](COPYING), and [COPYING.LESSER](COPYING.LESSER).
+
+Release artifacts may bundle NVIDIA DLSS/NGX SDK components under NVIDIA's own
+license terms. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## TODO List
 
