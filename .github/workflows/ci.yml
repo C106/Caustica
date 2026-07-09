@@ -14,7 +14,7 @@ env:
 jobs:
   native-windows:
     name: Build Windows NGX shim
-    runs-on: windows-latest
+    runs-on: windows-2022
 
     steps:
       - name: Checkout Candela
