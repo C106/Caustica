@@ -161,6 +161,7 @@ jobs:
           echo "VULKAN_SDK=${sdk_root}" >> "${GITHUB_ENV}"
           echo "${sdk_root}/bin" >> "${GITHUB_PATH}"
           "${sdk_root}/bin/glslangValidator" --version
+          "${sdk_root}/bin/slangc" -version
           "${sdk_root}/bin/spirv-val" --version
 
       - name: Download NGX shims

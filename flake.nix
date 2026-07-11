@@ -31,6 +31,7 @@
             name = "vulkan-sdk";
             paths = [
               pkgs.glslang
+              pkgs.shader-slang
               pkgs.spirv-tools
               pkgs.vulkan-headers
             ];
@@ -76,6 +77,7 @@
                 llvm.lld
                 llvm.llvm
                 ninja
+                shader-slang
                 spirv-tools
                 vulkan-headers
                 vulkan-tools

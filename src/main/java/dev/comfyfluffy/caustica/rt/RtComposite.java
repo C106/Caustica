@@ -11,6 +11,13 @@ import dev.comfyfluffy.caustica.CausticaConfig;
 import dev.comfyfluffy.caustica.CausticaMod;
 import dev.comfyfluffy.caustica.client.CausticaJitter;
 import dev.comfyfluffy.caustica.mixin.CommandEncoderAccessor;
+import dev.comfyfluffy.caustica.rt.gen.PushAddrData;
+import dev.comfyfluffy.caustica.rt.gen.WorldPushData;
+import dev.comfyfluffy.caustica.rt.gen.WorldPushData.BreakEntry;
+import dev.comfyfluffy.caustica.rt.gen.WorldPushData.Float2;
+import dev.comfyfluffy.caustica.rt.gen.WorldPushData.Float3;
+import dev.comfyfluffy.caustica.rt.gen.WorldPushData.Float4;
+import dev.comfyfluffy.caustica.rt.gen.WorldPushData.Int4;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.BiomeColors;
 import net.minecraft.client.renderer.texture.TextureAtlas;
@@ -78,27 +85,12 @@ public final class RtComposite {
         return CausticaConfig.Rt.ENABLED.value();
     }
 
-    // invViewProj(64) + camOffset(@64) + sectionTableAddr(@80) + debugView(@88) + frameIndex(@92)
-    // + prevViewProj(@96) + camDelta(@160) + spp(@172) + jitter(@176) + entityTableAddr(@184)
-    // + flags(@192): bit 0 = camera submerged, bit 1 = PBR BRDF enabled, bit 4 = water waves
-    // + maxBounces(@196)
-    // + dynamic sky (16-byte aligned vec4s): sunDir+dayFactor(@208) + lightDir(@224) + lightRadiance(@240)
-    // + sky rewrite: moonDir+moonPhase(@256) + celestialAxis+starAngle(@272) + sunUv(@288) + moonUv(@304)
-    // + W1/W2 water: waterParams(@320) xyz=camera-biome tint, w=wave time; waterAnchor(@336) xy=wave anchor
-    // + curViewProj(@352, forward camera-relative view-projection)
-    // + block-breaking overlay (Tier 2): breakCount(@416) + pad(@420-428) + breaking[MAX_BREAKING](@432,
-    // 16B each: ivec3 blockPos rebased relative to terrain origin, int bindless entityTex slot for this
-    // block's destroy-stage texture; unused entries are simply not counted, not zeroed)
-    private static final int MAX_BREAKING = 8;
-    private static final int BREAKING_OFFSET = 432;
-    private static final int WORLD_PUSH_SIZE = BREAKING_OFFSET + MAX_BREAKING * 16;
-    // Real inline push constants (fast constant-bank reads), separate from the WORLD_PUSH_SIZE BDA ring
-    // above. tableAddr/entityTableAddr/frameIndex are duplicated here so world.rchit/world.rahit's hottest
-    // per-hit lookups (Section/EntityGeom fetch) skip the extra global-memory load that dereferencing
-    // WorldPushRef(pcAddr.worldPushAddr) costs; everything else (matrices, sky, water, breaking) stays in
-    // the BDA struct since it's cold or only read once per ray-gen invocation.
-    // layout: worldPushAddr(@0, 8B) + tableAddr(@8, 8B) + entityTableAddr(@16, 8B) + frameIndex(@24, 4B)
-    private static final int WORLD_PUSH_CONST_SIZE = 32;
+    // WorldPushData and its serializer are generated from Slang's reflected Std430DataLayout. Java never
+    // owns or calculates a shader byte offset, struct size, array stride, or fixed-array capacity.
+    private static final int WORLD_PUSH_SIZE = WorldPushData.BYTE_SIZE;
+    // Real inline push constants (fast constant-bank reads), separate from the WorldPush BDA ring above.
+    // tableAddr/entityTableAddr/frameIndex are duplicated so hit shaders skip a global-memory dereference;
+    // PushAddrData is generated from the same Slang module and owns this second ABI as well.
     private static final int GUIDE_COUNT = 6; // RR guide buffers bound at world-pipeline bindings 3..8
     // Frames a retired per-frame TLAS must outlive before it's freed (> frames-in-flight); matches
     // RtTerrain's deferred-free horizon. The frame TLAS is built + traced this frame, then freed once
@@ -457,7 +449,7 @@ public final class RtComposite {
             bindlessTextureCapacity = RtEntityTextures.maxTextures();
             worldPipeline = RtPipeline.create(ctx, RtDeviceBringup.worldRaygenShader(),
                     new String[]{"world.rmiss.spv"}, "world.rchit.spv", "world.rahit.spv",
-                    WORLD_PUSH_CONST_SIZE, true, GUIDE_COUNT, bindlessTextureCapacity, true, true);
+                    PushAddrData.BYTE_SIZE, true, GUIDE_COUNT, bindlessTextureCapacity, true, true);
             // Per-frame push data lives in this BDA ring; the pipeline only pushes its address.
             if (pushRing == null) {
                 pushRing = new RtBuffer[PUSH_RING];
@@ -729,26 +721,12 @@ public final class RtComposite {
 
             boolean rrDone = false;
             RtTerrain terrain = RtTerrain.currentOrNull();
-            // Write this frame's push data into the next BDA ring slot (cycled so an in-flight slot is
-            // never overwritten). The std430 WorldPush layout matches these byte offsets exactly.
+            // Select the next BDA ring slot; the generated WorldPushData serializer fills it once all
+            // frame-derived values (including entity addresses and block-breaking entries) are known.
             pushSlot = (pushSlot + 1) % PUSH_RING;
             RtBuffer pushBuf = pushRing[pushSlot];
             ByteBuffer push = MemoryUtil.memByteBuffer(pushBuf.mapped, WORLD_PUSH_SIZE);
-            frameInvViewProj.set(frameProjection).mul(frameViewRotation).invert().get(0, push);
-            mvCurProjView.get(352, push); // forward camera-relative view-projection: HW depth guide + water MV
-            push.putFloat(64, (float) (camX - terrain.blockX));
-            push.putFloat(68, (float) (camY - terrain.blockY));
-            push.putFloat(72, (float) (camZ - terrain.blockZ));
-            push.putLong(80, terrain.tableAddress());
-            push.putInt(88, debugView);
-            push.putInt(92, (int) frameCounter); // per-frame RNG variation for the denoiser
-            mvPushMatrix.get(96, push);
-            push.putFloat(160, mvCamDeltaX);
-            push.putFloat(164, mvCamDeltaY);
-            push.putFloat(168, mvCamDeltaZ);
-            push.putInt(172, spp());
-            push.putFloat(176, jitterX);
-            push.putFloat(180, jitterY);
+            frameInvViewProj.set(frameProjection).mul(frameViewRotation).invert();
             // flags: PBR BRDF (bit 1, always on) + camera-in-water (so the path tracer starts in the water
             // medium when the eye is submerged, fixing the air→water first-segment orientation).
             int flags = 0b10;
@@ -762,14 +740,9 @@ public final class RtComposite {
             if (waterWaves()) {
                 flags |= 0b10000; // W1: animated water wave normals
             }
-            push.putInt(192, flags);
-            push.putInt(196, maxBounces());
-            writeSky(push);
 
-            // W1/W2 water params @320 (sunUv@288 / moonUv@304 belong to the sky push above): xyz = the
-            // camera biome's water tint (drives absorption when the eye starts submerged, before any water
-            // surface is hit); w = wave animation time (seconds, wrapped to keep float precision). Per-
-            // water-body tint comes from the prim; this is only the fallback.
+            // W1/W2 water parameters: camera-biome tint plus wrapped animation time. Per-water-body tint
+            // comes from the primitive; this is the fallback for a camera already inside the medium.
             float wtr = 0.25f, wtg = 0.46f, wtb = 0.9f; // neutral ocean-ish default if no level/biome
             if (level != null) {
                 int wc = BiomeColors.getAverageWaterColor(level, cameraBlockPos);
@@ -777,15 +750,13 @@ public final class RtComposite {
                 wtg = ((wc >> 8) & 0xFF) / 255f;
                 wtb = (wc & 0xFF) / 255f;
             }
-            push.putFloat(320, wtr);
-            push.putFloat(324, wtg);
-            push.putFloat(328, wtb);
-            push.putFloat(332, (float) (System.nanoTime() / 1.0e9 % 3600.0));
-            // W1 wave-domain anchor @336: the terrain rebase origin reduced mod 4096 (kept small for shader
+            Float4 waterParams = new Float4(wtr, wtg, wtb,
+                    (float) (System.nanoTime() / 1.0e9 % 3600.0));
+            // W1 wave-domain anchor: the terrain rebase origin reduced mod 4096 (kept small for shader
             // float precision). hitPos.xz (rebased) + anchor reconstructs a world-pinned coordinate, so the
             // ripple pattern stays fixed in the world as the player moves and the rebase origin shifts.
-            push.putFloat(336, terrain.blockX & WATER_ANCHOR_MASK);
-            push.putFloat(340, terrain.blockZ & WATER_ANCHOR_MASK);
+            Float4 waterAnchor = new Float4(terrain.blockX & WATER_ANCHOR_MASK,
+                    terrain.blockZ & WATER_ANCHOR_MASK, 0f, 0f);
 
             // Rebuild the TLAS this frame from static section instances merged with dynamic entity
             // instances, bind it into the pipeline's descriptor ring, record the build, then barrier so
@@ -795,12 +766,39 @@ public final class RtComposite {
             // feeds the hit shader entity path (per-prim normal/tint) and motion vectors.
             RtEntities.FrameEntities fe = RtEntities.INSTANCE.beginFrame(ctx, terrain.staticInstances(),
                     terrain.blockX, terrain.blockY, terrain.blockZ, camX, camY, camZ, frameProjection, frameViewRotation);
-            push.putLong(184, fe.geomTableAddr());
             // Block-breaking overlay: resolves each destroy-stage RenderType's texture into the
             // SAME bindless entity-texture array (destroy_stage_N.png is a standalone Sampler0 texture,
             // not a block-atlas sprite — see ModelBakery.BREAKING_LOCATIONS/DESTROY_TYPES), so any newly
             // resolved slot rides along with the uploadPending() call right below.
-            writeBreaking(push, terrain);
+            BreakEntry[] breaking = breakingEntries(terrain);
+            SkyPush sky = skyPush();
+            new WorldPushData(
+                    frameInvViewProj,
+                    new Float3((float) (camX - terrain.blockX), (float) (camY - terrain.blockY),
+                            (float) (camZ - terrain.blockZ)),
+                    terrain.tableAddress(),
+                    debugView,
+                    (int) frameCounter,
+                    mvPushMatrix,
+                    new Float3(mvCamDeltaX, mvCamDeltaY, mvCamDeltaZ),
+                    spp(),
+                    new Float2(jitterX, jitterY),
+                    fe.geomTableAddr(),
+                    flags,
+                    maxBounces(),
+                    sky.sunDir(),
+                    sky.lightDir(),
+                    sky.lightRadiance(),
+                    sky.moonDir(),
+                    sky.celestial(),
+                    sky.sunUv(),
+                    sky.moonUv(),
+                    waterParams,
+                    waterAnchor,
+                    mvCurProjView,
+                    breaking.length,
+                    breaking
+            ).write(push);
             // Upload any entity textures registered this frame into the bindless set before the trace.
             RtEntityTextures.INSTANCE.uploadPending(active, atlasSampler(ctx));
             // Re-upload the LabPBR _s atlas if extraction added sprites since the last frame (the
@@ -830,11 +828,9 @@ public final class RtComposite {
             // Push the BDA ring slot's address plus the small hot subset that rchit/rahit read on every
             // hit (tableAddr/entityTableAddr/frameIndex) as real inline push constants, so those lookups
             // don't pay for a second global-memory dereference through pcAddr.worldPushAddr first.
-            ByteBuffer pushAddr = stack.malloc(WORLD_PUSH_CONST_SIZE)
-                    .putLong(0, pushBuf.deviceAddress)
-                    .putLong(8, terrain.tableAddress())
-                    .putLong(16, fe.geomTableAddr())
-                    .putInt(24, (int) frameCounter);
+            ByteBuffer pushAddr = stack.malloc(PushAddrData.BYTE_SIZE);
+            new PushAddrData(pushBuf.deviceAddress, terrain.tableAddress(), fe.geomTableAddr(),
+                    (int) frameCounter).write(pushAddr);
             try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "world trace");
                  RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.trace")) {
                 active.trace(cmd, renderW, renderH, pushAddr);
@@ -898,22 +894,6 @@ public final class RtComposite {
     }
 
     /**
-     * Derive the celestial light from Minecraft's time of day and write it into the world push constant
-     * (three 16-byte-aligned vec4s at offsets 208/224/240):
-     * <ul>
-     *   <li>{@code sunDir.xyz} — the true sun direction (for the sky glow/disc), {@code .w} = dayFactor
-     *       (0 night .. 1 day), used to cross-fade the sky gradient.</li>
-     *   <li>{@code lightDir.xyz} — the active NEE light direction: the sun while it is above the horizon,
-     *       otherwise the moon (so surfaces still get soft moonlight at night); {@code .w} = the light's
-     *       angular radius in radians.</li>
-     *   <li>{@code lightRadiance.xyz} — that light's HDR colour: warm + dim near the horizon, white +
-     *       bright when high; dim cool moonlight at night.</li>
-     * </ul>
-     * Celestial angles come from the camera's {@link EnvironmentAttributeProbe} (partial-tick
-     * interpolated). {@code caustica.rt.sunNoonSouthDeg} tilts the east-west arc toward south (+Z) at
-     * noon.
-     */
-    /**
      * Block-breaking overlay: mirrors vanilla's {@code ClientLevel.destructionProgress()} (populated
      * by network packets, independent of the cancelled {@code LevelRenderer.render()} — see
      * [[rt-native-overlay-tier1]]) into the push's {@code breaking[]} list, so {@code world.rchit} can blend
@@ -922,12 +902,13 @@ public final class RtComposite {
      * {@link ModelBakery#DESTROY_TYPES}) is a standalone {@code Sampler0} texture, not a block-atlas sprite,
      * so it rides the same bindless entity-texture array as entity textures ({@link RtEntityTextures}).
      */
-    private void writeBreaking(ByteBuffer push, RtTerrain terrain) {
+    private BreakEntry[] breakingEntries(RtTerrain terrain) {
+        BreakEntry[] result = new BreakEntry[WorldPushData.BREAKING_CAPACITY];
         int count = 0;
         var level = Minecraft.getInstance().level;
         if (level != null) {
             for (var entry : level.destructionProgress().long2ObjectEntrySet()) {
-                if (count >= MAX_BREAKING) {
+                if (count >= result.length) {
                     break;
                 }
                 var progresses = entry.getValue();
@@ -937,18 +918,28 @@ public final class RtComposite {
                 int stage = Mth.clamp(progresses.last().getProgress(), 0, 9);
                 BlockPos pos = BlockPos.of(entry.getLongKey());
                 int slot = RtEntityTextures.INSTANCE.slotFor(ModelBakery.DESTROY_TYPES.get(stage));
-                int off = BREAKING_OFFSET + count * 16;
-                push.putInt(off, pos.getX() - terrain.blockX);
-                push.putInt(off + 4, pos.getY() - terrain.blockY);
-                push.putInt(off + 8, pos.getZ() - terrain.blockZ);
-                push.putInt(off + 12, slot);
-                count++;
+                result[count++] = new BreakEntry(new Int4(
+                        pos.getX() - terrain.blockX,
+                        pos.getY() - terrain.blockY,
+                        pos.getZ() - terrain.blockZ,
+                        slot));
             }
         }
-        push.putInt(416, count);
+        return count == result.length ? result : java.util.Arrays.copyOf(result, count);
     }
 
-    private void writeSky(ByteBuffer push) {
+    private record SkyPush(Float4 sunDir, Float4 lightDir, Float4 lightRadiance, Float4 moonDir,
+                           Float4 celestial, Float4 sunUv, Float4 moonUv) {}
+
+    private record CelestialUv(Float4 sun, Float4 moon) {}
+
+    /**
+     * Derive the celestial light from Minecraft's time of day as typed values for {@link WorldPushData}.
+     * Celestial angles come from the camera's {@link EnvironmentAttributeProbe} (partial-tick
+     * interpolated). {@code caustica.rt.sunNoonSouthDeg} tilts the east-west arc toward south (+Z) at
+     * noon.
+     */
+    private SkyPush skyPush() {
         float sunX, sunY, sunZ, dayFactor, lx, ly, lz, rr, rg, rb, lightRadius;
         float moonX, moonY, moonZ, moonPhase, starAngle, starBrightness;
         Minecraft mc = Minecraft.getInstance();
@@ -999,13 +990,15 @@ public final class RtComposite {
             rb = 0.55f * moonPeak * moonStrength * trans[2];
             lightRadius = CausticaConfig.Rt.Composite.MOON_ANGULAR_RADIUS.value();
         }
-        push.putFloat(208, sunX); push.putFloat(212, sunY); push.putFloat(216, sunZ); push.putFloat(220, dayFactor);
-        push.putFloat(224, lx); push.putFloat(228, ly); push.putFloat(232, lz); push.putFloat(236, lightRadius);
-        push.putFloat(240, rr); push.putFloat(244, rg); push.putFloat(248, rb); push.putFloat(252, starBrightness);
-        // Sky rewrite: moon direction + phase, celestial axis + star rotation angle (real world time).
-        push.putFloat(256, moonX); push.putFloat(260, moonY); push.putFloat(264, moonZ); push.putFloat(268, moonPhase);
-        push.putFloat(272, 0f); push.putFloat(276, celestialAxisY()); push.putFloat(280, celestialAxisZ()); push.putFloat(284, starAngle);
-        writeCelestialUv(push, moonPhase); // sunUv@288 + moonUv@304 (vanilla celestials-atlas sprite rects)
+        CelestialUv uv = celestialUv(moonPhase);
+        return new SkyPush(
+                new Float4(sunX, sunY, sunZ, dayFactor),
+                new Float4(lx, ly, lz, lightRadius),
+                new Float4(rr, rg, rb, starBrightness),
+                new Float4(moonX, moonY, moonZ, moonPhase),
+                new Float4(0f, celestialAxisY(), celestialAxisZ(), starAngle),
+                uv.sun(),
+                uv.moon());
     }
 
     /**
@@ -1013,7 +1006,7 @@ public final class RtComposite {
      * sprite, so world.rmiss can sample the real vanilla textures on the discs. Atlas-not-ready (early
      * boot / no resources) leaves full-range UVs and the shader's block-atlas fallback covers it.
      */
-    private void writeCelestialUv(ByteBuffer push, float moonPhaseIndex) {
+    private CelestialUv celestialUv(float moonPhaseIndex) {
         if (celestialUvAtlasHandle == 0L) {
             setCelestialUvAtlas(celestialsAtlasView());
         }
@@ -1021,8 +1014,9 @@ public final class RtComposite {
         if (phase != celestialUvMoonPhase) {
             refreshCelestialUvCache(phase);
         }
-        push.putFloat(288, sunU0); push.putFloat(292, sunV0); push.putFloat(296, sunU1); push.putFloat(300, sunV1);
-        push.putFloat(304, moonU0); push.putFloat(308, moonV0); push.putFloat(312, moonU1); push.putFloat(316, moonV1);
+        return new CelestialUv(
+                new Float4(sunU0, sunV0, sunU1, sunV1),
+                new Float4(moonU0, moonV0, moonU1, moonV1));
     }
 
     private void setCelestialUvAtlas(long atlasHandle) {

@@ -1,6 +1,8 @@
 .gradle/
 .idea/
-build/
+/build/
+/buildSrc/build/
+native/ngx_shim/build/
 run/
 out/
 *.log
