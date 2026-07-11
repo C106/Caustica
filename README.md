@@ -48,6 +48,7 @@ changes while the renderer is being built.
 - Caustica is client-side only.
 - DLSS Ray Reconstruction and Frame Generation require supported NVIDIA
   hardware and drivers.
+- On Linux if Minecraft crashes on startup with stack overflow errors, try adding `-Xss2M` to the Java args to increase the stack size.
 - Use Java args to improve performance. Minecraft Launcher default:
   `-XX:+UseCompactObjectHeaders -XX:+AlwaysPreTouch -XX:+UseStringDeduplication -XX:+UseZGC`
 - Frame Generation is experimental and needs to be enabled by modifying the configuration file.
