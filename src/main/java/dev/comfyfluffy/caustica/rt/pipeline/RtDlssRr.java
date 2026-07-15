@@ -70,6 +70,12 @@ public final class RtDlssRr {
         return initialized && !failed && !isNull(feature);
     }
 
+    /** Discard temporal history after a discontinuous world/camera state change. */
+    public void requestHistoryReset() {
+        resetHistory = true;
+        lastFrameNanos = 0L;
+    }
+
     /**
      * Record a DLSS-RR evaluation: denoise + upscale the noisy path-traced color (at render res) using
      * the guide buffers, writing the display-res result into {@code out}. {@code jitterX/jitterY} is the

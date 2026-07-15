@@ -30,6 +30,24 @@
 	"caustica.options.rt.waterWaves": "Animated Water",
 	"caustica.options.rt.waterWaves.tooltip": "Animate water-surface normals for moving wave highlights.",
 
+	"caustica.options.rt.fog": "Height Fog",
+	"caustica.options.rt.fog.tooltip": "Enable exponential height fog in the ray-traced world.",
+
+	"caustica.options.rt.fogDensity": "Fog Density",
+	"caustica.options.rt.fogDensity.tooltip": "Extinction density at the base height. Higher values produce thicker fog and reduce visibility.",
+
+	"caustica.options.rt.fogHeightFalloff": "Fog Height Falloff",
+	"caustica.options.rt.fogHeightFalloff.tooltip": "How quickly fog density decreases with altitude. Higher values keep fog closer to the base height.",
+
+	"caustica.options.rt.fogBaseHeight": "Fog Base Height",
+	"caustica.options.rt.fogBaseHeight.tooltip": "World height where the configured fog density applies.",
+
+	"caustica.options.rt.atmosphericScattering": "Atmospheric Scattering",
+	"caustica.options.rt.atmosphericScattering.tooltip": "Enable directional Rayleigh and Mie scattering from the sun and moon through the height fog.",
+
+	"caustica.options.rt.scatteringStrength": "Scattering Strength",
+	"caustica.options.rt.scatteringStrength.tooltip": "Scale the sun and moon's directional Rayleigh and Mie scattering contribution.",
+
 	"caustica.options.rt.hdr": "HDR Output",
 	"caustica.options.rt.hdr.tooltip": "Present in HDR (ST.2084/PQ) instead of SDR, when the display supports it. Takes effect after restarting the game.",
 

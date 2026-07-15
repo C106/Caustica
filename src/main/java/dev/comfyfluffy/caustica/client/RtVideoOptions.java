@@ -40,6 +40,12 @@ public final class RtVideoOptions {
             entities(),
             particles(),
             waterWaves(),
+            fogEnabled(),
+            fogDensity(),
+            fogHeightFalloff(),
+            fogBaseHeight(),
+            atmosphericScattering(),
+            scatteringStrength(),
             dlssQuality(),
             hdrEnabled(),
             hdrPaperWhite(),
@@ -122,6 +128,72 @@ public final class RtVideoOptions {
 
     private static OptionInstance<Boolean> waterWaves() {
         return bool("caustica.options.rt.waterWaves", CausticaConfig.Rt.Composite.WATER_WAVES);
+    }
+
+    private static OptionInstance<Boolean> fogEnabled() {
+        return bool("caustica.options.rt.fog", CausticaConfig.Rt.Fog.ENABLED);
+    }
+
+    private static OptionInstance<Integer> fogDensity() {
+        FloatSetting setting = CausticaConfig.Rt.Fog.DENSITY;
+        int initialPosition = encodeFogDensity(setting.value());
+        return new OptionInstance<>(
+            "caustica.options.rt.fogDensity",
+            OptionInstance.cachedConstantTooltip(Component.translatable("caustica.options.rt.fogDensity.tooltip")),
+            (caption, position) -> Options.genericValueLabel(caption,
+                    Component.literal(String.format(Locale.ROOT, "%.5f", decodeFogDensity(position)))),
+            new OptionInstance.IntRange(0, 1000),
+            initialPosition,
+            position -> setting.set(decodeFogDensity(position)));
+    }
+
+    private static int encodeFogDensity(float density) {
+        double normalized = Math.clamp(density / 0.02, 0.0, 1.0);
+        return Math.clamp((int) Math.round(Math.sqrt(normalized) * 1000.0), 0, 1000);
+    }
+
+    private static float decodeFogDensity(int position) {
+        float normalized = Math.clamp(position, 0, 1000) / 1000.0f;
+        return 0.02f * normalized * normalized;
+    }
+
+    private static OptionInstance<Integer> fogHeightFalloff() {
+        FloatSetting setting = CausticaConfig.Rt.Fog.HEIGHT_FALLOFF;
+        return new OptionInstance<>(
+            "caustica.options.rt.fogHeightFalloff",
+            OptionInstance.cachedConstantTooltip(Component.translatable("caustica.options.rt.fogHeightFalloff.tooltip")),
+            (caption, tenThousandths) -> Options.genericValueLabel(caption,
+                    Component.literal(String.format(Locale.ROOT, "%.4f", tenThousandths / 10000.0))),
+            new OptionInstance.IntRange(0, 1000),
+            Math.clamp(Math.round(setting.value() * 10000.0f), 0, 1000),
+            tenThousandths -> setting.set(tenThousandths / 10000.0f));
+    }
+
+    private static OptionInstance<Integer> fogBaseHeight() {
+        IntSetting setting = CausticaConfig.Rt.Fog.BASE_HEIGHT;
+        return new OptionInstance<>(
+            "caustica.options.rt.fogBaseHeight",
+            OptionInstance.cachedConstantTooltip(Component.translatable("caustica.options.rt.fogBaseHeight.tooltip")),
+            (caption, height) -> Options.genericValueLabel(caption, height),
+            new OptionInstance.IntRange(-64, 320),
+            Math.clamp(setting.value(), -64, 320),
+            setting::set);
+    }
+
+    private static OptionInstance<Boolean> atmosphericScattering() {
+        return bool("caustica.options.rt.atmosphericScattering", CausticaConfig.Rt.Fog.ATMOSPHERIC_SCATTERING);
+    }
+
+    private static OptionInstance<Integer> scatteringStrength() {
+        FloatSetting setting = CausticaConfig.Rt.Fog.SCATTERING_STRENGTH;
+        return new OptionInstance<>(
+            "caustica.options.rt.scatteringStrength",
+            OptionInstance.cachedConstantTooltip(Component.translatable("caustica.options.rt.scatteringStrength.tooltip")),
+            (caption, hundredths) -> Options.genericValueLabel(caption,
+                    Component.literal(String.format(Locale.ROOT, "%.2fx", hundredths / 100.0))),
+            new OptionInstance.IntRange(0, 400),
+            Math.clamp(Math.round(setting.value() * 100.0f), 0, 400),
+            hundredths -> setting.set(hundredths / 100.0f));
     }
 
     // NVSDK_NGX_PerfQuality_Value, ordered performance -> quality for the slider. Per NVIDIA's DLSS-RR

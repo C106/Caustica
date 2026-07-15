@@ -122,6 +122,43 @@ float3 waterExtinction(float3 tint) {
     return WATER_ABSORB_FLOOR + WATER_DENSITY * (float3(1.0, 1.0, 1.0) - clamp(tint, 0.0, 1.0));
 }
 
+// Analytic optical depth for density(y) = density0 * exp(-falloff * (y - baseHeight)).
+// Evaluate the exponential difference from its larger endpoint in log space: looking down from a high
+// altitude can span hundreds of density scale heights, where a direct exp() would overflow even though
+// all that matters to transmittance is that the segment is opaque.
+float fogOpticalDepth(float originY, float rayY, float distance) {
+    float density0 = pc.fogParams.x;
+    if (density0 <= 0.0 || distance <= 0.0) {
+        return 0.0;
+    }
+
+    float falloff = max(pc.fogParams.y, 0.0);
+    if (falloff <= 1.0e-7) {
+        return min(density0 * distance, 80.0);
+    }
+
+    float startExponent = -falloff * (originY - pc.fogParams.z);
+    float exponentDelta = -falloff * rayY * distance;
+    float span = abs(exponentDelta);
+    float averageScale;
+    if (span < 1.0e-3) {
+        // (1 - exp(-span)) / span, expanded to avoid cancellation for near-horizontal rays.
+        averageScale = 1.0 - 0.5 * span + (span * span) / 6.0;
+    } else {
+        averageScale = (1.0 - exp(-min(span, 80.0))) / span;
+    }
+
+    float maxExponent = startExponent + max(exponentDelta, 0.0);
+    float logDepth = log(density0) + log(distance) + maxExponent + log(averageScale);
+    if (logDepth >= log(80.0)) {
+        return 80.0;
+    }
+    if (logDepth <= -80.0) {
+        return 0.0;
+    }
+    return exp(logDepth);
+}
+
 // Animated surface waves — a directional wave spectrum, gradient-only (the surface stays geometrically
 // flat; only the normal tilts). Three things make it read as water rather than animated glass:
 //  * Sharp-crested profile: each component is h = a·exp(S·(sin φ − 1)) — peaked crests, wide flat
@@ -256,6 +293,42 @@ float hg(float cosT, float g) {
     return (1.0 - g2) / (4.0 * PI * pow(max(0.0, 1.0 + g2 - 2.0 * g * cosT), 1.5));
 }
 
+// Stable 1-exp(-tau), used for exact Beer-Lambert scattering weights without cancellation in thin fog.
+float fogScatterWeight(float tau) {
+    if (tau <= 0.0) return 0.0;
+    if (tau < 1.0e-3) {
+        return tau * (1.0 - 0.5 * tau + (tau * tau) / 6.0);
+    }
+    return 1.0 - exp(-tau);
+}
+
+// Inverse of x = 1-exp(-tau), with a series that avoids cancellation for thin optical depths.
+float fogTauFromScatterCdf(float x) {
+    if (x <= 0.0) return 0.0;
+    if (x < 1.0e-3) {
+        float x2 = x * x;
+        return x + 0.5 * x2 + (x2 * x) / 3.0 + (x2 * x2) * 0.25;
+    }
+    return -log(1.0 - x);
+}
+
+// Invert an absolute target optical depth using the same overflow-safe evaluator as transmittance. This
+// stays correct when the true segment depth is much greater than fogOpticalDepth's tau=80 saturation.
+float fogOpticalDistance(float originY, float rayY, float distance, float targetTau) {
+    float lo = 0.0;
+    float hi = max(distance, 0.0);
+    // At a 10 km sky cap, 18 bisections locate the stratum to about 0.04 blocks.
+    for (int i = 0; i < 18; i++) {
+        float mid = 0.5 * (lo + hi);
+        if (fogOpticalDepth(originY, rayY, mid) < targetTau) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    return 0.5 * (lo + hi);
+}
+
 // NVIDIA RR guide-buffer helper: integrated/view-dependent specular reflectivity, not raw F0.
 // alpha is GGX alpha (perceptual roughness squared), NoV is the first-hit view cosine.
 float3 rrSpecularAlbedo(float3 specularColor, float alpha, float NoV) {
@@ -311,6 +384,10 @@ uint pcg(inout uint s) {
     return (w >> 22u) ^ w;
 }
 float rndf(inout uint s) { return float(pcg(s)) * (1.0 / 4294967296.0); }
+
+// A [0,1) draw whose largest value stays at least one float ULP below 1 after division into four strata.
+// Used only by the copied fog RNG, so atmospheric sampling never changes the main path's random sequence.
+float fogRndf(inout uint s) { return float(pcg(s) >> 10u) * (1.0 / 4194304.0); }
 
 float3 primaryRayDir(float2 ndc) {
     float4 nearH = mul(pc.invViewProj, float4(ndc.x, ndc.y, 1.0, 1.0));
@@ -423,6 +500,76 @@ float3 visibility(float3 origin, float3 dir, float tmax) {
             CULL_SECONDARY, SBT_SHADOW, SBT_STRIDE_BUCKET, 0u,
             makeRay(origin, RAY_TMIN, dir, tmax), shadowVis);
     return hObj.IsMiss() ? shadowVis.rgb : float3(0.0, 0.0, 0.0);
+}
+
+// Directional single scattering within the local exponential-height fog. These spectral Rayleigh
+// coefficients and the Cornette-Shanks Mie phase match world.rmiss's sky atmosphere; dividing by total
+// local extinction yields a wavelength-dependent single-scattering source without changing fog density.
+static const float3 FOG_RAYLEIGH_BETA = float3(5.5, 13.0, 22.4);
+static const float FOG_MIE_BETA = 21.0;
+static const float FOG_MIE_EXTINCTION_SCALE = 1.1;
+static const float FOG_MIE_G = 0.758;
+static const int FOG_DIRECTIONAL_LAYERS = 4;
+float3 directionalFogRadiance(float3 ro, float3 rd, float segmentDistance, float segmentTau, uint fogSeed) {
+    float strength = pc.fogColor.w;
+    float lightLen2 = dot(pc.lightDir.xyz, pc.lightDir.xyz);
+    if (strength <= 0.0 || segmentDistance <= 0.0 || segmentTau <= 0.0 || lightLen2 <= 1.0e-8) {
+        return float3(0.0, 0.0, 0.0);
+    }
+
+    float3 lightAxis = pc.lightDir.xyz * rsqrt(lightLen2);
+    float3 lightScale = max(pc.lightRadiance.xyz, float3(0.0, 0.0, 0.0)) * strength;
+    float scatterWeight = fogScatterWeight(segmentTau);
+    if (scatterWeight <= 0.0 || max(lightScale.r, max(lightScale.g, lightScale.b)) <= 0.0) {
+        return float3(0.0, 0.0, 0.0); // exact-zero / underflow only
+    }
+
+    // Equal-mass strata in the Beer scattering CDF F(tau)=(1-exp(-tau))/scatterWeight. Each visibility
+    // query therefore carries exactly one quarter of the segment's directional scattering energy; a
+    // shadow boundary can no longer flip the old near-camera 63% layer. Independent layer jitter makes
+    // the estimator unbiased, while DLSS-RR converges the resulting spatiotemporal volume noise.
+    float layerWeight = scatterWeight / float(FOG_DIRECTIONAL_LAYERS);
+    uint localSeed = fogSeed ^ 0xA511E9B3u;
+    float3 integrated = float3(0.0, 0.0, 0.0);
+    for (int layer = 0; layer < FOG_DIRECTIONAL_LAYERS; layer++) {
+        float xi = fogRndf(localSeed);
+        float u = (float(layer) + xi) / float(FOG_DIRECTIONAL_LAYERS);
+        float sampleTau = fogTauFromScatterCdf(u * scatterWeight);
+        float sampleDistance = fogOpticalDistance(ro.y, rd.y, segmentDistance, sampleTau);
+        float3 samplePos = ro + rd * sampleDistance;
+
+        // Sample the same square sun/moon used by surface NEE. This one direction drives phase, local-fog
+        // transmittance, and visibility together, producing unbiased volumetric soft shadows over time.
+        float3 lightDir = lightAxis;
+        if (pc.lightDir.w > 0.0) {
+            lightDir = sampleSquare(lightAxis, pc.lightDir.w, localSeed);
+        }
+        if (lightDir.y <= 0.0) continue;
+
+        // rd points toward the scene and lightDir toward the light, so mu=+1 while looking at the light:
+        // the positive-g Mie lobe is the expected forward-scattering sun/moon halo.
+        float mu = clamp(dot(rd, lightDir), -1.0, 1.0);
+        float mu2 = mu * mu;
+        float phaseR = (3.0 / (16.0 * PI)) * (1.0 + mu2);
+        float g2 = FOG_MIE_G * FOG_MIE_G;
+        float phaseM = (3.0 / (8.0 * PI)) * ((1.0 - g2) * (1.0 + mu2))
+                / ((2.0 + g2) * pow(max(1.0 + g2 - 2.0 * FOG_MIE_G * mu, 1.0e-6), 1.5));
+        float3 phase = (FOG_RAYLEIGH_BETA * phaseR + FOG_MIE_BETA * phaseM)
+                / (FOG_RAYLEIGH_BETA + FOG_MIE_BETA * FOG_MIE_EXTINCTION_SCALE);
+
+        // This is only the additional local height-fog extinction. lightRadiance already carries the
+        // planet-scale atmosphere transmittance. The finite cap keeps grazing-light fog well-defined.
+        float lightT = exp(-fogOpticalDepth(samplePos.y, lightDir.y, max(pc.fogParams.w, 0.0)));
+        float3 layerRadiance = lightScale * phase * (layerWeight * lightT);
+        if (max(layerRadiance.r, max(layerRadiance.g, layerRadiance.b)) <= 0.0) {
+            continue; // exact-zero / underflow only
+        }
+
+        // The representative point lies inside the already traversed, empty camera segment, so TMin is enough.
+        float3 lightVisibility = visibility(samplePos, lightDir, 10000.0);
+        integrated += layerRadiance * lightVisibility;
+    }
+    return integrated;
 }
 
 float2 projectPrevNdc(float3 worldPos) {
@@ -566,6 +713,21 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed)
         // Primary (bounce 0) is the camera ray (CULL_PRIMARY): sees particles but not the first-person
         // player. Bounce rays are secondary (CULL_SECONDARY): exclude particles, include the player.
         traceRadianceReordered(bounce == 0 ? CULL_PRIMARY : CULL_SECONDARY, ro, 0.0, rd, 10000.0);
+
+        // Apply the atmospheric segment before splitting hit from miss so escaped rays fog over the
+        // configured sky distance too. Water already has its own colored Beer-Lambert absorption.
+        if (!inWater && pc.fogParams.x > 0.0) {
+            float segmentDistance = payload.hitT < 0.0 ? max(pc.fogParams.w, 0.0) : max(payload.hitT, 0.0);
+            float fogTau = fogOpticalDepth(ro.y, rd.y, segmentDistance);
+            float fogT = exp(-fogTau);
+            float3 fogRadiance = pc.fogColor.xyz * fogScatterWeight(fogTau);
+            if (bounce == 0) {
+                // Directional single scattering is only evaluated for the primary camera segment.
+                fogRadiance += directionalFogRadiance(ro, rd, segmentDistance, fogTau, seed);
+            }
+            L += throughput * fogRadiance;
+            throughput *= fogT;
+        }
 
         if (payload.hitT < 0.0) {
             // world.rmiss writes sky radiance (gradient + sun/moon disc + stars) into payload.albedo. The

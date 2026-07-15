@@ -49,6 +49,8 @@ public struct WorldPush {
     public float4   moonUv;           // vanilla current-moon-phase sprite atlas rect
     public float4   waterParams;      // xyz camera-biome water tint, w wave time (s)
     public float4   waterAnchor;      // xy world-stable wave-domain anchor
+    public float4   fogColor;         // xyz atmospheric in-scattering radiance
+    public float4   fogParams;        // density, height falloff, rebased base height, sky integration distance
     public float4x4 curViewProj;      // forward camera-relative view-projection
     public uint     breakCount;
     public BreakEntry breaking[8];    // Java capacity and breakCount serialization are generated from this

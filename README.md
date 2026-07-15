@@ -22,6 +22,7 @@ changes while the renderer is being built.
 - DLSS Ray Reconstruction support
 - DLSS Frame Generation support (experimental)
 - HDR output
+- Rayleigh/Mie atmospheric scattering and exponential height fog with runtime controls
 - Dynamic entity rendering in the ray-traced scene
 - LabPBR-style material support
 - OMM (Opacity Micro-Map) + SER (Shader Execution Reordering) optimizations
@@ -42,6 +43,21 @@ changes while the renderer is being built.
 3. Put the Caustica jar in your Minecraft `mods` folder.
 4. Launch the game with the Vulkan graphics backend.
 5. Open Video Settings to adjust Caustica's renderer options.
+
+## Building
+
+On Linux x86_64, install Java 25+, CMake, curl, tar, and SHA-256 utilities,
+then run:
+
+```bash
+./build.sh
+```
+
+The script downloads the pinned Vulkan and DLSS SDKs into the ignored
+`third_party/` directory, builds the NGX shim, and writes the mod jar to
+`build/libs/`. Existing `VULKAN_SDK` and `DLSS_SDK` installations are reused
+when they match the required versions. Additional arguments are passed to
+Gradle, for example `./build.sh clean build`.
 
 ## Usage Notes
 
@@ -80,7 +96,7 @@ license terms. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## TODO List
 
-- [ ] Nether/End sky, weather, volumetric fog/clouds
+- [ ] Nether/End sky, weather, volumetric clouds
 - [ ] NRD + FSR for non-NVIDIA GPUs
 - [ ] LOD
 - [ ] ReSTIR

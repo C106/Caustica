@@ -30,6 +30,24 @@
 	"caustica.options.rt.waterWaves": "动态水面",
 	"caustica.options.rt.waterWaves.tooltip": "对水面法线进行动画处理，以显示移动波浪高光。",
 
+	"caustica.options.rt.fog": "高度雾",
+	"caustica.options.rt.fog.tooltip": "在光线追踪世界中启用指数高度雾。",
+
+	"caustica.options.rt.fogDensity": "雾密度",
+	"caustica.options.rt.fogDensity.tooltip": "基准高度处的消光密度。数值越高，雾越浓，可见距离越短。",
+
+	"caustica.options.rt.fogHeightFalloff": "雾高度衰减",
+	"caustica.options.rt.fogHeightFalloff.tooltip": "雾密度随海拔升高而降低的速率。数值越高，雾越集中在基准高度附近。",
+
+	"caustica.options.rt.fogBaseHeight": "雾基准高度",
+	"caustica.options.rt.fogBaseHeight.tooltip": "采用设定雾密度的世界高度。",
+
+	"caustica.options.rt.atmosphericScattering": "大气散射",
+	"caustica.options.rt.atmosphericScattering.tooltip": "启用太阳和月亮穿过高度雾时产生的方向性瑞利散射与米氏散射。",
+
+	"caustica.options.rt.scatteringStrength": "散射强度",
+	"caustica.options.rt.scatteringStrength.tooltip": "缩放太阳和月亮产生的方向性瑞利散射与米氏散射贡献。",
+
 	"caustica.options.rt.hdr": "HDR 输出",
 	"caustica.options.rt.hdr.tooltip": "当显示器支持时，以 HDR (ST.2084/PQ) 而不是 SDR 显示。重启游戏后生效。",
 

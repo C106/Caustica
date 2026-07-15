@@ -59,7 +59,7 @@ public final class CausticaConfig {
             Rt.ENABLED, Rt.Composite.SPP, Rt.Composite.MAX_BOUNCES, Rt.Terrain.ASYNC_DISPATCH_PER_PASS, Rt.Omm.ENABLED,
             Rt.Entities.ENABLED, Rt.Entities.GLOW_ENABLED, Rt.EntityTextures.MAX_TEXTURES, Rt.DlssRr.ENABLED, Rt.Fg.ENABLED,
             Rt.Reflex.ENABLED, Rt.Exposure.MODE, Rt.FrameStats.ENABLED,
-            Rt.Hdr.ENABLED, Ngx.PATH,
+            Rt.Hdr.ENABLED, Rt.Fog.ENABLED, Ngx.PATH,
         };
     }
 
@@ -100,6 +100,12 @@ public final class CausticaConfig {
                 " HDR display output (ST.2084/PQ). When enabled the swapchain is created in PQ automatically\n"
                         + " (falls back to SDR if the surface doesn't advertise it). paper-white-nits / peak-nits\n"
                         + " drive the scene-HDR -> display mapping.");
+        FILE.setComment("fog",
+                " Exponential height fog for the ray-traced world. density controls extinction at base-height;\n"
+                        + " height-falloff controls how quickly fog thins above that height. Set enabled to false\n"
+                        + " to disable the effect without losing the tuned values. atmospheric-scattering adds\n"
+                        + " directional Rayleigh/Mie scattering around the sun and moon; scattering-strength\n"
+                        + " scales that contribution independently of the height-fog extinction.");
     }
 
     private static Path resolveConfigPath() {
@@ -749,6 +755,24 @@ public final class CausticaConfig {
             /** Highlight headroom above paper white, in paper-white-referred units ({@code >= 1}). */
             public static float headroom() {
                 return Math.max(1.0f, PEAK_NITS.value() / Math.max(1.0f, PAPER_WHITE_NITS.value()));
+            }
+        }
+
+        /** Exponential height fog parameters, sampled by the ray-traced composite pass each frame. */
+        public static final class Fog {
+            public static final BooleanSetting ENABLED = bool("caustica.rt.fog", "fog.enabled", true);
+            public static final FloatSetting DENSITY =
+                    clampedFloat("caustica.rt.fog.density", "fog.density", 0.0025f, 0.0f, 0.02f);
+            public static final FloatSetting HEIGHT_FALLOFF =
+                    clampedFloat("caustica.rt.fog.heightFalloff", "fog.height-falloff", 0.025f, 0.0f, 0.1f);
+            public static final IntSetting BASE_HEIGHT =
+                    clampedInt("caustica.rt.fog.baseHeight", "fog.base-height", 64, -64, 320);
+            public static final BooleanSetting ATMOSPHERIC_SCATTERING =
+                    bool("caustica.rt.fog.atmosphericScattering", "fog.atmospheric-scattering", true);
+            public static final FloatSetting SCATTERING_STRENGTH =
+                    clampedFloat("caustica.rt.fog.scatteringStrength", "fog.scattering-strength", 1.0f, 0.0f, 4.0f);
+
+            private Fog() {
             }
         }
     }

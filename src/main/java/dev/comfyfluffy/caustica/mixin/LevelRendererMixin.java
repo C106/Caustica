@@ -3,6 +3,7 @@ package dev.comfyfluffy.caustica.mixin;
 import com.mojang.blaze3d.buffers.GpuBufferSlice;
 import com.mojang.blaze3d.resource.GraphicsResourceAllocator;
 import dev.comfyfluffy.caustica.client.VanillaRenderController;
+import dev.comfyfluffy.caustica.rt.RtComposite;
 import dev.comfyfluffy.caustica.rt.terrain.RtTerrain;
 import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.renderer.LevelRenderer;
@@ -34,6 +35,8 @@ public abstract class LevelRendererMixin {
 			Vector4f fogColor,
 			boolean shouldRenderSky,
 			CallbackInfo ci) {
+		RtComposite.INSTANCE.captureFogColor(fogColor);
+
 		Runnable playerCompiledSectionCallback = this.levelRenderState.playerCompiledSectionCallback;
 		boolean waitingForRtPlayerSection = false;
 		if (VanillaRenderController.rtRuntimeWorkRequested() && playerCompiledSectionCallback != null) {

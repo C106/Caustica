@@ -19,6 +19,7 @@ import dev.comfyfluffy.caustica.rt.gen.WorldPushData.Float3;
 import dev.comfyfluffy.caustica.rt.gen.WorldPushData.Float4;
 import dev.comfyfluffy.caustica.rt.gen.WorldPushData.Int4;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.BiomeColors;
 import net.minecraft.client.renderer.texture.TextureAtlas;
 import net.minecraft.client.renderer.texture.TextureAtlasSprite;
@@ -29,10 +30,12 @@ import net.minecraft.resources.Identifier;
 import net.minecraft.tags.FluidTags;
 import net.minecraft.util.Mth;
 import net.minecraft.world.attribute.EnvironmentAttributes;
+import net.minecraft.world.level.LightLayer;
 import net.minecraft.world.level.MoonPhase;
 import net.minecraft.world.level.material.FluidState;
 import org.joml.Matrix4f;
 import org.joml.Matrix4fc;
+import org.joml.Vector4fc;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
 import org.lwjgl.vulkan.KHRSynchronization2;
@@ -44,6 +47,8 @@ import org.lwjgl.vulkan.VkImageCopy;
 import org.lwjgl.vulkan.VkImageMemoryBarrier2;
 import org.lwjgl.vulkan.VkMemoryBarrier2;
 import org.lwjgl.vulkan.VkSamplerCreateInfo;
+
+import java.lang.ref.WeakReference;
 
 import dev.comfyfluffy.caustica.rt.accel.RtAccel;
 import dev.comfyfluffy.caustica.rt.accel.RtBuffer;
@@ -117,6 +122,22 @@ public final class RtComposite {
     // Finite sun/moon angular sizes let NEE shadow rays sample the light disk (soft, contact-hardening
     // penumbrae). Radii in degrees; the real sun/moon are ~0.27°, but a touch larger reads pleasantly.
     private static final int WATER_ANCHOR_MASK = 4095;
+    private static final float FOG_SKY_DISTANCE = 10_000f;
+    private static final float DEFAULT_FOG_SRGB_R = 0.75f;
+    private static final float DEFAULT_FOG_SRGB_G = 0.85f;
+    private static final float DEFAULT_FOG_SRGB_B = 1.0f;
+    private static final float FOG_SKY_LIGHT_CLOSED = 1f;
+    private static final float FOG_SKY_LIGHT_OPEN = 13f;
+    private static final float FOG_OPENNESS_DARKEN_TAU_SECONDS = 0.35f;
+    private static final float FOG_OPENNESS_BRIGHTEN_TAU_SECONDS = 0.7f;
+    private static final double FOG_OPENNESS_RESET_DISTANCE_SQ = 32.0 * 32.0;
+    private static final float FOG_INDOOR_LOCAL_DENSITY_SCALE = 0.20f;
+    private static final float FOG_INDOOR_AMBIENT_SCALE = 0.10f;
+    private static final Float4 DEFAULT_FOG_COLOR = new Float4(
+            srgbToLinear(DEFAULT_FOG_SRGB_R),
+            srgbToLinear(DEFAULT_FOG_SRGB_G),
+            srgbToLinear(DEFAULT_FOG_SRGB_B),
+            1f);
     private static final Identifier SUN_ID = Identifier.withDefaultNamespace("sun");
     private static final Identifier[] MOON_IDS = createMoonIds();
     // Celestial rotation axis (the pole the sun/moon arc about): perpendicular to the east-west arc,
@@ -265,6 +286,16 @@ public final class RtComposite {
     private double camY;
     private double camZ;
     private boolean frameCaptured;
+    private volatile Float4 fogColor = DEFAULT_FOG_COLOR;
+    // Raw skylight is a stable indoor/outdoor signal (unlike effective light, it does not dim at night).
+    // Smooth the camera-local value so crossing a cave mouth changes the whole-view fog without a hard pop.
+    private WeakReference<ClientLevel> fogOpennessLevel = new WeakReference<>(null);
+    private float fogOpenness = 1f;
+    private long fogOpennessLastNanos;
+    private double fogOpennessCamX;
+    private double fogOpennessCamY;
+    private double fogOpennessCamZ;
+    private boolean fogOpennessInitialized;
     private long celestialUvAtlasHandle;
     private int celestialUvMoonPhase = -1;
     private float sunU0;
@@ -330,6 +361,74 @@ public final class RtComposite {
         camY = cameraY;
         camZ = cameraZ;
         frameCaptured = true;
+    }
+
+    /** Capture vanilla's sRGB fog color as the linear radiance consumed by the path tracer. */
+    public void captureFogColor(Vector4fc color) {
+        if (color == null) {
+            fogColor = DEFAULT_FOG_COLOR;
+            return;
+        }
+        fogColor = new Float4(
+                srgbToLinear(finiteOrDefault(color.x(), DEFAULT_FOG_SRGB_R)),
+                srgbToLinear(finiteOrDefault(color.y(), DEFAULT_FOG_SRGB_G)),
+                srgbToLinear(finiteOrDefault(color.z(), DEFAULT_FOG_SRGB_B)),
+                1f);
+    }
+
+    private static float finiteOrDefault(float value, float fallback) {
+        return Float.isFinite(value) ? Mth.clamp(value, 0f, 1f) : fallback;
+    }
+
+    private static float srgbToLinear(float value) {
+        return value <= 0.04045f
+                ? value / 12.92f
+                : (float) Math.pow((value + 0.055f) / 1.055f, 2.4);
+    }
+
+    /** Camera-local sky openness, smoothed independently of frame rate to avoid whole-view fog pops. */
+    private float updateFogOpenness(ClientLevel level) {
+        float target = 1f;
+        if (level != null && level.dimensionType().hasSkyLight()) {
+            int skyLight = level.getBrightness(LightLayer.SKY, cameraBlockPos);
+            target = smoothstep(FOG_SKY_LIGHT_CLOSED, FOG_SKY_LIGHT_OPEN, skyLight);
+        }
+
+        long now = System.nanoTime();
+        double realElapsedSeconds = fogOpennessLastNanos == 0L
+                ? Double.POSITIVE_INFINITY
+                : Math.max(0.0, (now - fogOpennessLastNanos) * 1.0e-9);
+        double dx = camX - fogOpennessCamX;
+        double dy = camY - fogOpennessCamY;
+        double dz = camZ - fogOpennessCamZ;
+        boolean levelChanged = level != fogOpennessLevel.get();
+        boolean teleported = dx * dx + dy * dy + dz * dz > FOG_OPENNESS_RESET_DISTANCE_SQ;
+        boolean reset = !fogOpennessInitialized || levelChanged || teleported;
+        if (reset) {
+            if (fogOpennessInitialized && (levelChanged || teleported)) {
+                RtDlssRr.INSTANCE.requestHistoryReset();
+            }
+            fogOpenness = target;
+        } else {
+            // A hitch or a long pause must not turn the filtered lighting change into a one-frame fog pop.
+            double elapsedSeconds = Math.min(realElapsedSeconds, 0.1);
+            float tau = target < fogOpenness
+                    ? FOG_OPENNESS_DARKEN_TAU_SECONDS
+                    : FOG_OPENNESS_BRIGHTEN_TAU_SECONDS;
+            float alpha = (float) (1.0 - Math.exp(-elapsedSeconds / tau));
+            fogOpenness += (target - fogOpenness) * alpha;
+        }
+
+        fogOpenness = Math.clamp(fogOpenness, 0f, 1f);
+        if (level != fogOpennessLevel.get()) {
+            fogOpennessLevel = new WeakReference<>(level);
+        }
+        fogOpennessLastNanos = now;
+        fogOpennessCamX = camX;
+        fogOpennessCamY = camY;
+        fogOpennessCamZ = camZ;
+        fogOpennessInitialized = true;
+        return fogOpenness;
     }
 
     /**
@@ -786,6 +885,36 @@ public final class RtComposite {
             // ripple pattern stays fixed in the world as the player moves and the rebase origin shifts.
             Float4 waterAnchor = new Float4(terrain.blockX & WATER_ANCHOR_MASK,
                     terrain.blockZ & WATER_ANCHOR_MASK, 0f, 0f);
+            boolean fogEnabled = CausticaConfig.Rt.Fog.ENABLED.value();
+            float configuredDensity = CausticaConfig.Rt.Fog.DENSITY.value();
+            float heightFalloff = CausticaConfig.Rt.Fog.HEIGHT_FALLOFF.value();
+            int baseHeight = CausticaConfig.Rt.Fog.BASE_HEIGHT.value();
+            float openness = updateFogOpenness(level);
+            float ambientFogScale = fogEnabled
+                    ? FOG_INDOOR_AMBIENT_SCALE + (1f - FOG_INDOOR_AMBIENT_SCALE) * openness
+                    : 1f;
+            double heightExponent = -heightFalloff * (camY - baseHeight);
+            // Work in log space so the CPU-side indoor cap exactly cancels the shader's unbounded
+            // exponential height term, including the most aggressive legal falloff/base-height values.
+            double logIndoorDensityScale = Math.min(0.0,
+                    Math.log(FOG_INDOOR_LOCAL_DENSITY_SCALE) - heightExponent);
+            float indoorDensityScale = (float) Math.exp(logIndoorDensityScale);
+            float densityScale = indoorDensityScale + (1f - indoorDensityScale) * openness;
+            float effectiveDensity = fogEnabled ? configuredDensity * densityScale : 0f;
+            Float4 capturedFogColor = fogColor;
+            float atmosphericScattering = CausticaConfig.Rt.Fog.ATMOSPHERIC_SCATTERING.value()
+                    ? CausticaConfig.Rt.Fog.SCATTERING_STRENGTH.value()
+                    : 0f;
+            Float4 frameFogColor = new Float4(
+                    capturedFogColor.x() * ambientFogScale,
+                    capturedFogColor.y() * ambientFogScale,
+                    capturedFogColor.z() * ambientFogScale,
+                    atmosphericScattering);
+            Float4 fogParams = new Float4(
+                    effectiveDensity,
+                    heightFalloff,
+                    baseHeight - terrain.blockY,
+                    FOG_SKY_DISTANCE);
 
             // Rebuild the TLAS this frame from static section instances merged with dynamic entity
             // instances, bind it into the pipeline's descriptor ring, record the build, then barrier so
@@ -825,6 +954,8 @@ public final class RtComposite {
                     sky.moonUv(),
                     waterParams,
                     waterAnchor,
+                    frameFogColor,
+                    fogParams,
                     mvCurProjView,
                     breaking.length,
                     breaking
@@ -1015,7 +1146,7 @@ public final class RtComposite {
             // is warm amber, silver once high (or zero while it is below the horizon).
             atmosphereTransmittance(moonX, moonY, moonZ, trans);
             float moonStrength = smoothstep(0.04f, 0.22f, -sunY);
-            float litFraction = 1.0f - Math.abs(moonPhase - 4.0f) / 4.0f; // 0 new .. 1 full
+            float litFraction = Math.abs(moonPhase - 4.0f) / 4.0f; // 0 new .. 1 full
             float moonPeak = 0.30f * (0.15f + 0.85f * litFraction);
             lx = moonX; ly = moonY; lz = moonZ;
             rr = 0.30f * moonPeak * moonStrength * trans[0];
@@ -1121,6 +1252,10 @@ public final class RtComposite {
     public void destroy() {
         // Teardown runs after the device is idle (CLIENT_STOPPING waits), so the TLAS ring's slots are no
         // longer in flight and can be freed immediately.
+        fogOpennessLevel.clear();
+        fogOpennessInitialized = false;
+        fogOpennessLastNanos = 0L;
+        fogOpenness = 1f;
         tlasRing.destroy();
         if (RtDlssRr.enabled()) {
             RtDlssRr.INSTANCE.destroy();
