@@ -1,6 +1,8 @@
 package dev.comfyfluffy.caustica.client;
 
 import com.mojang.blaze3d.pipeline.RenderTarget;
+import com.mojang.blaze3d.textures.GpuTexture;
+import com.mojang.blaze3d.textures.GpuTextureView;
 import dev.comfyfluffy.caustica.CausticaMod;
 import dev.comfyfluffy.caustica.rt.RtComposite;
 import dev.comfyfluffy.caustica.rt.RtContext;
@@ -18,11 +20,43 @@ public final class VanillaRenderController {
 	private boolean loggedWaitingForRtPlayerSection;
 	private boolean loggedRtPlayerSectionReady;
 	private boolean rtActive = true;
+	private boolean resizeTransitionFrame;
+	private GpuTexture observedMainColor;
+	private GpuTextureView observedMainColorView;
+	private GpuTexture observedMainDepth;
+	private GpuTextureView observedMainDepthView;
 	private Boolean lastLoggedRtActive;
 	private String inactiveReason;
 	private String lastLoggedInactiveReason;
 
 	private VanillaRenderController() {
+	}
+
+	/**
+	 * Observe the main target at the earliest render-frame boundary. A backing replacement counts as a resize
+	 * transition even when its extent and recycled Vulkan handles are unchanged. Holding RT for this frame also
+	 * coalesces continuous drag-resize events: RT rebuilds once, after the backing identity stays stable.
+	 */
+	public void observeRenderFrame(RenderTarget mainTarget, int windowWidth, int windowHeight) {
+		GpuTexture color = mainTarget != null ? mainTarget.getColorTexture() : null;
+		GpuTextureView colorView = mainTarget != null ? mainTarget.getColorTextureView() : null;
+		GpuTexture depth = mainTarget != null ? mainTarget.getDepthTexture() : null;
+		GpuTextureView depthView = mainTarget != null ? mainTarget.getDepthTextureView() : null;
+		boolean backingReplaced = observedMainColor != null
+				&& (observedMainColor != color || observedMainColorView != colorView
+						|| observedMainDepth != depth || observedMainDepthView != depthView);
+		this.resizeTransitionFrame = backingReplaced
+				|| !hasStableExtent(mainTarget, color, colorView, depth, depthView, windowWidth, windowHeight);
+		if (color != null && colorView != null && depth != null && depthView != null) {
+			this.observedMainColor = color;
+			this.observedMainColorView = colorView;
+			this.observedMainDepth = depth;
+			this.observedMainDepthView = depthView;
+		}
+	}
+
+	public boolean isResizeTransitionFrame() {
+		return this.resizeTransitionFrame;
 	}
 
 	public void beginFrame(RenderTarget mainTarget) {
@@ -100,7 +134,10 @@ public final class VanillaRenderController {
 	}
 
 	public boolean shouldCompositeRt() {
-		return this.rtActive;
+		// Non-resize fallback frames still run composite() so terrain streaming and material-epoch gates can
+		// advance in the background. A resize transition is the one case where touching extent-bound resources
+		// is unsafe and must be skipped entirely.
+		return this.rtActive && !this.resizeTransitionFrame;
 	}
 
 	/** Runtime work switch for per-frame RT work; mirrors {@link RtComposite#enabled()}. */
@@ -127,6 +164,9 @@ public final class VanillaRenderController {
 	}
 
 	private String findInactiveReason(RenderTarget mainTarget) {
+		if (this.resizeTransitionFrame) {
+			return "main render target resize is still in progress";
+		}
 		if (this.failureLatched || RtComposite.INSTANCE.hasFailed()) {
 			return "RT composite failure latch is set";
 		}
@@ -139,15 +179,21 @@ public final class VanillaRenderController {
 		if (RtTerrain.currentOrNull() == null) {
 			return "RT terrain is not ready";
 		}
-		if (mainTarget == null || mainTarget.getColorTexture() == null || mainTarget.getDepthTexture() == null) {
+		if (RtComposite.INSTANCE.requiresVanillaWorldFallback()) {
+			return "RT resources are crossing an epoch boundary";
+		}
+		if (mainTarget == null || mainTarget.getColorTexture() == null || mainTarget.getColorTextureView() == null
+				|| mainTarget.getDepthTexture() == null || mainTarget.getDepthTextureView() == null) {
 			return "main render target textures are not ready";
 		}
 		if (mainTarget.width <= 0 || mainTarget.height <= 0) {
 			return "main render target has zero extent";
 		}
 		var color = mainTarget.getColorTexture();
+		var colorView = mainTarget.getColorTextureView();
 		var depth = mainTarget.getDepthTexture();
-		if (color.isClosed() || depth.isClosed()) {
+		var depthView = mainTarget.getDepthTextureView();
+		if (color.isClosed() || colorView.isClosed() || depth.isClosed() || depthView.isClosed()) {
 			return "main render target textures are closed";
 		}
 		if (color.getWidth(0) != mainTarget.width || color.getHeight(0) != mainTarget.height
@@ -155,6 +201,18 @@ public final class VanillaRenderController {
 			return "main render target resize is still in progress";
 		}
 		return null;
+	}
+
+	private static boolean hasStableExtent(RenderTarget mainTarget, GpuTexture color, GpuTextureView colorView,
+			GpuTexture depth, GpuTextureView depthView, int windowWidth, int windowHeight) {
+		if (mainTarget == null || color == null || colorView == null || depth == null || depthView == null
+				|| windowWidth <= 0 || windowHeight <= 0
+				|| mainTarget.width != windowWidth || mainTarget.height != windowHeight
+				|| color.isClosed() || colorView.isClosed() || depth.isClosed() || depthView.isClosed()) {
+			return false;
+		}
+		return color.getWidth(0) == windowWidth && color.getHeight(0) == windowHeight
+				&& depth.getWidth(0) == windowWidth && depth.getHeight(0) == windowHeight;
 	}
 
 	private void latchFailure(String reason) {

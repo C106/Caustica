@@ -47,6 +47,8 @@ public final class RtSdrPresentPipeline {
     private long boundOutView;
     private long boundSdrView;
     private long boundSampler;
+    private long boundOutGeneration = Long.MIN_VALUE;
+    private long boundSdrGeneration = Long.MIN_VALUE;
     private boolean destroyed;
 
     private RtSdrPresentPipeline(RtContext ctx, long dsl, long pool, long set, long layout, long pipeline) {
@@ -113,8 +115,10 @@ public final class RtSdrPresentPipeline {
     }
 
     /** Bind the destination PQ image (storage) and the SDR source (combined image sampler, GENERAL layout). */
-    public void setImages(long outImageView, long sdrImageView, long sampler) {
-        if (boundOutView == outImageView && boundSdrView == sdrImageView && boundSampler == sampler) {
+    public void setImages(long outImageView, long outGeneration, long sdrImageView, long sdrGeneration,
+            long sampler) {
+        if (boundOutView == outImageView && boundSdrView == sdrImageView && boundSampler == sampler
+                && boundOutGeneration == outGeneration && boundSdrGeneration == sdrGeneration) {
             return;
         }
         try (MemoryStack stack = MemoryStack.stackPush()) {
@@ -133,6 +137,8 @@ public final class RtSdrPresentPipeline {
         boundOutView = outImageView;
         boundSdrView = sdrImageView;
         boundSampler = sampler;
+        boundOutGeneration = outGeneration;
+        boundSdrGeneration = sdrGeneration;
     }
 
     public void dispatch(VkCommandBuffer cmd, int width, int height, float paperWhiteNits) {

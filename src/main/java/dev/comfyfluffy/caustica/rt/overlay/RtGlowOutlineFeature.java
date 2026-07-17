@@ -129,13 +129,24 @@ final class RtGlowOutlineFeature implements RtOverlayFeature {
                     .build(ctx, "glow composite");
         }
         if (maskImage == null || maskImage.width != width || maskImage.height != height) {
+            boolean replaceDescriptorGeneration = maskImage != null;
             if (maskImage != null) {
                 maskImage.destroy();
             }
             maskImage = ctx.createStorageImage(width, height, MASK_FORMAT,
                     "glow outline mask " + width + "x" + height, VK10.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+            if (replaceDescriptorGeneration) {
+                RtOverlayPipelines.StorageImageSet previous = compositeSet;
+                compositeSet = RtOverlayPipelines.storageImageSet(ctx, 1, VK10.VK_SHADER_STAGE_FRAGMENT_BIT,
+                        "glow composite generation");
+                compositeSet.bind(ctx, 0, maskImage.view);
+                previous.destroy(ctx.vk());
+            } else {
+                compositeSet.bind(ctx, 0, maskImage.view);
+            }
+        } else {
+            compositeSet.bind(ctx, 0, maskImage.view);
         }
-        compositeSet.bind(ctx, 0, maskImage.view);
     }
 
     @Override

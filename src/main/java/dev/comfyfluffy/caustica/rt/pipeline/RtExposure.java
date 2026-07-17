@@ -31,6 +31,24 @@ public final class RtExposure {
         return image != null;
     }
 
+    /** Force descriptor rewrites after an extent-dependent trace image generation is replaced while idle. */
+    public void invalidateBindings() {
+        if (pipeline != null) {
+            pipeline.invalidateBindings();
+        }
+    }
+
+    /** Replace persistent exposure descriptors at an idle output-generation boundary. */
+    public void recreatePipeline(RtContext ctx) {
+        if (pipeline == null) {
+            return;
+        }
+        RtExposurePipeline replacement = RtExposurePipeline.create(ctx);
+        RtExposurePipeline previous = pipeline;
+        pipeline = replacement;
+        previous.destroy();
+    }
+
     public void ensureResources(RtContext ctx) {
         if (image == null) {
             image = ctx.createStorageImage(1, 1, VK10.VK_FORMAT_R32_SFLOAT, "display exposure");
@@ -52,12 +70,13 @@ public final class RtExposure {
         logOnce();
     }
 
-    public void record(RtContext ctx, VkCommandBuffer cmd, MemoryStack stack, RtImage traceColor) {
+    public void record(RtContext ctx, VkCommandBuffer cmd, MemoryStack stack, RtImage traceColor,
+            long colorGeneration) {
         if (image == null) {
             throw new IllegalStateException("RT exposure image not created");
         }
         if (mode() == Mode.AUTO) {
-            recordAuto(ctx, cmd, stack, traceColor);
+            recordAuto(ctx, cmd, stack, traceColor, colorGeneration);
             return;
         }
         try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "exposure manual write")) {
@@ -95,11 +114,12 @@ public final class RtExposure {
         return CausticaConfig.Rt.Exposure.clampScale((float) Math.pow(2.0, manualEv()));
     }
 
-    private void recordAuto(RtContext ctx, VkCommandBuffer cmd, MemoryStack stack, RtImage traceColor) {
+    private void recordAuto(RtContext ctx, VkCommandBuffer cmd, MemoryStack stack, RtImage traceColor,
+            long colorGeneration) {
         if (pipeline == null || histogram == null || state == null) {
             throw new IllegalStateException("RT auto exposure resources not created");
         }
-        pipeline.setResources(traceColor.view, histogram, image.view, state);
+        pipeline.setResources(traceColor.view, colorGeneration, histogram, image.view, state);
         try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "exposure histogram clear")) {
             VK10.vkCmdFillBuffer(cmd, histogram.handle, 0, histogram.size, 0);
         }

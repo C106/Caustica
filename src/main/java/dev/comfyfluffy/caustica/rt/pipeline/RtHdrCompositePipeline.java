@@ -22,6 +22,8 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.LongBuffer;
+import java.util.ArrayList;
+import java.util.List;
 
 import dev.comfyfluffy.caustica.rt.RtContext;
 import dev.comfyfluffy.caustica.rt.RtDebugLabels;
@@ -40,19 +42,21 @@ public final class RtHdrCompositePipeline {
 
     private final RtContext ctx;
     private final long descriptorSetLayout;
-    private final long descriptorPool;
-    private final long descriptorSet;
+    private final List<Long> descriptorPools = new ArrayList<>();
+    private long descriptorSet;
     private final long pipelineLayout;
     private final long pipeline;
     private long boundHdrView;
     private long boundOverlayView;
     private long boundSampler;
+    private long boundHdrGeneration = Long.MIN_VALUE;
+    private long boundOverlayGeneration = Long.MIN_VALUE;
     private boolean destroyed;
 
     private RtHdrCompositePipeline(RtContext ctx, long dsl, long pool, long set, long layout, long pipeline) {
         this.ctx = ctx;
         this.descriptorSetLayout = dsl;
-        this.descriptorPool = pool;
+        this.descriptorPools.add(pool);
         this.descriptorSet = set;
         this.pipelineLayout = layout;
         this.pipeline = pipeline;
@@ -113,10 +117,55 @@ public final class RtHdrCompositePipeline {
     }
 
     /** Bind the in-place HDR image (storage) and the overlay (combined image sampler, GENERAL layout). */
-    public void setImages(long hdrImageView, long overlayImageView, long sampler) {
-        if (boundHdrView == hdrImageView && boundOverlayView == overlayImageView && boundSampler == sampler) {
+    public void setImages(long hdrImageView, long overlayImageView, long sampler, long hdrGeneration,
+            long overlayGeneration) {
+        if (boundHdrView == hdrImageView && boundOverlayView == overlayImageView && boundSampler == sampler
+                && boundHdrGeneration == hdrGeneration && boundOverlayGeneration == overlayGeneration) {
             return;
         }
+        if (boundOverlayGeneration != Long.MIN_VALUE && boundOverlayGeneration != overlayGeneration) {
+            allocateFreshDescriptorSet();
+        }
+        writeImages(hdrImageView, overlayImageView, sampler, hdrGeneration, overlayGeneration);
+    }
+
+    /** Force the next bind to rewrite descriptors after an extent-dependent image generation was replaced. */
+    public void invalidateBindings() {
+        boundHdrView = 0L;
+        boundOverlayView = 0L;
+        boundSampler = 0L;
+        boundHdrGeneration = Long.MIN_VALUE;
+        boundOverlayGeneration = Long.MIN_VALUE;
+    }
+
+    private void allocateFreshDescriptorSet() {
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkDescriptorPoolSize.Buffer poolSizes = VkDescriptorPoolSize.calloc(2, stack);
+            poolSizes.get(0).type(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(1);
+            poolSizes.get(1).type(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(1);
+            VkDescriptorPoolCreateInfo dpci = VkDescriptorPoolCreateInfo.calloc(stack).sType$Default()
+                    .maxSets(1).pPoolSizes(poolSizes);
+            LongBuffer pPool = stack.mallocLong(1);
+            check(VK10.vkCreateDescriptorPool(ctx.vk(), dpci, null, pPool),
+                    "vkCreateDescriptorPool(hdr ui composite generation)");
+            long pool = pPool.get(0);
+            descriptorPools.add(pool);
+            RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_POOL, pool,
+                    "hdr ui composite descriptor pool generation " + descriptorPools.size());
+
+            VkDescriptorSetAllocateInfo dsai = VkDescriptorSetAllocateInfo.calloc(stack).sType$Default()
+                    .descriptorPool(pool).pSetLayouts(stack.longs(descriptorSetLayout));
+            LongBuffer pSet = stack.mallocLong(1);
+            check(VK10.vkAllocateDescriptorSets(ctx.vk(), dsai, pSet),
+                    "vkAllocateDescriptorSets(hdr ui composite generation)");
+            descriptorSet = pSet.get(0);
+            RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_SET, descriptorSet,
+                    "hdr ui composite descriptor set generation " + descriptorPools.size());
+        }
+    }
+
+    private void writeImages(long hdrImageView, long overlayImageView, long sampler, long hdrGeneration,
+            long overlayGeneration) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkDescriptorImageInfo.Buffer hdrInfo = VkDescriptorImageInfo.calloc(1, stack);
             hdrInfo.get(0).imageView(hdrImageView).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
@@ -133,6 +182,8 @@ public final class RtHdrCompositePipeline {
         boundHdrView = hdrImageView;
         boundOverlayView = overlayImageView;
         boundSampler = sampler;
+        boundHdrGeneration = hdrGeneration;
+        boundOverlayGeneration = overlayGeneration;
     }
 
     public void dispatch(VkCommandBuffer cmd, int width, int height, float paperWhiteNits) {
@@ -153,7 +204,10 @@ public final class RtHdrCompositePipeline {
         VkDevice vk = ctx.vk();
         VK10.vkDestroyPipeline(vk, pipeline, null);
         VK10.vkDestroyPipelineLayout(vk, pipelineLayout, null);
-        VK10.vkDestroyDescriptorPool(vk, descriptorPool, null);
+        for (long descriptorPool : descriptorPools) {
+            VK10.vkDestroyDescriptorPool(vk, descriptorPool, null);
+        }
+        descriptorPools.clear();
         VK10.vkDestroyDescriptorSetLayout(vk, descriptorSetLayout, null);
         destroyed = true;
     }

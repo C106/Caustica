@@ -66,6 +66,16 @@ public final class RtWorldOverlay {
     private RtImage overlayImage;
     private RtOverlayPipelines.Pipeline uiCompositePipeline;
     private RtOverlayPipelines.StorageImageSet uiCompositeSet;
+    // Every feature owns extent-specific images and replaces their descriptor generation on resize. Keep the
+    // full Blaze3D backing generation here: a resize may replace texture/view objects while returning to the
+    // same logical extent, so width/height alone cannot identify a safe descriptor-update boundary.
+    private boolean extentInitialized;
+    private int extentWidth;
+    private int extentHeight;
+    private Object extentColorTexture;
+    private Object extentColorView;
+    private Object extentDepthTexture;
+    private Object extentDepthView;
 
     private RtWorldOverlay() {
     }
@@ -79,13 +89,20 @@ public final class RtWorldOverlay {
         long frame = RtComposite.frameCounter();
         framePool.beginFrame(frame);
         try {
-            if (failed || main == null || main.getColorTexture() == null || !RtUiOverlay.enabled()) {
+            if (failed || !hasStableBackingExtent(main) || !RtUiOverlay.enabled()) {
                 return;
             }
             RtContext ctx = RtContext.currentOrNull();
             if (ctx == null) {
                 return;
             }
+            if (extentInitialized && backingGenerationChanged(main)) {
+                // RtImage.destroy() is immediate and the feature descriptor generations are replaced. Both
+                // operations are invalid while a prior overlay command buffer can still be in flight. A
+                // same-sized Blaze3D backing replacement is also a new generation and needs this boundary.
+                ctx.waitIdle();
+            }
+            rememberBackingGeneration(main);
             List<RtOverlayFeature> ready = new ArrayList<>(features.size());
             for (RtOverlayFeature f : features) {
                 if (f.prepare(ctx, framePool, main.width, main.height)) {
@@ -95,6 +112,9 @@ public final class RtWorldOverlay {
             if (!ready.isEmpty()) {
                 ensureOverlayBuffer(ctx, main.width, main.height);
                 RenderTarget uiTarget = RtUiOverlay.beginCompositeLayer(main);
+                if (uiTarget == null) {
+                    return;
+                }
                 long targetView = vkImageView(uiTarget.getColorTextureView());
                 if (targetView == 0L) {
                     CausticaMod.LOGGER.warn("World overlay: UI overlay target has no Vulkan image view; skipping");
@@ -108,6 +128,39 @@ public final class RtWorldOverlay {
         } finally {
             framePool.endFrame(frame);
         }
+    }
+
+    private static boolean hasStableBackingExtent(RenderTarget main) {
+        if (main == null || main.width <= 0 || main.height <= 0
+                || main.getColorTexture() == null || main.getColorTextureView() == null
+                || main.getDepthTexture() == null || main.getDepthTextureView() == null) {
+            return false;
+        }
+        var color = main.getColorTexture();
+        var colorView = main.getColorTextureView();
+        var depth = main.getDepthTexture();
+        var depthView = main.getDepthTextureView();
+        return !color.isClosed() && !colorView.isClosed() && !depth.isClosed() && !depthView.isClosed()
+                && color.getWidth(0) == main.width && color.getHeight(0) == main.height
+                && depth.getWidth(0) == main.width && depth.getHeight(0) == main.height;
+    }
+
+    private boolean backingGenerationChanged(RenderTarget main) {
+        return extentWidth != main.width || extentHeight != main.height
+                || extentColorTexture != main.getColorTexture()
+                || extentColorView != main.getColorTextureView()
+                || extentDepthTexture != main.getDepthTexture()
+                || extentDepthView != main.getDepthTextureView();
+    }
+
+    private void rememberBackingGeneration(RenderTarget main) {
+        extentInitialized = true;
+        extentWidth = main.width;
+        extentHeight = main.height;
+        extentColorTexture = main.getColorTexture();
+        extentColorView = main.getColorTextureView();
+        extentDepthTexture = main.getDepthTexture();
+        extentDepthView = main.getDepthTextureView();
     }
 
     private void ensureOverlayBuffer(RtContext ctx, int width, int height) {
@@ -124,13 +177,26 @@ public final class RtWorldOverlay {
                     .build(ctx, "world overlay UI composite");
         }
         if (overlayImage == null || overlayImage.width != width || overlayImage.height != height) {
+            boolean replaceDescriptorGeneration = overlayImage != null;
             if (overlayImage != null) {
                 overlayImage.destroy();
             }
             overlayImage = ctx.createStorageImage(width, height, TARGET_FORMAT,
                     "world overlay " + width + "x" + height, VK10.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+            if (replaceDescriptorGeneration) {
+                // The generation boundary above is idle. Allocate while the previous pool/set is still alive
+                // so even an aggressively recycling driver cannot return the old descriptor handles.
+                RtOverlayPipelines.StorageImageSet previous = uiCompositeSet;
+                uiCompositeSet = RtOverlayPipelines.storageImageSet(ctx, 1, VK10.VK_SHADER_STAGE_FRAGMENT_BIT,
+                        "world overlay UI composite generation");
+                uiCompositeSet.bind(ctx, 0, overlayImage.view);
+                previous.destroy(ctx.vk());
+            } else {
+                uiCompositeSet.bind(ctx, 0, overlayImage.view);
+            }
+        } else {
+            uiCompositeSet.bind(ctx, 0, overlayImage.view);
         }
-        uiCompositeSet.bind(ctx, 0, overlayImage.view);
     }
 
     private void record(RtContext ctx, List<RtOverlayFeature> ready, long targetView, int width, int height) {
@@ -181,6 +247,13 @@ public final class RtWorldOverlay {
             overlayImage = null;
         }
         ctxRef = null;
+        extentInitialized = false;
+        extentWidth = 0;
+        extentHeight = 0;
+        extentColorTexture = null;
+        extentColorView = null;
+        extentDepthTexture = null;
+        extentDepthView = null;
         framePool.destroy();
     }
 

@@ -1,5 +1,7 @@
 package dev.comfyfluffy.caustica.rt;
 
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.Optional;
 
 import org.joml.Vector4f;
@@ -17,6 +19,7 @@ import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.textures.FilterMode;
 
 import net.minecraft.client.Minecraft;
+import dev.comfyfluffy.caustica.client.VanillaRenderController;
 import net.minecraft.client.renderer.BindGroupLayouts;
 import net.minecraft.client.renderer.RenderPipelines;
 
@@ -42,6 +45,9 @@ import net.minecraft.client.renderer.RenderPipelines;
  */
 public final class RtUiOverlay {
     private static final Vector4f TRANSPARENT = new Vector4f(0.0f, 0.0f, 0.0f, 0.0f);
+    // VulkanCommandEncoder keeps two submissions in flight. Keep replaced targets alive beyond that window;
+    // destroyBuffers() then enters them into Blaze3D's own two-submit destruction queue as a second guard.
+    private static final long TARGET_RETIRE_FRAMES = 4L;
 
     /** Fullscreen blit that composites the premultiplied overlay over the destination (premultiplied-over). */
     private static final RenderPipeline COMPOSITE_PIPELINE = RenderPipeline.builder(RenderPipelines.GLOBALS_SNIPPET)
@@ -55,6 +61,15 @@ public final class RtUiOverlay {
             .build();
 
     private static TextureTarget overlay;
+    // TextureTarget's public extent does not identify its backing allocation. Preserve the Java object
+    // generation as well so an in-place/same-size backing replacement is never consumed as the old target.
+    private static Object overlayColorTexture;
+    private static Object overlayColorView;
+    private static Object overlayDepthTexture;
+    private static Object overlayDepthView;
+    private static final Deque<RetiredTarget> retiredTargets = new ArrayDeque<>();
+    private static long frameSerial;
+    private static long overlayGeneration;
     // Kept separate from usedThisFrame: HDR consumes the pending composite before DLSS-FG evaluates, but FG
     // still needs to know that the UI resource was freshly rendered during this frame.
     private static boolean populatedThisFrame;
@@ -64,6 +79,9 @@ public final class RtUiOverlay {
     // the hand/screen-effects redirects in HDR mode, or the GUI). Reset at the start of GameRenderer.render
     // via beginFrame().
     private static boolean overlayClearedThisFrame;
+
+    private record RetiredTarget(long closeAfterFrame, TextureTarget target) {
+    }
 
     private RtUiOverlay() {
     }
@@ -77,12 +95,19 @@ public final class RtUiOverlay {
      * GUI on the normal path.
      */
     public static boolean enabled() {
-        return !compositeFailed && Minecraft.getInstance().isGameLoadFinished();
+        return !compositeFailed && !VanillaRenderController.INSTANCE.isResizeTransitionFrame()
+                && Minecraft.getInstance().isGameLoadFinished();
     }
 
     /** Whether the overlay was freshly populated this frame (for HDR present and DLSS-FG UI input). */
     public static boolean populatedThisFrame() {
-        return populatedThisFrame && overlay != null;
+        return populatedThisFrame && targetBackingMatches(overlay, overlay != null ? overlay.width : 0,
+                overlay != null ? overlay.height : 0);
+    }
+
+    /** Whether this frame's overlay is valid for a consumer with the supplied output extent. */
+    public static boolean populatedThisFrame(int width, int height) {
+        return populatedThisFrame && targetBackingMatches(overlay, width, height);
     }
 
     /** Mark the overlay consumed by the HDR present composite (so it isn't reused next frame). */
@@ -96,6 +121,11 @@ public final class RtUiOverlay {
 
     public static int overlayHeight() {
         return overlay != null ? overlay.height : 0;
+    }
+
+    /** Monotonic identity for the current overlay backing, independent of recycled Vulkan handles. */
+    public static long overlayGeneration() {
+        return overlayGeneration;
     }
 
     /** The overlay color image view, for the HDR composite compute pass (0 if not available). */
@@ -127,7 +157,8 @@ public final class RtUiOverlay {
      * {@code GuiRendererMixin} redirect on the render thread.
      */
     public static RenderTarget beginAndRedirect(RenderTarget main) {
-        return prepare(main);
+        TextureTarget target = prepare(main);
+        return target != null ? target : main;
     }
 
     /**
@@ -140,6 +171,8 @@ public final class RtUiOverlay {
 
     /** Reset the per-frame clear latch. Called at the start of {@code GameRenderer.render} (every frame). */
     public static void beginFrame() {
+        frameSerial++;
+        closeRetiredTargets();
         populatedThisFrame = false;
         usedThisFrame = false;
         overlayClearedThisFrame = false;
@@ -151,6 +184,9 @@ public final class RtUiOverlay {
      * overlay is cleared before the hand (which renders first) and not wiped before the GUI.
      */
     private static TextureTarget prepare(RenderTarget main) {
+        if (!canRedirect(main)) {
+            return null;
+        }
         TextureTarget target = ensureSized(main);
         if (!overlayClearedThisFrame) {
             CommandEncoder enc = RenderSystem.getDevice().createCommandEncoder();
@@ -173,10 +209,14 @@ public final class RtUiOverlay {
      * color+depth (cleared once per frame), matching vanilla where hand and screen effects share the main
      * target's depth without a clear between them. Must be paired with {@link #endOutputRedirect()}.
      */
-    public static void beginOutputRedirect(RenderTarget main) {
+    public static boolean beginOutputRedirect(RenderTarget main) {
         TextureTarget target = prepare(main);
+        if (target == null) {
+            return false;
+        }
         RenderSystem.outputColorTextureOverride = target.getColorTextureView();
         RenderSystem.outputDepthTextureOverride = target.getDepthTextureView();
+        return true;
     }
 
     public static void endOutputRedirect() {
@@ -201,8 +241,7 @@ public final class RtUiOverlay {
         }
         usedThisFrame = false;
         RenderTarget main = Minecraft.getInstance().gameRenderer.mainRenderTarget();
-        if (main == null || main.getColorTextureView() == null
-                || main.width != overlay.width || main.height != overlay.height) {
+        if (!canRedirect(main) || !targetBackingMatches(overlay, main.width, main.height)) {
             return;
         }
         CommandEncoder enc = RenderSystem.getDevice().createCommandEncoder();
@@ -220,17 +259,80 @@ public final class RtUiOverlay {
     }
 
     private static TextureTarget ensureSized(RenderTarget main) {
-        if (overlay == null) {
+        if (overlay == null || overlay.width != main.width || overlay.height != main.height
+                || !canRedirect(overlay) || !overlayBackingGenerationMatches()) {
+            // Do not resize in place. resize() closes the old Java texture/view objects immediately even
+            // though commands recorded earlier in this or a generated frame can still reference them. A
+            // separate generation keeps those handles and their backing allocations alive off-queue.
+            TextureTarget previous = overlay;
             overlay = new TextureTarget("caustica UI overlay", main.width, main.height, true, GpuFormat.RGBA8_UNORM);
-        } else if (overlay.width != main.width || overlay.height != main.height) {
-            // resize() replaces the color/depth textures. Even if another contributor prepared the old target
-            // earlier in this frame, the new allocation has no valid contents and must be cleared before use.
+            overlayGeneration++;
+            rememberOverlayBackingGeneration();
+            if (previous != null) {
+                retiredTargets.addLast(new RetiredTarget(frameSerial + TARGET_RETIRE_FRAMES, previous));
+            }
             populatedThisFrame = false;
             usedThisFrame = false;
             overlayClearedThisFrame = false;
-            overlay.resize(main.width, main.height);
         }
         return overlay;
+    }
+
+    /**
+     * A RenderTarget's public extent changes independently from its backing textures during a GLFW resize.
+     * Rendering a full-size HUD against that transition state can use the wrong viewport/scissor and later
+     * feed a mismatched image to HDR or frame generation. Let vanilla own that transition frame.
+     */
+    public static boolean canRedirect(RenderTarget target) {
+        if (target == null || target.width <= 0 || target.height <= 0) {
+            return false;
+        }
+        var color = target.getColorTexture();
+        var colorView = target.getColorTextureView();
+        if (color == null || colorView == null || color.isClosed() || colorView.isClosed()
+                || color.getWidth(0) != target.width || color.getHeight(0) != target.height) {
+            return false;
+        }
+        if (!target.useDepth) {
+            return true;
+        }
+        var depth = target.getDepthTexture();
+        var depthView = target.getDepthTextureView();
+        return depth != null && depthView != null && !depth.isClosed() && !depthView.isClosed()
+                && depth.getWidth(0) == target.width && depth.getHeight(0) == target.height;
+    }
+
+    private static boolean targetBackingMatches(TextureTarget target, int width, int height) {
+        return target != null && target == overlay && target.width == width && target.height == height
+                && canRedirect(target) && overlayBackingGenerationMatches();
+    }
+
+    private static boolean overlayBackingGenerationMatches() {
+        return overlay != null
+                && overlayColorTexture == overlay.getColorTexture()
+                && overlayColorView == overlay.getColorTextureView()
+                && overlayDepthTexture == overlay.getDepthTexture()
+                && overlayDepthView == overlay.getDepthTextureView();
+    }
+
+    private static void rememberOverlayBackingGeneration() {
+        overlayColorTexture = overlay.getColorTexture();
+        overlayColorView = overlay.getColorTextureView();
+        overlayDepthTexture = overlay.getDepthTexture();
+        overlayDepthView = overlay.getDepthTextureView();
+    }
+
+    private static void forgetOverlayBackingGeneration() {
+        overlayColorTexture = null;
+        overlayColorView = null;
+        overlayDepthTexture = null;
+        overlayDepthView = null;
+    }
+
+    private static void closeRetiredTargets() {
+        while (!retiredTargets.isEmpty() && retiredTargets.peekFirst().closeAfterFrame <= frameSerial) {
+            retiredTargets.removeFirst().target.destroyBuffers();
+        }
     }
 
     public static void destroy() {
@@ -242,6 +344,10 @@ public final class RtUiOverlay {
         if (overlay != null) {
             overlay.destroyBuffers();
             overlay = null;
+        }
+        forgetOverlayBackingGeneration();
+        while (!retiredTargets.isEmpty()) {
+            retiredTargets.removeFirst().target.destroyBuffers();
         }
     }
 }

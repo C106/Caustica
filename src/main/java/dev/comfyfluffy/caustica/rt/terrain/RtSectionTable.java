@@ -193,11 +193,9 @@ final class RtSectionTable {
         return new RtAccel.Instance(xform, geom.blas.deviceAddress, geom.slot);
     }
 
-    /** GPU residency for one section: geometry buffers + BLAS + world section origin. */
+    /** GPU residency for one section: shader attributes + compacted BLAS + world section origin. */
     static final class SectionGeom {
         final long key;
-        final RtBuffer positions;
-        final RtBuffer indices;
         final RtBuffer uvs;
         final RtBuffer material;
         final RtAccel blas;
@@ -208,11 +206,9 @@ final class RtSectionTable {
         int slot = -1;
         int instanceIndex = -1;
 
-        SectionGeom(long key, RtBuffer positions, RtBuffer indices, RtBuffer uvs, RtBuffer material,
+        SectionGeom(long key, RtBuffer uvs, RtBuffer material,
                     RtAccel blas, int[] triBase, int sx, int sy, int sz) {
             this.key = key;
-            this.positions = positions;
-            this.indices = indices;
             this.uvs = uvs;
             this.material = material;
             this.blas = blas;
@@ -226,8 +222,6 @@ final class RtSectionTable {
             blas.destroy();
             material.destroy();
             uvs.destroy();
-            indices.destroy();
-            positions.destroy();
         }
     }
 }

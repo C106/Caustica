@@ -36,14 +36,15 @@ public final class RtDisplayPipeline {
 
     private final RtContext ctx;
     private final long descriptorSetLayout;
-    private final long descriptorPool;
-    private final long descriptorSet;
+    private long descriptorPool;
+    private long descriptorSet;
     private final long pipelineLayout;
     private final long pipeline;
     private long boundOutputView;
     private long boundRtView;
     private long boundExposureView;
     private long boundHdrView;
+    private long boundResourceGeneration = Long.MIN_VALUE;
     private boolean destroyed;
 
     private RtDisplayPipeline(RtContext ctx, long dsl, long pool, long set, long layout, long pipeline) {
@@ -112,9 +113,11 @@ public final class RtDisplayPipeline {
         }
     }
 
-    public void setImages(long outputImageView, long rtImageView, long exposureImageView, long hdrImageView) {
+    public void setImages(long outputImageView, long rtImageView, long exposureImageView, long hdrImageView,
+            long resourceGeneration) {
         if (boundOutputView == outputImageView && boundRtView == rtImageView
-                && boundExposureView == exposureImageView && boundHdrView == hdrImageView) {
+                && boundExposureView == exposureImageView && boundHdrView == hdrImageView
+                && boundResourceGeneration == resourceGeneration) {
             return;
         }
         try (MemoryStack stack = MemoryStack.stackPush()) {
@@ -142,6 +145,51 @@ public final class RtDisplayPipeline {
         boundRtView = rtImageView;
         boundExposureView = exposureImageView;
         boundHdrView = hdrImageView;
+        boundResourceGeneration = resourceGeneration;
+    }
+
+    /**
+     * Replace the descriptor allocation at an idle resource-generation boundary. The set layout and compute
+     * pipeline remain valid; only the pool/set that retained the previous image identities are replaced.
+     */
+    public void reallocateDescriptorSet() {
+        VkDevice vk = ctx.vk();
+        long nextPool = 0L;
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            LongBuffer p = stack.mallocLong(1);
+            VkDescriptorPoolSize.Buffer poolSizes = VkDescriptorPoolSize.calloc(1, stack);
+            poolSizes.get(0).type(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(4);
+            VkDescriptorPoolCreateInfo dpci = VkDescriptorPoolCreateInfo.calloc(stack)
+                    .sType$Default().maxSets(1).pPoolSizes(poolSizes);
+            check(VK10.vkCreateDescriptorPool(vk, dpci, null, p),
+                    "vkCreateDescriptorPool(rt display generation)");
+            nextPool = p.get(0);
+            RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_POOL, nextPool,
+                    "display descriptor pool generation");
+
+            VkDescriptorSetAllocateInfo dsai = VkDescriptorSetAllocateInfo.calloc(stack).sType$Default()
+                    .descriptorPool(nextPool).pSetLayouts(stack.longs(descriptorSetLayout));
+            LongBuffer pSet = stack.mallocLong(1);
+            check(VK10.vkAllocateDescriptorSets(vk, dsai, pSet),
+                    "vkAllocateDescriptorSets(rt display generation)");
+            long nextSet = pSet.get(0);
+            RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_SET, nextSet,
+                    "display descriptor set generation");
+
+            VK10.vkDestroyDescriptorPool(vk, descriptorPool, null);
+            descriptorPool = nextPool;
+            descriptorSet = nextSet;
+            nextPool = 0L;
+            boundOutputView = 0L;
+            boundRtView = 0L;
+            boundExposureView = 0L;
+            boundHdrView = 0L;
+            boundResourceGeneration = Long.MIN_VALUE;
+        } finally {
+            if (nextPool != 0L) {
+                VK10.vkDestroyDescriptorPool(vk, nextPool, null);
+            }
+        }
     }
 
     /**

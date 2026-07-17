@@ -50,6 +50,9 @@ final class RtExposurePipeline {
     private long boundHistogramBufferForResolve;
     private long boundExposureView;
     private long boundStateBuffer;
+    private long boundColorGeneration = Long.MIN_VALUE;
+    private boolean histogramBindingsValid;
+    private boolean resolveBindingsValid;
     private boolean destroyed;
 
     private RtExposurePipeline(RtContext ctx,
@@ -126,8 +129,9 @@ final class RtExposurePipeline {
         }
     }
 
-    void setResources(long colorView, RtBuffer histogram, long exposureView, RtBuffer state) {
-        if (boundColorView != colorView || boundHistogramBufferForHist != histogram.handle) {
+    void setResources(long colorView, long colorGeneration, RtBuffer histogram, long exposureView, RtBuffer state) {
+        if (!histogramBindingsValid || boundColorView != colorView || boundColorGeneration != colorGeneration
+                || boundHistogramBufferForHist != histogram.handle) {
             try (MemoryStack stack = MemoryStack.stackPush()) {
                 VkDescriptorImageInfo.Buffer colorInfo = VkDescriptorImageInfo.calloc(1, stack);
                 colorInfo.get(0).imageView(colorView).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
@@ -141,9 +145,11 @@ final class RtExposurePipeline {
                 VK10.vkUpdateDescriptorSets(ctx.vk(), writes, null);
             }
             boundColorView = colorView;
+            boundColorGeneration = colorGeneration;
             boundHistogramBufferForHist = histogram.handle;
+            histogramBindingsValid = true;
         }
-        if (boundHistogramBufferForResolve != histogram.handle || boundExposureView != exposureView
+        if (!resolveBindingsValid || boundHistogramBufferForResolve != histogram.handle || boundExposureView != exposureView
                 || boundStateBuffer != state.handle) {
             try (MemoryStack stack = MemoryStack.stackPush()) {
                 VkDescriptorBufferInfo.Buffer histInfo = VkDescriptorBufferInfo.calloc(1, stack);
@@ -164,7 +170,14 @@ final class RtExposurePipeline {
             boundHistogramBufferForResolve = histogram.handle;
             boundExposureView = exposureView;
             boundStateBuffer = state.handle;
+            resolveBindingsValid = true;
         }
+    }
+
+    /** Invalidate numeric-handle caches after any bound resource generation is replaced while idle. */
+    void invalidateBindings() {
+        histogramBindingsValid = false;
+        resolveBindingsValid = false;
     }
 
     void dispatchHistogram(org.lwjgl.vulkan.VkCommandBuffer cmd, int width, int height) {

@@ -9,18 +9,19 @@ module world_common;
 // this alias is the single layout switch and generated Java serialization stays in lock-step.
 public typealias ConstPtr<T> = Ptr<T, Access.Read, AddressSpace.Device, Std430DataLayout>;
 
-// Push constant block. Only the first 8 bytes (worldPushAddr) are meaningful to rgen/rchit/rmiss;
-// the hot inline lanes (tableAddr/entityTableAddr/frameIndex) exist so world.rahit's per-hit
-// Section/EntityGeom fetch skips the extra global-memory load of dereferencing WorldPush first.
-public struct PushAddr {
+// Push constant block. The hot inline lanes avoid dereferencing WorldPush for values that are read in
+// hit shaders or used for raygen control flow.
+public struct WorldPushConstants {
     public uint64_t worldPushAddr;
     public uint64_t tableAddr;
     public uint64_t entityTableAddr;
+    public uint64_t materialTableAddr;
     public uint frameIndex;
+    public uint debugView;
 };
 
 // Block-breaking overlay entry: xyz = breaking block position (rebased, same space as gl_WorldRay*),
-// w = bindless entityTex slot of the destroy-stage texture.
+// w = bindless entityAlbedoTex slot of the destroy-stage texture.
 public struct BreakEntry {
     public int4 posSlot;
 };
@@ -31,7 +32,6 @@ public struct WorldPush {
     public float4x4 invViewProj;
     public float3   camOffset;
     public uint64_t tableAddr;        // section table
-    public uint     debugView;
     public uint     frameIndex;
     public float4x4 prevViewProj;
     public float3   camDelta;
@@ -68,9 +68,10 @@ public struct Payload {
     public float  hitT;        // >= 0 on hit, < 0 on miss.
     public float3 motionPrev;  // per-vertex world displacement since last frame.
     public float3 f0;          // specular F0.
-    public uint   flags;       // bits 0..1 material, bit 2 show celestial disc on miss, bit 3 water-entering (hit only).
+    public uint   flags;       // bits 0..1 material, bit 2 celestial, bit 3 water-entering, bits 4..6 emission source.
     public uint   roughMetal;  // packHalf2x16(roughness, metalness)
     public uint   emissionSss; // packHalf2x16(emission, sss)
+    public uint   iorTransmission; // packHalf2x16(IOR, transmission factor)
     public uint   rayCone;     // packHalf2x16(width, spread)
 };
 
@@ -80,6 +81,13 @@ public static const uint PAYLOAD_SHOW_CELESTIAL = 4u;
 // (PAYLOAD_SHOW_CELESTIAL) is only meaningful on a miss and this bit only on a hit, so they never need
 // to be read together, but they get distinct bits anyway to keep the two concerns unambiguous.
 public static const uint PAYLOAD_WATER_ENTERING = 8u;
+public static const uint PAYLOAD_EMISSION_SOURCE_SHIFT = 4u;
+public static const uint PAYLOAD_EMISSION_SOURCE_MASK = 7u;
+public static const uint EMISSION_SOURCE_NONE = 0u;
+public static const uint EMISSION_SOURCE_UNIFORM = 1u;
+public static const uint EMISSION_SOURCE_HEURISTIC = 2u;
+public static const uint EMISSION_SOURCE_LAB_PBR = 3u;
+public static const uint EMISSION_SOURCE_OVERRIDE = 4u;
 
 // Procedural sky / celestial-light modes. Keep these values in lock-step with RtComposite.dimensionMode().
 public static const uint DIMENSION_MODE_OVERWORLD = 0u;
@@ -87,14 +95,57 @@ public static const uint DIMENSION_MODE_NETHER = 1u;
 public static const uint DIMENSION_MODE_END = 2u;
 public static const uint DIMENSION_MODE_GENERIC = 3u;
 
-// Terrain per-triangle record (48 B, stride must match RtTerrain's upload).
-// mat = {roughness, metalness, hasS, hasN} for solid/cutout; TRANSLUCENT-bucket prims repurpose it as
-// a precomputed whole-sprite average color {r,g,b,a} (RtTerrain.emit()/translucentAvgColor).
+public static const uint PAYLOAD_MATERIAL_MASK = 3u;
+public static const uint MATERIAL_OPAQUE = 0u;
+public static const uint MATERIAL_WATER = 1u;
+public static const uint MATERIAL_PARTICLE = 2u;
+public static const uint MATERIAL_GLASS = 3u;
+
+// Entity per-triangle record (48 B). The final lane mirrors TerrainPrim's integer material metadata.
 public struct Prim {
     public float4 normal;
     public float4 tint;
-    public float4 mat;
+    public uint materialId;
+    public uint flags;
+    public uint aux0;
+    public uint aux1;
 };
+
+// Terrain per-triangle record (48 B). The final 16-byte lane contains integer geometry-local metadata;
+// shared surface parameters live once in MaterialHeader instead of being copied into every triangle.
+public struct TerrainPrim {
+    public float4 normal;
+    public float4 tint;
+    public uint materialId;
+    public uint flags;
+    public uint aux0;
+    public uint aux1;
+};
+
+// Compiled material record (80 B). Source-format data has already been decoded into canonical pages;
+// texturePage indexes the dedicated canonical page arrays. materialUv maps sprite-local UV into the packed
+// page, while albedoUv maps the vanilla atlas rectangle back to sprite-local UV.
+public struct MaterialHeader {
+    public uint model;
+    public uint features;        // low feature bits; bits 24..31 = maximum valid material-page LOD
+    public uint texturePage;
+    public uint extensionOffset; // zero when no optional extension record is present
+    public float4 materialUv; // packed-page uvMin.xy + uvExtent.xy
+    public float4 albedoUv;   // vanilla atlas uvMin.xy + inverse uvExtent.xy
+    public float4 params;  // roughness, metalness, IOR, transmission
+    public float4 average; // whole-sprite linear-input average RGBA for translucent shadow filtering
+};
+
+public static const uint MATERIAL_FEATURE_SPEC = 1u;
+public static const uint MATERIAL_FEATURE_NORMAL = 2u;
+public static const uint MATERIAL_FEATURE_HEURISTIC_EMISSION = 4u;
+public static const uint MATERIAL_FEATURE_OVERRIDE_EMISSION = 8u;
+public static const uint MATERIAL_FEATURE_STOCHASTIC_ALPHA = 16u;
+public static const uint MATERIAL_EMISSION_STRENGTH_SHIFT = 8u;
+public static const uint MATERIAL_EMISSION_STRENGTH_MASK = 255u;
+public static const float MATERIAL_MAX_OVERRIDE_EMISSION_STRENGTH = 4.0;
+public static const uint MATERIAL_MAX_LOD_SHIFT = 24u;
+public static const uint MATERIAL_MAX_LOD_MASK = 255u;
 
 // Per-section geometry record: packed buffer addresses + per-bucket triangle offsets
 // (gl_PrimitiveID restarts at 0 per geometry, so hit shaders re-add triBase[geometryIndex]).

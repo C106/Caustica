@@ -570,11 +570,11 @@ public final class CausticaConfig {
             // External keys retain their historical "per-tick" names for config compatibility; terrain
             // streaming is render-pass driven and these Java names reflect the actual scheduling unit.
             public static final IntSetting ASYNC_DISPATCH_PER_PASS =
-                    intAtLeast("caustica.rt.asyncDispatchPerTick", "terrain.async-dispatch-per-tick", 64, 0);
+                    intAtLeast("caustica.rt.asyncDispatchPerTick", "terrain.async-dispatch-per-tick", 32, 0);
             public static final IntSetting COMPLETION_RESULTS_PER_PASS =
-                    intAtLeast("caustica.rt.sectionResultsPerTick", "terrain.section-results-per-tick", 64, 0);
+                    intAtLeast("caustica.rt.sectionResultsPerTick", "terrain.section-results-per-tick", 32, 0);
             public static final IntSetting MAX_INFLIGHT_SECTIONS =
-                    intAtLeast("caustica.rt.maxInflightSections", "terrain.max-inflight-sections", 128, 0);
+                    intAtLeast("caustica.rt.maxInflightSections", "terrain.max-inflight-sections", 64, 0);
             public static final IntSetting SECTION_TABLE_INITIAL_CAPACITY =
                     intAtLeast("caustica.rt.sectionTableInitialCapacity", "terrain.section-table-initial-capacity", 512, 1);
             public static final IntSetting REBASE_DISTANCE_BLOCKS =
@@ -602,8 +602,15 @@ public final class CausticaConfig {
                     bool("caustica.rt.glow", "entities.glow.enabled", true);
             public static final BooleanSetting NAME_TAGS_ENABLED =
                     bool("caustica.rt.nameTags", "entities.name-tags.enabled", true);
-            public static final IntSetting MAX_ENTITIES =
-                    intAtLeast("caustica.rt.maxEntities", "entities.max-entities", 1024, 1);
+            /** Debug-only: render each model submission twice and require bitwise-identical CPU captures. */
+            public static final BooleanSetting CAPTURE_PARITY =
+                    bool("caustica.rt.entityCaptureParity", "entities.debug.capture-parity", false);
+            public static final IntSetting MAX_ORDINARY_ENTITIES =
+                    intAtLeast("caustica.rt.maxOrdinaryEntities", "entities.max-ordinary-entities", 1024, 0);
+            public static final IntSetting MAX_BLOCK_ENTITIES =
+                    intAtLeast("caustica.rt.maxBlockEntities", "entities.block-entities.max-entities", 1024, 0);
+            public static final IntSetting MAX_PARTICLES =
+                    intAtLeast("caustica.rt.maxParticles", "particles.max-particles", 1024, 0);
             public static final IntSetting BE_VIEW_CHUNKS =
                     intAtLeast("caustica.rt.beViewChunks", "entities.block-entities.view-chunks", 8, 0);
             public static final IntSetting BE_BUILDS_PER_FRAME =
@@ -614,16 +621,18 @@ public final class CausticaConfig {
             private Entities() {
             }
 
-            public static int entityListCapacity() {
-                return Math.max(16, MAX_ENTITIES.value());
+            public static int maxEntities() {
+                return Math.addExact(Math.addExact(
+                        MAX_ORDINARY_ENTITIES.value(), MAX_BLOCK_ENTITIES.value()), MAX_PARTICLES.value());
             }
 
-            public static int entityBufferListCapacity() {
-                return (int) Math.min(Integer.MAX_VALUE, (long) entityListCapacity() * 5L);
+            public static int entityListCapacity() {
+                return Math.max(16, maxEntities());
             }
 
             public static int entityMapCapacity() {
-                return (int) Math.min(Integer.MAX_VALUE, Math.max(16L, (long) MAX_ENTITIES.value() * 2L));
+                // Fastutil expected-size constructors apply their own load-factor headroom.
+                return Math.max(16, MAX_ORDINARY_ENTITIES.value());
             }
         }
 
@@ -726,6 +735,21 @@ public final class CausticaConfig {
             public static final BooleanSetting ENABLED = bool("caustica.rt.frameStats", "frame-stats.enabled", false);
 
             private FrameStats() {
+            }
+        }
+
+        /** Startup Vulkan inventory + {@code VK_EXT_device_fault} reporting on device loss. See {@code VulkanDiagnostics}. */
+        public static final class Diagnostics {
+            /** Heavy driver-side crash diagnostics: vendor diagnostics-config extensions (shader debug
+             * info, resource tracking, automatic checkpoints, shader error reporting) and the
+             * {@code deviceFaultVendorBinary} feature (vendor-format crash dump on device loss). Off by
+             * default: measured ~10x BLAS build time / -20% fps when enabled. Plain {@code deviceFault}
+             * reporting (fault addresses + vendor records) is always on and unaffected. Turn on only
+             * while chasing a live device-loss crash. */
+            public static final BooleanSetting HEAVY_CRASH_DIAGNOSTICS =
+                    bool("caustica.rt.heavyCrashDiagnostics", "diagnostics.heavy-crash-diagnostics", false);
+
+            private Diagnostics() {
             }
         }
 

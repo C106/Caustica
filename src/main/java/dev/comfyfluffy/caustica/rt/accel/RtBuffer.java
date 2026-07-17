@@ -1,5 +1,6 @@
 package dev.comfyfluffy.caustica.rt.accel;
 
+import dev.comfyfluffy.caustica.rt.VulkanDiagnostics;
 import org.lwjgl.util.vma.Vma;
 
 /**
@@ -22,7 +23,8 @@ public final class RtBuffer {
     private final long vma;
     private boolean destroyed;
 
-    public RtBuffer(long vma, long handle, long allocation, long deviceAddress, long mapped, long size, int usage, boolean hostVisible) {
+    public RtBuffer(long vma, long handle, long allocation, long deviceAddress, long mapped, long size, int usage,
+                    boolean hostVisible, String label) {
         this.vma = vma;
         this.handle = handle;
         this.allocation = allocation;
@@ -31,10 +33,12 @@ public final class RtBuffer {
         this.size = size;
         this.usage = usage;
         this.hostVisible = hostVisible;
+        VulkanDiagnostics.registerBuffer(deviceAddress, size, handle, label);
     }
 
     public void destroy() {
         if (!destroyed && handle != 0L) {
+            VulkanDiagnostics.unregisterBuffer(deviceAddress, handle);
             Vma.vmaDestroyBuffer(vma, handle, allocation);
             destroyed = true;
         }

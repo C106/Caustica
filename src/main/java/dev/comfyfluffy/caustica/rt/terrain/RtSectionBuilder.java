@@ -3,10 +3,21 @@ package dev.comfyfluffy.caustica.rt.terrain;
 import dev.comfyfluffy.caustica.rt.RtContext;
 import dev.comfyfluffy.caustica.rt.accel.RtAccel;
 import dev.comfyfluffy.caustica.rt.accel.RtBuffer;
-import dev.comfyfluffy.caustica.rt.material.RtBlockMaterials;
+import dev.comfyfluffy.caustica.rt.material.RtMaterialAbi;
 import dev.comfyfluffy.caustica.rt.terrain.RtTerrainMesher.PackedSection;
-import net.minecraft.client.renderer.texture.TextureAtlasSprite;
+import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
+import org.lwjgl.vulkan.VK10;
+import org.lwjgl.vulkan.VkBufferCopy;
+import org.lwjgl.vulkan.VkCommandBuffer;
+import org.lwjgl.vulkan.VkDependencyInfo;
+import org.lwjgl.vulkan.VkMemoryBarrier2;
+
+import static org.lwjgl.vulkan.KHRSynchronization2.VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+import static org.lwjgl.vulkan.KHRSynchronization2.VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+import static org.lwjgl.vulkan.KHRSynchronization2.vkCmdPipelineBarrier2KHR;
+import static org.lwjgl.vulkan.VK13.VK_ACCESS_2_TRANSFER_WRITE_BIT;
+import static org.lwjgl.vulkan.VK13.VK_PIPELINE_STAGE_2_TRANSFER_BIT;
 
 /** Worker-owned terrain buffer allocation/fill and BLAS preparation. */
 final class RtSectionBuilder {
@@ -17,46 +28,56 @@ final class RtSectionBuilder {
     static PreparedSection prepare(RtContext ctx, PackedSection packed,
                                    RtAccel.OpacityMicromapInput ommInput,
                                    long key, int sox, int soy, int soz) {
+        RtMaterialAbi.requireTriangleParity(packed.material().length, packed.indices().length);
         int vertCount = packed.positions().length / 3;
-        int asInput = org.lwjgl.vulkan.KHRAccelerationStructure.VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
-        int storage = org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        int asInput = org.lwjgl.vulkan.KHRAccelerationStructure
+                .VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+        int storage = VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
         String label = "terrain section " + sox + "," + soy + "," + soz;
-        // Terrain sections are long-lived and stream only as the residency window changes. Keep their
-        // resources as direct VMA allocations so an eviction returns the allocation to VMA instead of
-        // retaining the peak render-distance working set in the per-frame buffer cache.
+        // Resident geometry is device-local. A single mapped staging allocation exists only until
+        // the async copy/build completes, avoiding a render-distance-sized host-visible working set.
         RtBuffer positions = null;
         RtBuffer indices = null;
         RtBuffer uvs = null;
         RtBuffer material = null;
+        RtBuffer upload = null;
         RtAccel.PreparedBlas blas = null;
         try {
-            positions = ctx.createAsyncBuffer((long) packed.positions().length * Float.BYTES, asInput, true,
-                    label + " positions");
-            indices = ctx.createAsyncBuffer((long) packed.indices().length * Integer.BYTES, asInput | storage, true,
-                    label + " indices");
-            uvs = ctx.createAsyncBuffer((long) packed.uvs().length * Float.BYTES, storage, true,
-                    label + " uvs");
-            material = ctx.createAsyncBuffer((long) packed.material().length * Float.BYTES, storage, true,
-                    label + " material");
+            long positionsBytes = (long) packed.positions().length * Float.BYTES;
+            long indicesBytes = (long) packed.indices().length * Integer.BYTES;
+            long uvsBytes = (long) packed.uvs().length * Float.BYTES;
+            long materialBytes = (long) packed.material().length * Float.BYTES;
+            int transferDst = VK10.VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 
-            MemoryUtil.memFloatBuffer(positions.mapped, packed.positions().length).put(packed.positions());
-            MemoryUtil.memIntBuffer(indices.mapped, packed.indices().length).put(packed.indices());
-            MemoryUtil.memFloatBuffer(uvs.mapped, packed.uvs().length).put(packed.uvs());
-            MemoryUtil.memFloatBuffer(material.mapped, packed.material().length).put(packed.material());
-            positions.flush();
-            indices.flush();
-            uvs.flush();
-            material.flush();
+            positions = ctx.createAsyncBuffer(positionsBytes, asInput | transferDst, false,
+                    label + " positions");
+            indices = ctx.createAsyncBuffer(indicesBytes, asInput | transferDst, false,
+                    label + " indices");
+            uvs = ctx.createAsyncBuffer(uvsBytes, storage | transferDst, false, label + " uvs");
+            material = ctx.createAsyncBuffer(materialBytes, storage | transferDst, false, label + " material");
+            upload = ctx.createUploadBuffer(positionsBytes + indicesBytes + uvsBytes + materialBytes,
+                    label + " upload");
+
+            long cursor = upload.mapped;
+            MemoryUtil.memFloatBuffer(cursor, packed.positions().length).put(packed.positions());
+            cursor += positionsBytes;
+            MemoryUtil.memIntBuffer(cursor, packed.indices().length).put(packed.indices());
+            cursor += indicesBytes;
+            MemoryUtil.memFloatBuffer(cursor, packed.uvs().length).put(packed.uvs());
+            cursor += uvsBytes;
+            MemoryUtil.memFloatBuffer(cursor, packed.material().length).put(packed.material());
+            upload.flush();
 
             blas = RtAccel.prepareTerrainBlas(ctx, positions, vertCount, indices,
                     packed.bucketTris(), ommInput, label + " BLAS");
-            return new PreparedSection(key, positions, indices, uvs, material, blas,
-                    packed.triBase(), packed.materialSprites(), sox, soy, soz);
+            return new PreparedSection(key, positions, indices, uvs, material, upload, blas,
+                    packed.triBase(), sox, soy, soz);
         } catch (Throwable t) {
             if (blas != null) {
-                destroy(new PreparedSection(key, positions, indices, uvs, material, blas,
-                        packed.triBase(), packed.materialSprites(), sox, soy, soz));
+                destroy(new PreparedSection(key, positions, indices, uvs, material, upload, blas,
+                        packed.triBase(), sox, soy, soz));
             } else {
+                if (upload != null) upload.destroy();
                 if (material != null) material.destroy();
                 if (uvs != null) uvs.destroy();
                 if (indices != null) indices.destroy();
@@ -66,24 +87,40 @@ final class RtSectionBuilder {
         }
     }
 
-    /** Patch primitive records' hasS/hasN lanes via render-thread material ingestion. */
-    static void resolveMaterials(PreparedSection prepared) {
-        for (int t = 0; t < prepared.materialSprites.length; t++) {
-            TextureAtlasSprite sprite = prepared.materialSprites[t];
-            if (sprite == null) {
-                continue;
-            }
-            int flags = RtBlockMaterials.INSTANCE.ensure(sprite);
-            long base = prepared.material.mapped + ((long) t * 12 + 10) * Float.BYTES;
-            MemoryUtil.memPutFloat(base, (flags & RtBlockMaterials.HAS_S) != 0 ? 1f : 0f);
-            MemoryUtil.memPutFloat(base + Float.BYTES, (flags & RtBlockMaterials.HAS_N) != 0 ? 1f : 0f);
+    /** Copy the packed staging allocation into device-local section buffers before the BLAS build. */
+    static void recordUpload(VkCommandBuffer cmd, PreparedSection prepared) {
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkBufferCopy.Buffer region = VkBufferCopy.calloc(1, stack);
+            long srcOffset = 0L;
+            copy(cmd, prepared.upload, prepared.positions, srcOffset, region);
+            srcOffset += prepared.positions.size;
+            copy(cmd, prepared.upload, prepared.indices, srcOffset, region);
+            srcOffset += prepared.indices.size;
+            copy(cmd, prepared.upload, prepared.uvs, srcOffset, region);
+            srcOffset += prepared.uvs.size;
+            copy(cmd, prepared.upload, prepared.material, srcOffset, region);
+
+            VkMemoryBarrier2.Buffer barrier = VkMemoryBarrier2.calloc(1, stack);
+            barrier.get(0).sType$Default()
+                    .srcStageMask(VK_PIPELINE_STAGE_2_TRANSFER_BIT)
+                    .srcAccessMask(VK_ACCESS_2_TRANSFER_WRITE_BIT)
+                    .dstStageMask(VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR)
+                    .dstAccessMask(VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR);
+            VkDependencyInfo dependency = VkDependencyInfo.calloc(stack).sType$Default().pMemoryBarriers(barrier);
+            vkCmdPipelineBarrier2KHR(cmd, dependency);
         }
-        prepared.material.flush();
+    }
+
+    private static void copy(VkCommandBuffer cmd, RtBuffer upload, RtBuffer destination,
+                             long srcOffset, VkBufferCopy.Buffer region) {
+        region.get(0).srcOffset(srcOffset).dstOffset(0L).size(destination.size);
+        VK10.vkCmdCopyBuffer(cmd, upload.handle, destination.handle, region);
     }
 
     static void destroy(PreparedSection prepared) {
         RtAccel.freeBlasScratch(java.util.List.of(prepared.blas));
         prepared.blas.accel.destroy();
+        prepared.upload.destroy();
         prepared.material.destroy();
         prepared.uvs.destroy();
         prepared.indices.destroy();
@@ -92,7 +129,20 @@ final class RtSectionBuilder {
 
     /** Worker-owned native section state paired with its prepared BLAS. */
     record PreparedSection(long key, RtBuffer positions, RtBuffer indices, RtBuffer uvs,
-                           RtBuffer material, RtAccel.PreparedBlas blas, int[] triBase,
-                           TextureAtlasSprite[] materialSprites, int sx, int sy, int sz) {
+                           RtBuffer material, RtBuffer upload, RtAccel.PreparedBlas blas, int[] triBase,
+                           int sx, int sy, int sz) {
+        void releaseUpload() {
+            upload.destroy();
+        }
+
+        void releaseBuildInputs() {
+            indices.destroy();
+            positions.destroy();
+        }
+
+        PreparedSection withBlas(RtAccel.PreparedBlas replacement) {
+            return new PreparedSection(key, positions, indices, uvs, material, upload, replacement,
+                    triBase, sx, sy, sz);
+        }
     }
 }

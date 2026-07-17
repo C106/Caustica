@@ -262,9 +262,8 @@ public abstract class VulkanGpuSurfaceMixin {
 		// misdisplay (SDR bytes reinterpreted as PQ codes). Convert sRGB -> PQ at paper white instead. Falls
 		// through to vanilla SDR if conversion resources aren't ready or the source view is not a Vulkan view.
 		if (rt.isPqSdrPresentActive()) {
-			long sdrView = caustica$vkImageView(textureView);
-			if (sdrView != 0L && rt.presentSdrToPq((VulkanCommandEncoder) commandEncoder, swapchainImage,
-					this.swapchainWidth, this.swapchainHeight, sdrView, acquireSem, presentSem)) {
+			if (rt.presentSdrToPq((VulkanCommandEncoder) commandEncoder, swapchainImage,
+					this.swapchainWidth, this.swapchainHeight, textureView, acquireSem, presentSem)) {
 				ci.cancel();
 			}
 		}

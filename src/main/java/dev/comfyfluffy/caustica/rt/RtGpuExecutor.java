@@ -347,6 +347,10 @@ public final class RtGpuExecutor {
         boolean submitted = false;
         boolean completed = false;
         long signalValue = batch.get(batch.size() - 1).build.value;
+        long firstValue = batch.get(0).build.value;
+        VulkanDiagnostics.setInFlight("async-compute",
+                "recording builds=" + firstValue + ".." + signalValue + " batch=" + batch.size()
+                        + " queued=" + jobs.size());
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkCommandBufferAllocateInfo ai = VkCommandBufferAllocateInfo.calloc(stack).sType$Default()
                     .commandPool(commandPool).level(VK10.VK_COMMAND_BUFFER_LEVEL_PRIMARY).commandBufferCount(1);
@@ -367,11 +371,15 @@ public final class RtGpuExecutor {
                     .stageMask(VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR);
             VkSubmitInfo2.Buffer submit = VkSubmitInfo2.calloc(1, stack).sType$Default()
                     .pCommandBufferInfos(command).pSignalSemaphoreInfos(signal);
+            VulkanDiagnostics.noteQueueSubmission(computeQueue.vkQueue(), "async-compute terrain builds");
             RtContext.check(org.lwjgl.vulkan.KHRSynchronization2.vkQueueSubmit2KHR(
                     computeQueue.vkQueue(), submit, 0L), "vkQueueSubmit2KHR(RT GPU executor)");
             submitted = true;
+            VulkanDiagnostics.setInFlight("async-compute",
+                    "submitted builds=" + firstValue + ".." + signalValue + " batch=" + batch.size());
             waitTimeline(buildTimeline, signalValue);
             completed = true;
+            VulkanDiagnostics.breadcrumb("async-compute completed buildTimeline=" + signalValue);
         } finally {
             // Never retry a failed host wait while unwinding: propagate its original error. A command
             // buffer is safe to release here only if submission never happened or completion was observed.
@@ -380,6 +388,9 @@ public final class RtGpuExecutor {
                 try (MemoryStack stack = MemoryStack.stackPush()) {
                     VK10.vkFreeCommandBuffers(ctx.vk(), commandPool, stack.pointers(cmd));
                 }
+            }
+            if (!submitted || completed) {
+                VulkanDiagnostics.setInFlight("async-compute", null);
             }
         }
     }

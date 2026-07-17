@@ -12,10 +12,10 @@
 // water/translucent branches that write shadowVis run only from shadow SBT records.
 import world_common;
 
-[[vk::push_constant]] PushAddr pcAddr;
+[[vk::push_constant]] WorldPushConstants pc;
 
-[[vk::binding(2, 0)]] Sampler2D blockAtlas;
-[[vk::binding(0, 1)]] Sampler2D entityTex[];
+[[vk::binding(2, 0)]] Sampler2D blockAlbedoAtlas;
+[[vk::binding(0, 1)]] Sampler2D entityAlbedoTex[];
 
 static const float ALPHA_CUTOFF = 0.5;        // terrain (matches the cutout block models)
 static const float ENTITY_ALPHA_CUTOFF = 0.1; // entities: only discard near-fully-transparent texels
@@ -43,7 +43,7 @@ static const float ALPHA_DITHER_8X8[64] = {
 float alphaDitherThreshold(uint salt) {
     uint2 p = (DispatchRaysIndex().xy + uint2(salt * 3u, salt * 5u)) & uint2(7u, 7u);
     float base = ALPHA_DITHER_8X8[int(p.y * 8u + p.x)];
-    return frac(base + float((pcAddr.frameIndex + salt) & 255u) * 0.61803398875);
+    return frac(base + float((pc.frameIndex + salt) & 255u) * 0.61803398875);
 }
 
 [shader("anyhit")]
@@ -52,8 +52,9 @@ void main(inout float4 shadowVis, in BuiltInTriangleIntersectionAttributes attr)
     float2 attribs = attr.barycentrics;
     float3 bary = float3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
 
-    if ((InstanceID() & (ENTITY_BIT | PARTICLE_BIT)) != 0u) {
-        EntityGeom g = ConstPtr<EntityGeom>(pcAddr.entityTableAddr)[InstanceID() & IDX_MASK];
+    uint instanceKind = InstanceID() & (ENTITY_BIT | PARTICLE_BIT);
+    if (instanceKind != 0u) {
+        EntityGeom g = ConstPtr<EntityGeom>(pc.entityTableAddr)[InstanceID() & IDX_MASK];
         ConstPtr<uint> indices = ConstPtr<uint>(g.idxAddr);
         ConstPtr<float2> uvs = ConstPtr<float2>(g.uvAddr);
         uint i0 = indices[3u * pid + 0u];
@@ -62,32 +63,51 @@ void main(inout float4 shadowVis, in BuiltInTriangleIntersectionAttributes attr)
         float2 uv = bary.x * uvs[i0] + bary.y * uvs[i1] + bary.z * uvs[i2];
         Prim epr = ConstPtr<Prim>(g.primAddr)[pid];
         int texSlot = int(epr.tint.w + 0.5);
-        float ealpha = entityTex[NonUniformResourceIndex(texSlot)].SampleLevel(uv, 0.0).a;
-        // normal.w flags an alpha-blended (translucent) surface — slime / sulfur-cube shells, ghosts, …
-        // (set by RtEntityCapture; 0 for opaque/cutout mobs + particles, which keep the binary cutout).
-        if (epr.normal.w > 0.5) {
+        float4 texel = entityAlbedoTex[NonUniformResourceIndex(texSlot)].SampleLevel(uv, 0.0);
+        bool stochasticAlpha = false;
+        MaterialHeader materialHeader;
+        if (instanceKind == ENTITY_BIT) {
+            materialHeader = ConstPtr<MaterialHeader>(pc.materialTableAddr)[epr.materialId];
+            stochasticAlpha = (materialHeader.features & MATERIAL_FEATURE_STOCHASTIC_ALPHA) != 0u;
+        }
+        if (stochasticAlpha) {
             uint salt = pid * 1664525u
                     ^ (InstanceID() & IDX_MASK) * 1013904223u
                     ^ asuint(RayTCurrent());
-            if (alphaDitherThreshold(salt) >= clamp(ealpha, 0.0, 1.0)) {
+            if (alphaDitherThreshold(salt) >= clamp(texel.a, 0.0, 1.0)) {
                 IgnoreHit();
             }
-            return;
+        } else if (texel.a < ENTITY_ALPHA_CUTOFF) {
+            IgnoreHit();
         }
-        if (ealpha < ENTITY_ALPHA_CUTOFF) {
+
+        // Radiance rays accept the surface and continue to closest-hit. Shadow rays use the same material
+        // model here so entity dielectrics transmit instead of becoming opaque shadow blockers.
+        bool shadowRay = (RayFlags() & RAY_FLAG_SKIP_CLOSEST_HIT_SHADER) != 0u;
+        if (instanceKind == ENTITY_BIT && shadowRay && materialHeader.model == MATERIAL_GLASS) {
+            float3 tint = lerp(float3(1.0, 1.0, 1.0),
+                    srgbToLinear(texel.rgb) * epr.tint.rgb, texel.a);
+            shadowVis.rgb *= tint * clamp(materialHeader.params.w, 0.0, 1.0);
+            IgnoreHit();
+        }
+        if (instanceKind == ENTITY_BIT && shadowRay && materialHeader.model == MATERIAL_WATER) {
+            float3 tint = srgbToLinear(texel.rgb) * epr.tint.rgb;
+            shadowVis.rgb *= lerp(float3(1.0, 1.0, 1.0), tint, WATER_SHADOW_TINT)
+                    * clamp(materialHeader.params.w, 0.0, 1.0);
+            shadowVis.a = shadowVis.a < 0.0 ? RayTCurrent() : min(shadowVis.a, RayTCurrent());
             IgnoreHit();
         }
         return;
     }
 
-    Section sec = ConstPtr<Section>(pcAddr.tableAddr)[InstanceID()];
+    Section sec = ConstPtr<Section>(pc.tableAddr)[InstanceID()];
     uint bucket = GeometryIndex();
     uint tri = pid + sec.triBase[bucket];
 
     // Water radiance rays use a closest-hit-only SBT record. Shadow rays run this record: tint sunlight by
     // the biome water color, then keep walking so submerged terrain is lit by colored transmission.
     if (bucket == BUCKET_WATER) {
-        Prim pr = ConstPtr<Prim>(sec.primAddr)[tri];
+        TerrainPrim pr = ConstPtr<TerrainPrim>(sec.primAddr)[tri];
         shadowVis.rgb *= lerp(float3(1.0, 1.0, 1.0), pr.tint.rgb, WATER_SHADOW_TINT);
         // Record the NEAREST water crossing (any-hit order is arbitrary) in the otherwise-unused alpha
         // lane. For an underwater shading point this is the exit point of its sun shadow ray, where
@@ -98,21 +118,23 @@ void main(inout float4 shadowVis, in BuiltInTriangleIntersectionAttributes attr)
 
     // Translucent radiance rays use a closest-hit-only SBT record; shadow rays tint and pass through here.
     // This doesn't touch the atlas at all: a shadow ray only needs the pane's overall tint/opacity, so
-    // pr.mat carries a precomputed whole-sprite average {r,g,b,a} with biome tint baked in at pack time
-    // (RtTerrain.emit()/translucentAvgColor) — one 16-byte mat lane, no scattered UV gather.
+    // MaterialHeader carries a precomputed whole-sprite average {r,g,b,a}; per-primitive biome tint is
+    // applied here. The average is compiled once per resource epoch rather than copied per triangle.
     //
     // Modeled as Beer-Lambert absorption (matching the water medium in world.rgen): a per-channel
     // extinction derived from how dark the average is, scaled by the average alpha (how much of the
     // sprite is glass-colorant vs. see-through frame), so saturated panes darken transmitted light
     // non-linearly. Multiplying into shadowVis.rgb compounds correctly across stacked panes.
     if (bucket == BUCKET_TRANSLUCENT) {
-        Prim pr = ConstPtr<Prim>(sec.primAddr)[tri];
-        float3 avgColor = max(pr.mat.rgb, float3(1.0e-3, 1.0e-3, 1.0e-3));
+        TerrainPrim pr = ConstPtr<TerrainPrim>(sec.primAddr)[tri];
+        MaterialHeader materialHeader = ConstPtr<MaterialHeader>(pc.materialTableAddr)[pr.materialId];
+        float3 avgColor = max(materialHeader.average.rgb * pr.tint.rgb,
+                float3(1.0e-3, 1.0e-3, 1.0e-3));
         float3 colorExtinction = max(-log(avgColor), float3(0.0, 0.0, 0.0));
         // The neutral floor is a flat per-hit dimming, NOT scaled by alpha: vanilla clear glass has a low
         // natural alpha, so folding it into the alpha-scaled term crushed it to near-zero for exactly the
         // white/clear-glass case it's meant to cover.
-        shadowVis.rgb *= exp(-colorExtinction * pr.mat.a - TRANSLUCENT_NEUTRAL_EXTINCTION);
+        shadowVis.rgb *= exp(-colorExtinction * materialHeader.average.a - TRANSLUCENT_NEUTRAL_EXTINCTION);
         IgnoreHit();
     }
 
@@ -120,7 +142,7 @@ void main(inout float4 shadowVis, in BuiltInTriangleIntersectionAttributes attr)
     // bucket's triangle base to index the section's packed corner-UV array (3 UVs per triangle).
     ConstPtr<float2> uvs = ConstPtr<float2>(sec.uvAddr);
     float2 uv = bary.x * uvs[3u * tri + 0u] + bary.y * uvs[3u * tri + 1u] + bary.z * uvs[3u * tri + 2u];
-    if (blockAtlas.SampleLevel(uv, 0.0).a < ALPHA_CUTOFF) {
+    if (blockAlbedoAtlas.SampleLevel(uv, 0.0).a < ALPHA_CUTOFF) {
         IgnoreHit();
     }
 }

@@ -43,10 +43,12 @@ public abstract class GameRendererMixin {
 	// or GUI render into it).
 	@Inject(method = "render(Lnet/minecraft/client/DeltaTracker;Z)V", at = @At("HEAD"))
 	private void caustica$beginOverlayFrame(DeltaTracker deltaTracker, boolean advanceGameTime, CallbackInfo ci) {
+		var window = this.gameRenderState().windowRenderState;
+		VanillaRenderController.INSTANCE.observeRenderFrame(this.mainRenderTarget, window.width, window.height);
 		RtUiOverlay.beginFrame();
 		// Clear the stale HDR-present flag every frame: composite() only runs while a level renders, so on
 		// menu frames it would otherwise stay true from the last world frame and present a black HDR image.
-		RtComposite.INSTANCE.beginFrame();
+		RtComposite.INSTANCE.beginFrame(VanillaRenderController.INSTANCE.isResizeTransitionFrame());
 		// Reflex RENDERSUBMIT_START: render-graph recording begins here; RENDERSUBMIT_END is set at
 		// VulkanGpuSurface.present() HEAD (VulkanGpuSurfaceMixin), just before the real present.
 		if (RtReflex.enabled()) {
@@ -79,10 +81,7 @@ public abstract class GameRendererMixin {
 					target = "Lnet/minecraft/client/renderer/GameRenderer;renderItemInHand(Lnet/minecraft/client/renderer/state/level/CameraRenderState;FLorg/joml/Matrix4fc;)V"))
 	private void caustica$redirectHandToOverlay(GameRenderer self, CameraRenderState cameraState, float deltaPartialTick,
 			Matrix4fc modelViewMatrix, Operation<Void> original) {
-		boolean redirect = RtUiOverlay.enabled();
-		if (redirect) {
-			RtUiOverlay.beginOutputRedirect(this.mainRenderTarget);
-		}
+		boolean redirect = RtUiOverlay.enabled() && RtUiOverlay.beginOutputRedirect(this.mainRenderTarget);
 		try {
 			original.call(self, cameraState, deltaPartialTick, modelViewMatrix);
 		} finally {
@@ -102,10 +101,7 @@ public abstract class GameRendererMixin {
 					target = "Lnet/minecraft/client/renderer/feature/FeatureRenderDispatcher;renderAllFeatures(Lnet/minecraft/client/renderer/SubmitNodeStorage;)V"))
 	private void caustica$redirectScreenEffectsToOverlay(FeatureRenderDispatcher self, SubmitNodeStorage storage,
 			Operation<Void> original) {
-		boolean redirect = RtUiOverlay.enabled();
-		if (redirect) {
-			RtUiOverlay.beginOutputRedirect(this.mainRenderTarget);
-		}
+		boolean redirect = RtUiOverlay.enabled() && RtUiOverlay.beginOutputRedirect(this.mainRenderTarget);
 		try {
 			original.call(self, storage);
 		} finally {
@@ -134,7 +130,8 @@ public abstract class GameRendererMixin {
 					target = "Lnet/minecraft/client/renderer/ProjectionMatrixBuffer;getBuffer(Lorg/joml/Matrix4f;)Lcom/mojang/blaze3d/buffers/GpuBufferSlice;"),
 			index = 0)
 	private Matrix4f caustica$captureLevelProjection(Matrix4f projection) {
-		if (!VanillaRenderController.rtRuntimeWorkRequested()) {
+		if (!VanillaRenderController.rtRuntimeWorkRequested()
+				|| VanillaRenderController.INSTANCE.isResizeTransitionFrame()) {
 			return projection;
 		}
 

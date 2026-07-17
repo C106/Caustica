@@ -22,7 +22,7 @@ import world_common;
 import world_clouds;
 import world_fog;
 
-[[vk::push_constant]] PushAddr pcAddr;
+[[vk::push_constant]] WorldPushConstants pc;
 
 [[vk::binding(0, 0)]] RaytracingAccelerationStructure topLevelAS;
 // HDR trace target: linear radiance, may exceed 1. Tonemap happens later at the display.comp seam.
@@ -37,8 +37,8 @@ import world_fog;
 [[vk::binding(8, 0)]] [format("rg16f")]   RWTexture2D<float2> gSpecMotion; // reflection MVs for RR
 
 // Per-frame push data loaded once from the BDA buffer at the top of main() (same pattern as the GLSL
-// `pc` global). Layout constants generated from this module's SPIR-V — see world_common.WorldPush.
-static WorldPush pc;
+// `worldPush` global). Layout constants generated from this module's SPIR-V — see world_common.WorldPush.
+static WorldPush worldPush;
 
 // Ray payloads. Module-level statics so the helper functions (visibility / refractedGuideHit /
 // specularReflectionMotion / tracePath) can share them, mirroring the GLSL rayPayloadEXT globals.
@@ -51,6 +51,8 @@ static float3 gv_normal;
 static float3 gv_albedo;
 static float3 gv_specAlb; // specular albedo fed to DLSS-RR for specular demodulation (0 = pure diffuse).
 static float gv_rough;
+static float gv_emission;
+static uint gv_emissionSource;
 // Linear VIEW-SPACE depth guide inputs; sky resolves to a large far value (no negative sentinel).
 static float gv_depth;
 static float3 gv_hitCamRel;       // primary-surface hit position relative to the current camera
@@ -60,14 +62,10 @@ static bool gv_motionUseRefracted; // true when the MV tracks the refracted hit 
 // terrain/sky, an entity's per-vertex/object motion for a dynamic hit).
 static float3 gv_motionObjDisp;
 
-static const uint PAYLOAD_MATERIAL_MASK = 3u;
-
-static const uint MATERIAL_OPAQUE = 0u;
-static const uint MATERIAL_WATER = 1u;
-static const uint MATERIAL_PARTICLE = 2u;
-static const uint MATERIAL_GLASS = 3u;
-
 uint payloadMaterial() { return payload.flags & PAYLOAD_MATERIAL_MASK; }
+uint payloadEmissionSource() {
+    return (payload.flags >> PAYLOAD_EMISSION_SOURCE_SHIFT) & PAYLOAD_EMISSION_SOURCE_MASK;
+}
 // Set by world.rchit only on a MATERIAL_WATER hit (see PAYLOAD_WATER_ENTERING) — whether the ray was
 // travelling into the water volume (vs. out of it) at this hit's face.
 bool payloadWaterEntering() { return (payload.flags & PAYLOAD_WATER_ENTERING) != 0u; }
@@ -75,8 +73,10 @@ float payloadRoughness() { return unpackHalf2(payload.roughMetal).x; }
 float payloadMetalness() { return unpackHalf2(payload.roughMetal).y; }
 float payloadEmission() { return unpackHalf2(payload.emissionSss).x; }
 float payloadSss() { return unpackHalf2(payload.emissionSss).y; }
+float payloadIor() { return unpackHalf2(payload.iorTransmission).x; }
+float payloadTransmission() { return unpackHalf2(payload.iorTransmission).y; }
 bool volumetricCloudsEnabled() {
-    return (pc.flags & 32u) != 0u && pc.dimensionMode == DIMENSION_MODE_OVERWORLD;
+    return (worldPush.flags & 32u) != 0u && worldPush.dimensionMode == DIMENSION_MODE_OVERWORLD;
 }
 CloudResult emptyCloudResult() {
     CloudResult cloud;
@@ -94,20 +94,17 @@ static const float INV_PI = 0.31830988618;
 
 // The analytic sky (gradient + sun/moon discs + stars) is computed in world.rmiss. On a miss, raygen
 // reads payload.albedo and accumulates that sky radiance. The directional NEE light is pushed separately
-// as pc.lightDir / pc.lightRadiance / pc.sunDir.
+// as worldPush.lightDir / worldPush.lightRadiance / worldPush.sunDir.
 static const float EMISSIVE_STRENGTH = 3.0; // HDR radiance of a full (level-15) emitter, modulated by albedo
 static const float SURF_BIAS = 0.005;  // offset secondary-ray origins along the normal (anti-acne)
 static const float RAY_TMIN = 0.001;   // tiny tmin: the normal offset already clears the surface
 
 // Water is a smooth dielectric. IOR 1.333; absorption is per-block Beer-Lambert extinction.
 static const float WATER_IOR = 1.333;
-static const float WATER_GUIDE_ROUGH = 0.02;
 static const float3 SKY_SPEC_ALBEDO = float3(0.5, 0.5, 0.5); // RR guide default for sky pixels.
 static const float3 SKY_DIFF_ALBEDO = float3(0.5, 0.5, 0.5);
 
 // Stained glass / ice (material 3): a thin colored dielectric. IOR ~1.5 (soda-lime glass).
-static const float GLASS_IOR = 1.52;
-static const float GLASS_GUIDE_ROUGH = 0.04;
 // Transmitted-ray origin offset when crossing a glass face. Must be SMALLER than the terrain-side
 // TRANSLUCENT_INSET (RtTerrain, 2e-4 blocks): glass is recessed into its block by that inset, so a face
 // touching a slab/stair leaves a tiny gap before the neighbour's surface. A large bias (SURF_BIAS) would
@@ -129,7 +126,7 @@ static const float SECONDARY_CLOUD_RR_THRESHOLD = 0.125;
 static const float SECONDARY_CLOUD_RR_MIN_SURVIVAL = 0.10;
 
 // Per-channel Beer–Lambert extinction from a water body's biome tint (carried in payload.albedo for
-// water hits, or pc.waterParams.xyz for the camera's own biome when starting submerged). A blue ocean
+// water hits, or worldPush.waterParams.xyz for the camera's own biome when starting submerged). A blue ocean
 // tint (low red) absorbs red fastest → bluer with depth; swamp green-brown shifts the hue. The floor
 // keeps even a white-tinted body very slightly absorbing so deep water never reads as clear vacuum.
 static const float WATER_DENSITY = 0.05;
@@ -222,9 +219,9 @@ float waterCaustic(float3 exitPos, float3 lightDir, float waterDist) {
     float fade = smoothstep(0.06, 0.18, lightDir.y);
     if (fade <= 0.0) return 1.0;
     float h = max(waterDist * lightDir.y, 0.05); // vertical depth of the receiver below the exit point
-    float t = pc.waterParams.w;
+    float t = worldPush.waterParams.w;
     float3 inc = -lightDir;
-    float2 base = exitPos.xz + pc.waterAnchor.xy;  // world-stable wave domain (same as applyWaterWaves)
+    float2 base = exitPos.xz + worldPush.waterAnchor.xy;  // world-stable wave domain (same as applyWaterWaves)
     float2 p0 = causticLanding(base, t, inc, h);
     float2 px = causticLanding(base + float2(CAUSTIC_EPS, 0.0), t, inc, h);
     float2 pz = causticLanding(base + float2(0.0, CAUSTIC_EPS), t, inc, h);
@@ -299,7 +296,7 @@ float fogDirectionalSourceDistance(float originY, float rayY, float distance, fl
     // At the 1536-block sky cap, 18 bisections locate the stratum to about 0.006 blocks.
     for (int i = 0; i < 18; i++) {
         float mid = 0.5 * (lo + hi);
-        if (analyticFogDirectionalSourceOpticalDepth(originY, rayY, mid, pc) < targetTau) {
+        if (analyticFogDirectionalSourceOpticalDepth(originY, rayY, mid, worldPush) < targetTau) {
             lo = mid;
         } else {
             hi = mid;
@@ -369,8 +366,8 @@ float rndf(inout uint s) { return float(pcg(s)) * (1.0 / 4294967296.0); }
 float fogRndf(inout uint s) { return float(pcg(s) >> 10u) * (1.0 / 4194304.0); }
 
 float3 primaryRayDir(float2 ndc) {
-    float4 nearH = mul(pc.invViewProj, float4(ndc.x, ndc.y, 1.0, 1.0));
-    float4 farH = mul(pc.invViewProj, float4(ndc.x, ndc.y, 0.0, 1.0));
+    float4 nearH = mul(worldPush.invViewProj, float4(ndc.x, ndc.y, 1.0, 1.0));
+    float4 farH = mul(worldPush.invViewProj, float4(ndc.x, ndc.y, 0.0, 1.0));
     float3 nearP = nearH.xyz / nearH.w;
     float3 farP = farH.xyz / farH.w;
     return normalize(farP - nearP);
@@ -401,10 +398,10 @@ float3 cosineDir(float3 n, inout uint s) {
 // Soft shadows: sample a direction within the light's SQUARE angular extent about `axis`. MC's
 // sun/moon are square quads, so the NEE shadow ray samples a square (not a cone) — the same square the
 // visible disc in world.rmiss uses, built from the same celestial tangent frame (right = arc-travel
-// direction, from pc.celestial.xyz). Averaged over frames by DLSS-RR this yields soft penumbrae that
+// direction, from worldPush.celestial.xyz). Averaged over frames by DLSS-RR this yields soft penumbrae that
 // widen with occluder distance (contact-hardening) for free. halfAngle <= 0 ⇒ exact direction (hard).
 float3 sampleSquare(float3 axis, float halfAngle, inout uint s) {
-    float3 right = normalize(cross(axis, pc.celestial.xyz));
+    float3 right = normalize(cross(axis, worldPush.celestial.xyz));
     float3 up = cross(right, axis);
     float t = tan(halfAngle);
     float u = (rndf(s) * 2.0 - 1.0) * t;
@@ -493,18 +490,18 @@ static const float FOG_LOCAL_LIGHT_DISTANCE = 1024.0;
 float3 directionalFogRadiance(float3 ro, float3 rd, float segmentDistance,
                               float segmentSourceTau, int requestedLayers, uint fogSeed) {
     int activeLayers = min(FOG_DIRECTIONAL_LAYERS, max(requestedLayers, 0));
-    float strength = pc.fogColor.w;
-    float lightLen2 = dot(pc.lightDir.xyz, pc.lightDir.xyz);
+    float strength = worldPush.fogColor.w;
+    float lightLen2 = dot(worldPush.lightDir.xyz, worldPush.lightDir.xyz);
     if (strength <= 0.0 || segmentDistance <= 0.0 || segmentSourceTau <= 0.0
             || activeLayers <= 0 || lightLen2 <= 1.0e-8) {
         return float3(0.0, 0.0, 0.0);
     }
 
-    float3 lightAxis = pc.lightDir.xyz * rsqrt(lightLen2);
-    float3 lightScale = max(pc.lightRadiance.xyz, float3(0.0, 0.0, 0.0)) * strength;
+    float3 lightAxis = worldPush.lightDir.xyz * rsqrt(lightLen2);
+    float3 lightScale = max(worldPush.lightRadiance.xyz, float3(0.0, 0.0, 0.0)) * strength;
     float scatterWeight = fogScatterWeight(segmentSourceTau);
     float analyticSegmentSourceTau = analyticFogDirectionalSourceOpticalDepth(
-            ro.y, rd.y, segmentDistance, pc);
+            ro.y, rd.y, segmentDistance, worldPush);
     float analyticScatterWeight = fogScatterWeight(analyticSegmentSourceTau);
     if (scatterWeight <= 0.0 || analyticScatterWeight <= 0.0
             || max(lightScale.r, max(lightScale.g, lightScale.b)) <= 0.0) {
@@ -529,8 +526,8 @@ float3 directionalFogRadiance(float3 ro, float3 rd, float segmentDistance,
         // Sample the same square sun/moon used by surface NEE. This one direction drives phase, local-fog
         // transmittance, and visibility together, producing unbiased volumetric soft shadows over time.
         float3 lightDir = lightAxis;
-        if (pc.lightDir.w > 0.0) {
-            lightDir = sampleSquare(lightAxis, pc.lightDir.w, localSeed);
+        if (worldPush.lightDir.w > 0.0) {
+            lightDir = sampleSquare(lightAxis, worldPush.lightDir.w, localSeed);
         }
         if (lightDir.y <= 0.0) continue;
 
@@ -547,9 +544,9 @@ float3 directionalFogRadiance(float3 ro, float3 rd, float segmentDistance,
 
         // This is only the additional local fog extinction. lightRadiance already carries planet-scale
         // atmospheric transmittance, so bound the nonzero ambient floor to a local illumination reach.
-        float localLightDistance = min(max(pc.fogParams.w, 0.0), FOG_LOCAL_LIGHT_DISTANCE);
+        float localLightDistance = min(max(worldPush.fogParams.w, 0.0), FOG_LOCAL_LIGHT_DISTANCE);
         float lightT = exp(-analyticFogLightOpticalDepth(
-                samplePos.y, lightDir.y, localLightDistance, pc));
+                samplePos.y, lightDir.y, localLightDistance, worldPush));
         float3 layerRadiance = lightScale * phase * (layerWeight * lightT);
         if (max(layerRadiance.r, max(layerRadiance.g, layerRadiance.b)) <= 0.0) {
             continue; // exact-zero / underflow only
@@ -568,16 +565,16 @@ float3 directionalFogRadiance(float3 ro, float3 rd, float segmentDistance,
 void applyFogSegment(float3 segmentOrigin, float3 rayDir, float segmentDistance,
                      int requestedMaxSteps, int requestedDirectionalLayers, int bounce, uint fogSeed,
                      inout float3 radiance, inout float3 pathThroughput) {
-    if (pc.fogParams.x <= 0.0 || segmentDistance <= 0.0) return;
+    if (worldPush.fogParams.x <= 0.0 || segmentDistance <= 0.0) return;
 
     float2 fogTauComponents = volumeFogOpticalDepthComponents(
-            segmentOrigin, rayDir, segmentDistance, requestedMaxSteps, pc);
+            segmentOrigin, rayDir, segmentDistance, requestedMaxSteps, worldPush);
     float fogTau = fogTauComponents.x + fogTauComponents.y;
     float fogT = exp(-fogTau);
-    float3 fogRadiance = pc.fogColor.xyz * fogScatterWeight(fogTau);
+    float3 fogRadiance = worldPush.fogColor.xyz * fogScatterWeight(fogTau);
     if (bounce == 0) {
         // Ambient fog remains fully visible, but only its configured fraction acts as a directional source.
-        float ambientLightCoupling = clamp(pc.fogAmbientParams.y, 0.0, 1.0);
+        float ambientLightCoupling = clamp(worldPush.fogAmbientParams.y, 0.0, 1.0);
         float sourceTau = fogTauComponents.y + fogTauComponents.x * ambientLightCoupling;
         fogRadiance += directionalFogRadiance(
                 segmentOrigin, rayDir, segmentDistance, sourceTau,
@@ -588,7 +585,7 @@ void applyFogSegment(float3 segmentOrigin, float3 rayDir, float segmentDistance,
 }
 
 float2 projectPrevNdc(float3 worldPos) {
-    float4 clip = mul(pc.prevViewProj, float4(worldPos - pc.camOffset + pc.camDelta, 1.0));
+    float4 clip = mul(worldPush.prevViewProj, float4(worldPos - worldPush.camOffset + worldPush.camDelta, 1.0));
     return clip.xy / clip.w;
 }
 
@@ -627,7 +624,7 @@ float2 specularReflectionMotion(float3 surfacePos, float3 primaryDir, float2 cur
     // zeroing the trace bias the main path tracer needs to avoid surface acne.
     payload.hitT = -1.0;
     payloadSetTraceState(false,
-            max(length(surfacePos - pc.camOffset) * primaryConeSpread, RAY_CONE_MIN_WIDTH),
+            max(length(surfacePos - worldPush.camOffset) * primaryConeSpread, RAY_CONE_MIN_WIDTH),
             max(primaryConeSpread, RAY_CONE_MIN_SPREAD));
     float3 traceRo = surfacePos + n * SURF_BIAS;
     traceRadianceReordered(CULL_SECONDARY, traceRo, RAY_TMIN, specDir, 10000.0);
@@ -638,13 +635,13 @@ float2 specularReflectionMotion(float3 surfacePos, float3 primaryDir, float2 cur
     float cloudDistance = -1.0;
     if (volumetricCloudsEnabled()) {
         float cloudLimit = traceHitT > 0.0 ? traceHitT : CLOUD_MAX_DISTANCE;
-        cloudDistance = marchCloudGuideDistance(traceRo, specDir, cloudLimit, pc);
+        cloudDistance = marchCloudGuideDistance(traceRo, specDir, cloudLimit, worldPush);
     }
     if (cloudDistance > 0.0) {
         // Reconstruct from the true surface point rather than traceRo so a static reflection remains
         // exactly on the primary view ray after mirroring across the reflector plane.
         reflectedHit = surfacePos + specDir * cloudDistance;
-        reflectedMotionPrev = pc.cloudMotion.xyz;
+        reflectedMotionPrev = worldPush.cloudMotion.xyz;
     } else if (traceHitT > 0.0) {
         reflectedHit = surfacePos + specDir * traceHitT;
         // Reflected water/fluid is a static dielectric (its chit MV lane is repurposed); only opaque
@@ -666,17 +663,18 @@ float2 specularReflectionMotion(float3 surfacePos, float3 primaryDir, float2 cur
 // `refracted` is false on total internal reflection (no refracted hit exists); a sky miss returns a far
 // point along the refracted direction, which the self-delta MV handles uniformly.
 void refractedGuideHit(float3 surfacePos, float3 incidentDir, float3 surfaceNormal, bool inWaterAtSurface,
+                       float materialIor,
                        float rayConeWidth, float rayConeSpread,
                        out float3 hitCamRel, out float3 motionPrev, out bool refracted, out float3 diffuseAlbedo,
                        out float3 specAlbedo) {
-    hitCamRel = surfacePos - pc.camOffset;
+    hitCamRel = surfacePos - worldPush.camOffset;
     motionPrev = float3(0.0, 0.0, 0.0);
     refracted = false;
     diffuseAlbedo = float3(0.0, 0.0, 0.0);
     specAlbedo = float3(0.0, 0.0, 0.0);
 
-    float etaI = inWaterAtSurface ? WATER_IOR : 1.0;
-    float etaT = inWaterAtSurface ? 1.0 : WATER_IOR;
+    float etaI = inWaterAtSurface ? materialIor : 1.0;
+    float etaT = inWaterAtSurface ? 1.0 : materialIor;
     float3 refractedDir = refract(incidentDir, surfaceNormal, etaI / etaT);
     if (dot(refractedDir, refractedDir) <= 0.0) {
         return; // total internal reflection: no refracted guide hit exists
@@ -692,17 +690,17 @@ void refractedGuideHit(float3 surfacePos, float3 incidentDir, float3 surfaceNorm
     float cloudDistance = -1.0;
     if (volumetricCloudsEnabled()) {
         float cloudLimit = traceHitT > 0.0 ? traceHitT : CLOUD_MAX_DISTANCE;
-        cloudDistance = marchCloudGuideDistance(ro, refractedDir, cloudLimit, pc);
+        cloudDistance = marchCloudGuideDistance(ro, refractedDir, cloudLimit, worldPush);
     }
     if (cloudDistance > 0.0) {
-        hitCamRel = (ro + refractedDir * cloudDistance) - pc.camOffset;
-        motionPrev = pc.cloudMotion.xyz;
+        hitCamRel = (ro + refractedDir * cloudDistance) - worldPush.camOffset;
+        motionPrev = worldPush.cloudMotion.xyz;
         diffuseAlbedo = SKY_DIFF_ALBEDO;
         specAlbedo = SKY_SPEC_ALBEDO;
         return;
     }
     if (traceHitT < 0.0) {
-        hitCamRel = (ro + refractedDir * 1.0e6) - pc.camOffset;
+        hitCamRel = (ro + refractedDir * 1.0e6) - worldPush.camOffset; // sky through the surface, at infinity
         motionPrev = float3(0.0, 0.0, 0.0);
         diffuseAlbedo = SKY_DIFF_ALBEDO; // sky guide: keep radiance out of the demodulation albedo
         specAlbedo = SKY_SPEC_ALBEDO;
@@ -710,11 +708,11 @@ void refractedGuideHit(float3 surfacePos, float3 incidentDir, float3 surfaceNorm
     }
 
     float3 hitPos = ro + refractedDir * traceHitT;
-    hitCamRel = hitPos - pc.camOffset;
+    hitCamRel = hitPos - worldPush.camOffset;
     uint material = payloadMaterial();
     motionPrev = material != MATERIAL_WATER ? payload.motionPrev : float3(0.0, 0.0, 0.0);
     if (material == MATERIAL_OPAQUE) {
-        bool pbr = (pc.flags & 2u) != 0u;
+        bool pbr = (worldPush.flags & 2u) != 0u;
         diffuseAlbedo = pbr ? payload.albedo * (1.0 - clamp(payloadMetalness(), 0.0, 1.0)) : payload.albedo;
         if (pbr) {
             float3 f0 = payload.f0;
@@ -733,16 +731,16 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed,
     float3 throughput = float3(1.0, 1.0, 1.0);
     float rayConeWidth = 0.0;
     float rayConeSpread = max(primaryConeSpread, RAY_CONE_MIN_SPREAD);
-    int maxBounces = int(pc.maxBounces);
+    int maxBounces = int(worldPush.maxBounces);
     int rrStart = maxBounces <= 3 ? 1 : 2;
-    bool pbr = (pc.flags & 2u) != 0u; // GGX BRDF + material guides, else Lambertian fallback
+    bool pbr = (worldPush.flags & 2u) != 0u; // GGX BRDF + material guides, else Lambertian fallback
     // Start submerged if the camera is in water so the first segment gets the right medium orientation
     // and absorption when the eye is underwater.
-    bool inWater = (pc.flags & 1u) != 0u;
+    bool inWater = (worldPush.flags & 1u) != 0u;
     // Current medium extinction. Defaults to the camera-biome tint (correct when the eye starts
     // submerged, before any water surface is hit); refreshed to the hit water body's tint on each crossing.
-    float3 waterExt = waterExtinction(pc.waterParams.xyz);
-    bool waterWaves = (pc.flags & 16u) != 0u; // animated wave-normal perturbation
+    float3 waterExt = waterExtinction(worldPush.waterParams.xyz);
+    bool waterWaves = (worldPush.flags & 16u) != 0u; // animated wave-normal perturbation
     bool volumetricClouds = volumetricCloudsEnabled();
     bool primaryCloudDominant = false;
     float3 primaryCloudHitCamRel = float3(0.0, 0.0, 0.0);
@@ -762,7 +760,7 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed,
 
         bool segmentMiss = payload.hitT < 0.0;
         float surfaceDistance = segmentMiss ? 0.0 : max(payload.hitT, 0.0);
-        float fogDistance = segmentMiss ? max(pc.fogParams.w, 0.0) : surfaceDistance;
+        float fogDistance = segmentMiss ? max(worldPush.fogParams.w, 0.0) : surfaceDistance;
 
         // Miss returns raw sky only. March the same cloud field exactly once here for either a finite
         // surface segment or an escaped ray, so cloud integration and its DLSS guide share one result.
@@ -775,7 +773,7 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed,
             float pathImportance = max(throughput.r, max(throughput.g, throughput.b));
             if (bounce > 0 && !showCelestial
                     && pathImportance < SECONDARY_CLOUD_RR_THRESHOLD
-                    && cloudRayIntersectsLayer(ro, rd, cloudLimit, pc)) {
+                    && cloudRayIntersectsLayer(ro, rd, cloudLimit, worldPush)) {
                 float survive = clamp(pathImportance / SECONDARY_CLOUD_RR_THRESHOLD,
                                       SECONDARY_CLOUD_RR_MIN_SURVIVAL, 1.0);
                 if (rndf(seed) > survive) break;
@@ -787,7 +785,7 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed,
                 // Primary and directly visible specular chains retain denser cloud-light probes. Diffuse
                 // secondary rays are strongly filtered by their BRDF and can safely reuse them farther.
                 int cloudLightingStride = (bounce == 0 || showCelestial) ? 2 : 4;
-                cloud = marchClouds(ro, rd, cloudLimit, pc, cloudLightingStride);
+                cloud = marchClouds(ro, rd, cloudLimit, worldPush, cloudLightingStride);
                 if (bounce == 0) {
                     primaryCloudCache = cloud;
                 }
@@ -797,7 +795,7 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed,
         // Preserve the near-to-far cloud runs. Each run is locally premultiplied, while the world fog
         // between two run centroids is integrated as its own interval. This avoids putting all clouds at a
         // single contribution centroid that can land in clear air and invert their apparent transparency.
-        bool applyWorldFog = !inWater && pc.fogParams.x > 0.0 && fogDistance > 0.0;
+        bool applyWorldFog = !inWater && worldPush.fogParams.x > 0.0 && fogDistance > 0.0;
         int totalFogSteps = bounce == 0 ? 16 : 4;
         int usedFogSteps = 0;
         int usedDirectionalLayers = 0;
@@ -833,7 +831,7 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed,
 
         if (bounce == 0 && capturePrimaryGuides && cloud.distance > 0.0) {
             primaryCloudDominant = true;
-            primaryCloudHitCamRel = (ro + rd * cloud.distance) - pc.camOffset;
+            primaryCloudHitCamRel = (ro + rd * cloud.distance) - worldPush.camOffset;
         }
 
         if (segmentMiss) {
@@ -848,7 +846,9 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed,
                 gv_albedo = SKY_DIFF_ALBEDO;
                 gv_specAlb = SKY_SPEC_ALBEDO;
                 gv_rough = 1.0;
-                gv_hitCamRel = rd * 1.0e6;
+                gv_emission = 0.0;
+                gv_emissionSource = EMISSION_SOURCE_NONE;
+                gv_hitCamRel = rd * 1.0e6; // sky at infinity: only rotation parallax (-> large far depth)
                 gv_motionHitCamRel = gv_hitCamRel;
                 gv_motionUseRefracted = false;
                 gv_motionObjDisp = float3(0.0, 0.0, 0.0); // sky is static
@@ -868,6 +868,10 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed,
         float3 hitPos = ro + rd * payload.hitT;
         rayConeWidth = max(rayConeWidth + rayConeSpread * max(payload.hitT, 0.0), RAY_CONE_MIN_WIDTH);
         uint material = payloadMaterial();
+        if (bounce == 0 && capturePrimaryGuides) {
+            gv_emission = payloadEmission();
+            gv_emissionSource = payloadEmissionSource();
+        }
 
         // Stained glass / ice (material 3): a thin colored dielectric. Stochastically reflect (Fresnel
         // glint) or transmit; on transmission the throughput is multiplied by the pane's tint, so light
@@ -876,14 +880,16 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed,
         // refraction bend) — the instance stays double-sided and the normal already faces the incoming ray.
         if (material == MATERIAL_GLASS) {
             float3 glassTint = payload.albedo;
+            float materialIor = max(payloadIor(), 1.0e-3);
+            float transmission = clamp(payloadTransmission(), 0.0, 1.0);
             float cosI = clamp(dot(-rd, n), 0.0, 1.0);
-            float F = fresnelDielectric(cosI, 1.0, GLASS_IOR);
+            float F = fresnelDielectric(cosI, 1.0, materialIor);
             if (bounce == 0 && capturePrimaryGuides) { // primary glass hit: feed RR a smooth dielectric specular surface
                 gv_normal = n;
-                gv_rough = GLASS_GUIDE_ROUGH;
+                gv_rough = clamp(payloadRoughness(), MIN_ROUGH, 1.0);
                 gv_specAlb = float3(F, F, F);
                 gv_albedo = glassTint;            // demodulate by the transmission tint
-                gv_hitCamRel = hitPos - pc.camOffset;
+                gv_hitCamRel = hitPos - worldPush.camOffset;
                 gv_motionHitCamRel = gv_hitCamRel;
                 gv_motionUseRefracted = false;
                 gv_motionObjDisp = payload.motionPrev; // 0 for static terrain
@@ -892,7 +898,7 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed,
                 rd = reflect(rd, n);
                 ro = hitPos + n * SURF_BIAS;       // reflected ray stays on the incidence side
             } else {
-                throughput *= glassTint;           // colored transmission
+                throughput *= glassTint * transmission; // colored, optionally partial transmission
                 ro = hitPos - n * GLASS_TRANSMIT_BIAS; // cross to the far side without overshooting a close neighbour
             }
             showCelestial = true;                  // specular interface: the continuation ray may see the disc
@@ -916,17 +922,17 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed,
                 gv_albedo = albedo; // RR demodulation target = the particle texel (keeps it sharp)
                 gv_specAlb = float3(0.0, 0.0, 0.0);
                 gv_rough = 1.0;
-                gv_hitCamRel = hitPos - pc.camOffset;
+                gv_hitCamRel = hitPos - worldPush.camOffset;
                 gv_motionHitCamRel = gv_hitCamRel;
                 gv_motionUseRefracted = false;
                 gv_motionObjDisp = payload.motionPrev; // per-particle MV: de-ghost moving particles
             }
 
-            float directionalEnergy = max(pc.lightRadiance.r,
-                    max(pc.lightRadiance.g, pc.lightRadiance.b));
+            float directionalEnergy = max(worldPush.lightRadiance.r,
+                    max(worldPush.lightRadiance.g, worldPush.lightRadiance.b));
             if (directionalEnergy > 0.0) {
-                float3 lightDir = pc.lightDir.xyz;
-                float lightHalfAngle = pc.lightDir.w;
+                float3 lightDir = worldPush.lightDir.xyz;
+                float lightHalfAngle = worldPush.lightDir.w;
                 if (lightHalfAngle > 0.0) {
                     lightDir = sampleSquare(lightDir, lightHalfAngle, seed);
                 }
@@ -938,7 +944,7 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed,
                     float3 shadowOrigin = hitPos + (signedNdl >= 0.0 ? n : -n) * SURF_BIAS;
                     float3 vis = visibility(shadowOrigin, lightDir, 10000.0);
                     if (max(vis.r, max(vis.g, vis.b)) > 0.0) {
-                        L += throughput * albedo * INV_PI * pc.lightRadiance.xyz * ndl * vis;
+                        L += throughput * albedo * INV_PI * worldPush.lightRadiance.xyz * ndl * vis;
                     }
                 }
             }
@@ -960,46 +966,49 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed,
         // transmission, the new medium is read from this hit's face orientation (payloadWaterEntering),
         // not toggled — see PAYLOAD_WATER_ENTERING. The bounce cap bounds stacked refractions.
         if (material == MATERIAL_WATER) {
+            float materialIor = max(payloadIor(), 1.0e-3);
+            float transmission = clamp(payloadTransmission(), 0.0, 1.0);
+            // The primary-water guide traces another radiance ray through the global payload. Preserve
+            // this interface's orientation before that nested trace overwrites payload.flags.
+            bool materialEntering = payloadWaterEntering();
             // Ripple the (near-flat) surface normal before any Fresnel/guide use → glints, broken
             // reflections, wobbling refraction. This water body's biome tint (carried in payload.albedo
             // for water hits) sets the absorption applied to the next submerged segment.
             if (waterWaves) {
                 // World-stable wave domain: rebased hit XZ + the pushed anchor (terrain origin mod 4096)
                 // reconstructs a world-pinned coordinate that survives the per-move terrain rebase.
-                n = applyWaterWaves(n, hitPos.xz + pc.waterAnchor.xy, pc.waterParams.w);
+                n = applyWaterWaves(n, hitPos.xz + worldPush.waterAnchor.xy, worldPush.waterParams.w);
             }
             waterExt = waterExtinction(payload.albedo);
-            // The primary-water guide traces another ray through the shared payload below. Preserve this
-            // hit's medium transition before that trace overwrites payload.flags.
-            bool hitWaterEntering = payloadWaterEntering();
             float cosI = clamp(dot(-rd, n), 0.0, 1.0);
             if (bounce == 0 && capturePrimaryGuides) { // primary water hit: feed RR a smooth dielectric specular surface
                 gv_normal = n;
-                gv_rough = WATER_GUIDE_ROUGH;
-                gv_hitCamRel = hitPos - pc.camOffset; // depth + reflection start at the water surface
+                gv_rough = clamp(payloadRoughness(), MIN_ROUGH, 1.0);
+                gv_hitCamRel = hitPos - worldPush.camOffset; // depth + reflection start at the water surface
                 // Diffuse AND specular albedo + MV track the refracted hit (floor/shore seen through the
                 // surface) so refracted content stops ghosting; depth stays on the water surface. Water's
                 // own Fresnel reflectance is ignored here — a clear interface, not a demodulation target.
                 float3 refractedAlbedo;
                 float3 refractedSpecAlbedo;
-                refractedGuideHit(hitPos, rd, n, inWater, rayConeWidth, rayConeSpread,
+                refractedGuideHit(hitPos, rd, n, inWater, materialIor, rayConeWidth, rayConeSpread,
                         gv_motionHitCamRel, gv_motionObjDisp,
                         gv_motionUseRefracted, refractedAlbedo, refractedSpecAlbedo);
                 gv_albedo = refractedAlbedo;
                 gv_specAlb = refractedSpecAlbedo;
             }
-            float etaI = inWater ? WATER_IOR : 1.0;
-            float etaT = inWater ? 1.0 : WATER_IOR;
+            float etaI = inWater ? materialIor : 1.0;
+            float etaT = inWater ? 1.0 : materialIor;
             float F = fresnelDielectric(cosI, etaI, etaT);
             if (rndf(seed) < F) {
                 rd = reflect(rd, n);
                 ro = hitPos + n * SURF_BIAS; // reflected ray stays on the incidence side
             } else {
                 rd = refract(rd, n, etaI / etaT); // F < 1 here, so this is never total internal reflection
+                throughput *= transmission;
                 ro = hitPos - n * SURF_BIAS;       // transmitted ray crosses to the far side
                 // Derived from this hit's face orientation, not toggled — self-corrects instead of a
                 // stray/missing face corrupting the medium for the rest of the path (see PAYLOAD_WATER_ENTERING).
-                inWater = hitWaterEntering;
+                inWater = materialEntering;
             }
             // Specular interface (mirror reflect / clear refract): the continuation ray should see the
             // sun/moon disc directly — no NEE happened here to double-count it.
@@ -1032,7 +1041,7 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed,
             gv_albedo = pbr ? diffAlb : albedo;  // RR diffuse-albedo demodulation target
             gv_rough = rough;
             gv_specAlb = pbr ? rrSpecularAlbedo(F0, rough * rough, dot(n, v)) : float3(0.0, 0.0, 0.0);
-            gv_hitCamRel = ro + rd * payload.hitT - pc.camOffset; // camera-relative hit position
+            gv_hitCamRel = ro + rd * payload.hitT - worldPush.camOffset; // camera-relative hit position
             gv_motionHitCamRel = gv_hitCamRel;
             gv_motionUseRefracted = false;
             gv_motionObjDisp = payload.motionPrev; // per-vertex world motion (0 for static terrain/sky)
@@ -1049,13 +1058,13 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed,
 
         // NEE: direct light from the dominant celestial body (sun by day, moon by night) — Lambert
         // diffuse + GGX specular, one shadow ray. Jitter the light direction within its square angular
-        // extent (pc.lightDir.w half-angle) so the shadow ray samples the light's quad — soft penumbrae
+        // extent (worldPush.lightDir.w half-angle) so the shadow ray samples the light's quad — soft penumbrae
         // over accumulation. The same sampled direction drives ndl, the shadow ray, and the specular
         // half-vector.
-        float3 lightDir = pc.lightDir.xyz;
-        float lightHalfAngle = pc.lightDir.w;
-        float directionalEnergy = max(pc.lightRadiance.r,
-                max(pc.lightRadiance.g, pc.lightRadiance.b));
+        float3 lightDir = worldPush.lightDir.xyz;
+        float lightHalfAngle = worldPush.lightDir.w;
+        float directionalEnergy = max(worldPush.lightRadiance.r,
+                max(worldPush.lightRadiance.g, worldPush.lightRadiance.b));
         bool hasDirectionalLight = directionalEnergy > 0.0;
         if (hasDirectionalLight && lightHalfAngle > 0.0) {
             lightDir = sampleSquare(lightDir, lightHalfAngle, seed);
@@ -1081,7 +1090,7 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed,
                     float3 F = fresnelSchlick(vdh, F0);
                     brdf += (D * G) * F / (4.0 * ndv * ndl); // Cook–Torrance specular
                 }
-                L += throughput * brdf * pc.lightRadiance.xyz * ndl * vis;
+                L += throughput * brdf * worldPush.lightRadiance.xyz * ndl * vis;
             }
         }
 
@@ -1101,7 +1110,7 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed,
                 }
                 if (max(visB.r, max(visB.g, visB.b)) > 0.0) {
                     float cosT = dot(lightDir, rd);
-                    L += throughput * diffAlb * sss * SSS_STRENGTH * hg(cosT, SSS_G) * backNdl * pc.lightRadiance.xyz * visB;
+                    L += throughput * diffAlb * sss * SSS_STRENGTH * hg(cosT, SSS_G) * backNdl * worldPush.lightRadiance.xyz * visB;
                 }
             }
         }
@@ -1158,14 +1167,16 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed,
         gv_hitCamRel = primaryCloudHitCamRel;
         gv_motionHitCamRel = primaryCloudHitCamRel;
         gv_motionUseRefracted = false;
-        gv_motionObjDisp = pc.cloudMotion.xyz;
+        gv_emission = 0.0;
+        gv_emissionSource = EMISSION_SOURCE_NONE;
+        gv_motionObjDisp = worldPush.cloudMotion.xyz;
     }
     return L;
 }
 
 [shader("raygeneration")]
 void main() {
-    pc = ConstPtr<WorldPush>(pcAddr.worldPushAddr)[0]; // load the per-frame push data from the BDA buffer
+    worldPush = ConstPtr<WorldPush>(pc.worldPushAddr)[0]; // load the per-frame push data from the BDA buffer
     int2 pix = int2(DispatchRaysIndex().xy);
     float2 size = float2(DispatchRaysDimensions().xy);
     float2 uv = (float2(pix) + 0.5) / size;
@@ -1175,14 +1186,14 @@ void main() {
     // successive frames sample different positions and RR can resolve detail above render resolution.
     // The guide buffers below come from this jittered first hit (they must match the jittered colour);
     // only the motion vector stays on the unjittered centre, which DLSS expects.
-    float2 jndc = (uv + pc.jitter / size) * 2.0 - 1.0;
+    float2 jndc = (uv + worldPush.jitter / size) * 2.0 - 1.0;
 
-    float4 nearH = mul(pc.invViewProj, float4(jndc.x, jndc.y, 1.0, 1.0));
-    float4 farH = mul(pc.invViewProj, float4(jndc.x, jndc.y, 0.0, 1.0));
+    float4 nearH = mul(worldPush.invViewProj, float4(jndc.x, jndc.y, 1.0, 1.0));
+    float4 farH = mul(worldPush.invViewProj, float4(jndc.x, jndc.y, 0.0, 1.0));
     float3 nearP = nearH.xyz / nearH.w;
     float3 farP = farH.xyz / farH.w;
 
-    float3 origin = nearP + pc.camOffset;
+    float3 origin = nearP + worldPush.camOffset;
     float3 dir = normalize(farP - nearP);
     float rayConeSpread = primaryRayConeSpread(jndc, size, dir);
 
@@ -1194,6 +1205,8 @@ void main() {
     gv_albedo = SKY_DIFF_ALBEDO;
     gv_specAlb = SKY_SPEC_ALBEDO;
     gv_rough = 1.0;
+    gv_emission = 0.0;
+    gv_emissionSource = EMISSION_SOURCE_NONE;
     gv_depth = 0.0;
     gv_hitCamRel = dir * 1.0e6;
     gv_motionHitCamRel = gv_hitCamRel;
@@ -1202,7 +1215,7 @@ void main() {
 
     uint seed = (uint(pix.x) * 1973u + uint(pix.y) * 9277u + 26699u) ^ (pc.frameIndex * 2654435761u);
 
-    uint spp = max(pc.spp, 1u);
+    uint spp = max(worldPush.spp, 1u);
     float3 frameRadiance = float3(0.0, 0.0, 0.0);
     CloudResult primaryCloudCache = emptyCloudResult();
     for (uint s = 0u; s < spp; s++) {
@@ -1216,7 +1229,7 @@ void main() {
     // primary hit through the forward view-projection and take ndc z/w — exactly the value a rasterizer
     // would write. Reversed-Z (near=1, far=0), so DLSS gets the DepthInverted flag; sky's far hit -> ~0.
     // Depth follows the primary surface (water included); only the MV tracks the refracted hit.
-    float4 curClip = mul(pc.curViewProj, float4(gv_hitCamRel, 1.0));
+    float4 curClip = mul(worldPush.curViewProj, float4(gv_hitCamRel, 1.0));
     gv_depth = curClip.w > 0.0 ? curClip.z / curClip.w : 0.0;
 
     // Guide buffers: first-hit attributes for the denoiser / DLSS-RR (written every frame).
@@ -1231,7 +1244,7 @@ void main() {
     // what DLSS expects with MVJittered unset. Scaled from NDC into render-pixel space.
     // For a dynamic surface, previous-frame position is the current point minus its world-space
     // displacement; subtracting gv_motionObjDisp de-cameras the MV.
-    float4 prevClip = mul(pc.prevViewProj, float4(gv_motionHitCamRel + pc.camDelta - gv_motionObjDisp, 1.0));
+    float4 prevClip = mul(worldPush.prevViewProj, float4(gv_motionHitCamRel + worldPush.camDelta - gv_motionObjDisp, 1.0));
     float2 prevNdc = prevClip.xy / prevClip.w;
     float2 curNdc = jndc; // primary hit's current screen position is exactly the jittered ray ndc
     // Water MV guide: track the one-refraction hit (the floor seen through the surface), not the water
@@ -1239,12 +1252,12 @@ void main() {
     // its own reprojection delta (prev - current projection) — bit-exact zero when static, no Snell
     // solve needed. The constant per-frame refraction offset cancels out of prev - current.
     if (gv_motionUseRefracted) {
-        float4 curClipRefr = mul(pc.curViewProj, float4(gv_motionHitCamRel, 1.0));
+        float4 curClipRefr = mul(worldPush.curViewProj, float4(gv_motionHitCamRel, 1.0));
         curNdc = curClipRefr.xy / curClipRefr.w;
     }
     float2 motion = (prevNdc - curNdc) * 0.5 * size;
     gMotion[pix] = motion;
-    float2 specMotion = specularReflectionMotion(gv_hitCamRel + pc.camOffset, dir, jndc, size, rayConeSpread);
+    float2 specMotion = specularReflectionMotion(gv_hitCamRel + worldPush.camOffset, dir, jndc, size, rayConeSpread);
     gSpecMotion[pix] = specMotion;
 
     // Debug guide-buffer visualization: bypass accumulation and show a guide directly.
@@ -1262,6 +1275,16 @@ void main() {
             dbg = gv_specAlb;                       // specular albedo
         } else if (pc.debugView == 7u) {
             dbg = float3(clamp(0.5 + specMotion * 0.05, 0.0, 1.0), 0.5); // reflection motion
+        } else if (pc.debugView == 8u) {
+            dbg = float3(gv_emission, gv_emission, gv_emission); // resolved emission mask/strength
+        } else if (pc.debugView == 9u) {
+            float3 sourceColor = gv_emissionSource == EMISSION_SOURCE_OVERRIDE ? float3(1.0, 0.2, 1.0)
+                    : gv_emissionSource == EMISSION_SOURCE_LAB_PBR ? float3(0.15, 0.8, 1.0)
+                    : gv_emissionSource == EMISSION_SOURCE_HEURISTIC ? float3(1.0, 0.45, 0.05)
+                    : gv_emissionSource == EMISSION_SOURCE_UNIFORM ? float3(1.0, 1.0, 1.0)
+                    : float3(0.0, 0.0, 0.0);
+            dbg = sourceColor * (gv_emissionSource == EMISSION_SOURCE_NONE
+                    ? 0.0 : max(0.2, clamp(gv_emission, 0.0, 1.0)));
         } else {
             dbg = float3(clamp(0.5 + motion * 0.05, 0.0, 1.0), 0.5); // motion: red=+x, green=+y
         }

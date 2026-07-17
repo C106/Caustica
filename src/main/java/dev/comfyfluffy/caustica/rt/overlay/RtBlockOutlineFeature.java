@@ -212,13 +212,24 @@ final class RtBlockOutlineFeature implements RtOverlayFeature {
                     RtDeviceBringup.overlayMsaaSamples(), "block outline msaa " + width + "x" + height);
         }
         if (resolvedMask == null || resolvedMask.width != width || resolvedMask.height != height) {
+            boolean replaceDescriptorGeneration = resolvedMask != null;
             if (resolvedMask != null) {
                 resolvedMask.destroy();
             }
             resolvedMask = ctx.createStorageImage(width, height, RtWorldOverlay.TARGET_FORMAT,
                     "block outline resolved mask " + width + "x" + height, VK10.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+            if (replaceDescriptorGeneration) {
+                RtOverlayPipelines.StorageImageSet previous = compositeSet;
+                compositeSet = RtOverlayPipelines.storageImageSet(ctx, 1, VK10.VK_SHADER_STAGE_FRAGMENT_BIT,
+                        "block outline composite generation");
+                compositeSet.bind(ctx, 0, resolvedMask.view);
+                previous.destroy(ctx.vk());
+            } else {
+                compositeSet.bind(ctx, 0, resolvedMask.view);
+            }
+        } else {
+            compositeSet.bind(ctx, 0, resolvedMask.view);
         }
-        compositeSet.bind(ctx, 0, resolvedMask.view);
     }
 
     @Override

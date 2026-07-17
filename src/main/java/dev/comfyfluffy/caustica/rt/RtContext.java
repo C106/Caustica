@@ -166,15 +166,24 @@ public final class RtContext {
 
     /** Create a VMA buffer; {@code SHADER_DEVICE_ADDRESS} is always added so it has a device address. */
     public RtBuffer createBuffer(long size, int usage, boolean hostVisible, String label) {
-        return createBuffer(size, usage, hostVisible, label, false);
+        return createBuffer(size, usage, hostVisible, label, false,
+                hostVisible ? Vma.VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT : 0);
     }
 
     /** Create a buffer shared by the graphics and async-compute families when those families differ. */
     public RtBuffer createAsyncBuffer(long size, int usage, boolean hostVisible, String label) {
-        return createBuffer(size, usage, hostVisible, label, true);
+        return createBuffer(size, usage, hostVisible, label, true,
+                hostVisible ? Vma.VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT : 0);
     }
 
-    private RtBuffer createBuffer(long size, int usage, boolean hostVisible, String label, boolean asyncShared) {
+    /** Create a transient, persistently mapped upload buffer optimized for sequential host writes. */
+    public RtBuffer createUploadBuffer(long size, String label) {
+        return createBuffer(size, VK10.VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true, label, false,
+                Vma.VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
+    }
+
+    private RtBuffer createBuffer(long size, int usage, boolean hostVisible, String label, boolean asyncShared,
+                                  int hostAccessFlags) {
         long handle = 0L;
         long allocation = 0L;
         try (MemoryStack stack = MemoryStack.stackPush()) {
@@ -185,9 +194,11 @@ public final class RtContext {
                 bci.sharingMode(VK10.VK_SHARING_MODE_CONCURRENT)
                         .pQueueFamilyIndices(stack.ints(graphicsQueue.queueFamilyIndex(), computeQueue.queueFamilyIndex()));
             }
-            VmaAllocationCreateInfo aci = VmaAllocationCreateInfo.calloc(stack).usage(Vma.VMA_MEMORY_USAGE_AUTO);
+            VmaAllocationCreateInfo aci = VmaAllocationCreateInfo.calloc(stack).usage(hostVisible
+                    ? Vma.VMA_MEMORY_USAGE_AUTO
+                    : Vma.VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
             if (hostVisible) {
-                aci.flags(Vma.VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | Vma.VMA_ALLOCATION_CREATE_MAPPED_BIT);
+                aci.flags(hostAccessFlags | Vma.VMA_ALLOCATION_CREATE_MAPPED_BIT);
             }
             LongBuffer pBuf = stack.mallocLong(1);
             PointerBuffer pAlloc = stack.mallocPointer(1);
@@ -198,7 +209,8 @@ public final class RtContext {
             RtDebugLabels.nameBuffer(this, handle, label);
             VkBufferDeviceAddressInfo bdai = VkBufferDeviceAddressInfo.calloc(stack).sType$Default().buffer(handle);
             long address = VK12.vkGetBufferDeviceAddress(vk, bdai);
-            return new RtBuffer(vma, handle, allocation, address, hostVisible ? info.pMappedData() : 0L, size, usage, hostVisible);
+            return new RtBuffer(vma, handle, allocation, address, hostVisible ? info.pMappedData() : 0L,
+                    size, usage, hostVisible, label);
         } catch (Throwable t) {
             if (handle != 0L) {
                 Vma.vmaDestroyBuffer(vma, handle, allocation);
@@ -400,6 +412,9 @@ public final class RtContext {
 
     public static void check(int rc, String what) {
         if (rc != VK10.VK_SUCCESS) {
+            if (rc == VK10.VK_ERROR_DEVICE_LOST && instance != null) {
+                VulkanDiagnostics.reportDeviceLost(instance.device, what);
+            }
             throw new IllegalStateException(what + " failed: " + rc);
         }
     }

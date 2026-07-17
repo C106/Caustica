@@ -10,11 +10,11 @@
 // added on every miss (any bounce): stars aren't a NEE light, so they never double-count.
 import world_common;
 
-[[vk::push_constant]] PushAddr pcAddr;
+[[vk::push_constant]] WorldPushConstants pc;
 
 // Vanilla celestials atlas (sun + moon-phase sprites), bound by RtComposite. Sampled with an explicit
 // LOD (no derivatives in a miss shader). The sun/moon discs are drawn from its real texels.
-[[vk::binding(11, 0)]] Sampler2D celestialsAtlas;
+[[vk::binding(9, 0)]] Sampler2D celestialsAtlas;
 
 static const float PI = 3.14159265359;
 float pow2(float x) { return x * x; }
@@ -89,6 +89,7 @@ void storeSkyPayload(inout Payload payload, float3 col) {
     payload.flags = 0u;
     payload.roughMetal = packHalf2(float2(1.0, 0.0));
     payload.emissionSss = packHalf2(float2(0.0, 0.0));
+    payload.iorTransmission = packHalf2(float2(1.0, 0.0));
     payload.rayCone = 0u;
 }
 
@@ -278,29 +279,29 @@ float3 stars(float3 dir, float starBrightness, float VdotS, float4 celestial) {
 
 [shader("miss")]
 void main(inout Payload payload) {
-    WorldPush pc = ConstPtr<WorldPush>(pcAddr.worldPushAddr)[0];
+    WorldPush worldPush = ConstPtr<WorldPush>(pc.worldPushAddr)[0];
     float3 dir = normalize(WorldRayDirection());
     // Non-Overworld dimensions return before any planetary atmosphere march, star hash, or celestial-atlas
     // sample. Their CPU-pushed directional radiance is zero, so no hidden sun/moon remains in lighting.
-    if (pc.dimensionMode == DIMENSION_MODE_NETHER) {
-        storeSkyPayload(payload, netherSky(dir, pc.fogColor.xyz));
+    if (worldPush.dimensionMode == DIMENSION_MODE_NETHER) {
+        storeSkyPayload(payload, netherSky(dir, worldPush.fogColor.xyz));
         return;
     }
-    if (pc.dimensionMode == DIMENSION_MODE_END) {
-        storeSkyPayload(payload, endSky(dir, pc.fogColor.xyz));
+    if (worldPush.dimensionMode == DIMENSION_MODE_END) {
+        storeSkyPayload(payload, endSky(dir, worldPush.fogColor.xyz));
         return;
     }
-    if (pc.dimensionMode == DIMENSION_MODE_GENERIC) {
-        storeSkyPayload(payload, genericSky(dir, pc.fogColor.xyz));
+    if (worldPush.dimensionMode == DIMENSION_MODE_GENERIC) {
+        storeSkyPayload(payload, genericSky(dir, worldPush.fogColor.xyz));
         return;
     }
 
-    float day = pc.sunDir.w;
-    float3 sd = pc.sunDir.xyz;
+    float day = worldPush.sunDir.w;
+    float3 sd = worldPush.sunDir.xyz;
     float SdotU = sd.y;
     float VdotS = dot(dir, sd);
     float sunUp = clamp((SdotU + 0.0625) / 0.125, 0.0, 1.0); // 0 well below horizon .. 1 above
-    float starBrightness = pc.lightRadiance.w;
+    float starBrightness = worldPush.lightRadiance.w;
     bool showCelestial = (payload.flags & PAYLOAD_SHOW_CELESTIAL) != 0u;
 
     // Physically-based in-scattering: blue zenith, bright/desaturated horizon, warm Mie halo + red
@@ -327,16 +328,16 @@ void main(inout Payload payload) {
     float3 nightAmbient = lerp(NIGHT_HORIZON, NIGHT_ZENITH, up);
     col += nightAmbient * (1.0 - day);
     col *= downFade;
-    col += stars(dir, starBrightness, VdotS, pc.celestial);
+    col += stars(dir, starBrightness, VdotS, worldPush.celestial);
 
     // Sun & moon discs — sampled from the vanilla celestials atlas, gated to rays that haven't already
     // accounted for the light via diffuse NEE. squareBody gives the body-local [-1,1] coord; the
     // sprite's own texel coverage (alpha) shapes the disc.
     if (showCelestial) {
         float2 local;
-        squareBody(dir, sd, SUN_DISC_HALF_ANGLE, pc.celestial.xyz, local);
+        squareBody(dir, sd, SUN_DISC_HALF_ANGLE, worldPush.celestial.xyz, local);
         if (all(abs(local) < float2(1.0, 1.0))) {
-            float2 uv = lerp(pc.sunUv.xy, pc.sunUv.zw, local * 0.5 + 0.5);
+            float2 uv = lerp(worldPush.sunUv.xy, worldPush.sunUv.zw, local * 0.5 + 0.5);
             float3 t = celestialsAtlas.SampleLevel(uv, 0.0).rgb;
             // The vanilla sun sprite bakes a soft glow gradient into its texels; scaling that raw to HDR
             // makes a huge ring. Raise the texture luminance to a high power — only the bright core
@@ -347,10 +348,10 @@ void main(inout Payload payload) {
         }
         // Same horizon gate as the sun: with the soft-horizon change, below-horizon rays no longer clip
         // at the planet, so without this the moon disc would stay visible after it set.
-        float moonUp = clamp((pc.moonDir.y + 0.0625) / 0.125, 0.0, 1.0);
-        squareBody(dir, pc.moonDir.xyz, MOON_DISC_HALF_ANGLE, pc.celestial.xyz, local);
+        float moonUp = clamp((worldPush.moonDir.y + 0.0625) / 0.125, 0.0, 1.0);
+        squareBody(dir, worldPush.moonDir.xyz, MOON_DISC_HALF_ANGLE, worldPush.celestial.xyz, local);
         if (all(abs(local) < float2(1.0, 1.0)) && moonUp > 0.0) {
-            float2 uv = lerp(pc.moonUv.xy, pc.moonUv.zw, local * 0.5 + 0.5);
+            float2 uv = lerp(worldPush.moonUv.xy, worldPush.moonUv.zw, local * 0.5 + 0.5);
             float3 t = celestialsAtlas.SampleLevel(uv, 0.0).rgb;
             // Moon: a smoothstep contrast ramp suppresses the faint halo while keeping the lit phase
             // shape from the texture. The transmittance tint gives a warm amber moon at moonrise/set.

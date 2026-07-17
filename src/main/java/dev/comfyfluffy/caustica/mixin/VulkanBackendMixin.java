@@ -1,6 +1,8 @@
 package dev.comfyfluffy.caustica.mixin;
 
 import com.llamalad7.mixinextras.sugar.Local;
+import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
+import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
 import com.mojang.blaze3d.shaders.GpuDebugOptions;
 import com.mojang.blaze3d.shaders.ShaderSource;
 import com.mojang.blaze3d.systems.GpuDevice;
@@ -9,9 +11,11 @@ import com.mojang.blaze3d.vulkan.VulkanPhysicalDevice;
 import com.mojang.blaze3d.vulkan.init.VulkanFeature;
 import dev.comfyfluffy.caustica.CausticaMod;
 import dev.comfyfluffy.caustica.rt.RtDeviceBringup;
+import dev.comfyfluffy.caustica.rt.VulkanDiagnostics;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.VK12;
 import org.lwjgl.vulkan.VkDevice;
+import org.lwjgl.vulkan.VkDeviceCreateInfo;
 import org.lwjgl.vulkan.VkPhysicalDeviceFeatures;
 import org.lwjgl.vulkan.VkPhysicalDeviceFeatures2;
 import org.lwjgl.vulkan.VkPhysicalDeviceVulkan12Features;
@@ -63,6 +67,20 @@ public abstract class VulkanBackendMixin {
 
 	private static final Set<String> loggedMissingSdkFeatures = new HashSet<>();
 
+	/** NVIDIA advertises AMD markers too, but its native diagnostic checkpoints contain better fault context. */
+	@WrapOperation(
+			method = "createDevice(JLcom/mojang/blaze3d/shaders/ShaderSource;Lcom/mojang/blaze3d/shaders/GpuDebugOptions;Ljava/lang/Runnable;)Lcom/mojang/blaze3d/systems/GpuDevice;",
+			at = @At(value = "INVOKE", target = "Lcom/mojang/blaze3d/vulkan/VulkanPhysicalDevice;hasDeviceExtension(Ljava/lang/String;)Z"))
+	private boolean caustica$preferNvidiaCheckpoints(VulkanPhysicalDevice physicalDevice, String extension,
+			Operation<Boolean> original) {
+		if ("VK_AMD_buffer_marker".equals(extension)
+				&& "NVIDIA".equals(physicalDevice.vendorName())
+				&& physicalDevice.hasDeviceExtension("VK_NV_device_diagnostic_checkpoints")) {
+			return false;
+		}
+		return original.call(physicalDevice, extension);
+	}
+
 	@ModifyArgs(
 			method = "createDevice(JLcom/mojang/blaze3d/shaders/ShaderSource;Lcom/mojang/blaze3d/shaders/GpuDebugOptions;Ljava/lang/Runnable;)Lcom/mojang/blaze3d/systems/GpuDevice;",
 			at = @At(value = "INVOKE", target = "Lcom/mojang/blaze3d/vulkan/VulkanBackend;createDevice(Ljava/util/Collection;Lcom/mojang/blaze3d/vulkan/VulkanPhysicalDevice;Ljava/util/Set;)Lorg/lwjgl/vulkan/VkDevice;"))
@@ -83,12 +101,14 @@ public abstract class VulkanBackendMixin {
 						extension, physicalDevice.deviceName());
 			}
 		}
+		VulkanDiagnostics.addDeviceFaultExtension(augmented, physicalDevice);
 		RtDeviceBringup.addExtensions(augmented, physicalDevice);
 		args.set(0, augmented);
 
 		caustica$addCoreDeviceFeatures(args, physicalDevice);
-
+		VulkanDiagnostics.addDeviceFaultFeature(args);
 		RtDeviceBringup.addFeatures(args, physicalDevice);
+		VulkanDiagnostics.logEnabledExtensions(augmented);
 	}
 
 	@SuppressWarnings("unchecked")
@@ -133,6 +153,16 @@ public abstract class VulkanBackendMixin {
 			at = @At(value = "INVOKE", target = "Lcom/mojang/blaze3d/vulkan/VulkanBackend;createVma(Lorg/lwjgl/vulkan/VkDevice;)J"))
 	private void caustica$probeRayTracing(long window, ShaderSource defaultShaderSource, GpuDebugOptions debugOptions,
 			Runnable criticalShaderLoader, CallbackInfoReturnable<GpuDevice> cir, @Local VkDevice device) {
+		VulkanDiagnostics.probe(device);
 		RtDeviceBringup.probe(device);
+	}
+
+	@Inject(
+			method = "createDevice(Ljava/util/Collection;Lcom/mojang/blaze3d/vulkan/VulkanPhysicalDevice;Ljava/util/Set;)Lorg/lwjgl/vulkan/VkDevice;",
+			at = @At(value = "INVOKE", target = "Lorg/lwjgl/vulkan/VK12;vkCreateDevice(Lorg/lwjgl/vulkan/VkPhysicalDevice;Lorg/lwjgl/vulkan/VkDeviceCreateInfo;Lorg/lwjgl/vulkan/VkAllocationCallbacks;Lorg/lwjgl/PointerBuffer;)I"))
+	private static void caustica$attachNvidiaDiagnostics(Collection<String> extensions,
+			VulkanPhysicalDevice physicalDevice, Set<VulkanFeature> features,
+			CallbackInfoReturnable<VkDevice> cir, @Local VkDeviceCreateInfo deviceCreateInfo) {
+		VulkanDiagnostics.attachNvDiagnosticsConfig(deviceCreateInfo, MemoryStack.stackGet());
 	}
 }

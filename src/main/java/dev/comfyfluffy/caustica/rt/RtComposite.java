@@ -11,7 +11,7 @@ import dev.comfyfluffy.caustica.CausticaConfig;
 import dev.comfyfluffy.caustica.CausticaMod;
 import dev.comfyfluffy.caustica.client.CausticaJitter;
 import dev.comfyfluffy.caustica.mixin.CommandEncoderAccessor;
-import dev.comfyfluffy.caustica.rt.gen.PushAddrData;
+import dev.comfyfluffy.caustica.rt.gen.WorldPushConstantsData;
 import dev.comfyfluffy.caustica.rt.gen.WorldPushData;
 import dev.comfyfluffy.caustica.rt.gen.WorldPushData.BreakEntry;
 import dev.comfyfluffy.caustica.rt.gen.WorldPushData.Float2;
@@ -57,7 +57,9 @@ import dev.comfyfluffy.caustica.rt.accel.RtImage;
 import dev.comfyfluffy.caustica.rt.entity.RtEntities;
 import dev.comfyfluffy.caustica.rt.entity.RtEntityTextures;
 import dev.comfyfluffy.caustica.rt.material.RtBlockMaterials;
-import dev.comfyfluffy.caustica.rt.material.RtEntityMaterials;
+import dev.comfyfluffy.caustica.rt.material.RtEmissionSemantics;
+import dev.comfyfluffy.caustica.rt.material.RtMaterialOverrides;
+import dev.comfyfluffy.caustica.rt.material.RtMaterialRegistry;
 import dev.comfyfluffy.caustica.rt.pipeline.RtDisplayPipeline;
 import dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg;
 import dev.comfyfluffy.caustica.rt.pipeline.RtDlssRr;
@@ -96,8 +98,8 @@ public final class RtComposite {
     // owns or calculates a shader byte offset, struct size, array stride, or fixed-array capacity.
     private static final int WORLD_PUSH_SIZE = WorldPushData.BYTE_SIZE;
     // Real inline push constants (fast constant-bank reads), separate from the WorldPush BDA ring above.
-    // tableAddr/entityTableAddr/frameIndex are duplicated so hit shaders skip a global-memory dereference;
-    // PushAddrData is generated from the same Slang module and owns this second ABI as well.
+    // Hot addresses/frameIndex and raygen's debugView avoid unnecessary global-memory dereferences;
+    // WorldPushConstantsData is generated from the same Slang module and owns this second ABI as well.
     private static final int GUIDE_COUNT = 6; // RR guide buffers bound at world-pipeline bindings 3..8
     // Frames a retired per-frame TLAS must outlive before it's freed (> frames-in-flight); matches
     // RtTerrain's deferred-free horizon. The frame TLAS is built + traced this frame, then freed once
@@ -191,14 +193,17 @@ public final class RtComposite {
     // Set at the HEAD of Minecraft.reloadResourcePacks() (mixin): a resource reload recreates the block
     // atlas + entity textures. We tear down the world pipeline there (drops all descriptor references) and
     // rebuild it once the NEW atlas is in place — detected by the atlas view handle changing away from
-    // boundAtlasHandle to a fresh non-zero value (MC's deferred free keeps the old handle live for a few
+    // boundBlockAlbedoAtlasHandle to a fresh non-zero value (MC's deferred free keeps the old handle live for a few
     // frames, so "handle != 0" alone isn't enough to tell old from new).
     private volatile boolean reloadRebindRequested;
     // The block-atlas view handle currently bound into the world pipeline (set by bindWorldTextures).
-    private long boundAtlasHandle;
+    private long boundBlockAlbedoAtlasHandle;
     private int bindlessTextureCapacity;
     // True after the LabPBR atlases have been resolved/bound for the currently alive world pipeline.
     private boolean materialBindingsReady;
+    // Set when a new material epoch is published. The first composite returns to vanilla so the next
+    // client tick can apply RtTerrain's full-clear before any old-epoch primitive IDs are traced.
+    private boolean materialEpochTraceGate;
     // World push data (256 B) lives in a host-visible BDA ring; only the 8-byte slot address is pushed
     // inline (256-byte NVIDIA push constant ceiling is otherwise exhausted by the world push struct).
     // One slot per in-flight frame, cycled per frame so an in-flight slot is never overwritten.
@@ -208,6 +213,10 @@ public final class RtComposite {
     private RtDisplayPipeline displayPipeline;
     private RtImage output;
     private RtImage displayImage;
+    // Resource identity is not a Vk handle: drivers may recycle the same numeric image/view handles after
+    // resize. Increment only after an idle-boundary rebuild, and include it in every persistent descriptor.
+    private long outputResourceGeneration;
+    private GpuTexture mainColorIdentity;
     // Parallel PQ-encoded ([0,1], ST.2084) HDR display image. Written alongside displayImage when HDR is
     // enabled. When the PQ swapchain is active, the combined UI overlay is composited over this image, then
     // this image is blitted straight to the swapchain.
@@ -215,6 +224,7 @@ public final class RtComposite {
     // Set true after this frame's display dispatch wrote hdrDisplayImage (HDR enabled + RT ran); gates the
     // HDR present blit so a frame where RT did not run falls back to the vanilla SDR present.
     private boolean hdrWrittenThisFrame;
+    private boolean compositeProducedThisFrame;
     // DLSS-FG "hudless" resource: a copy of the main render target before the combined UI overlay
     // composites back on top. Lazily allocated (only meaningful once FG + the UI overlay redirect are both
     // active), resized on demand.
@@ -233,6 +243,9 @@ public final class RtComposite {
     // raw-copied (misdisplayed). Lazily created; the image is sized to the swapchain.
     private RtSdrPresentPipeline sdrPresentPipeline;
     private RtImage sdrPresentImage;
+    private long sdrPresentImageGeneration;
+    private GpuTextureView sdrPresentSourceIdentity;
+    private long sdrPresentSourceGeneration;
     // DLSS Frame Generation: per-generated-frame interpolated output images (backbuffer size/format), and
     // the jitter-free reprojection matrices derived from the MV view-projections each frame. In HDR mode
     // these hold DLSSG's raw PQ-encoded output, which is blitted straight to the (PQ) swapchain — no decode
@@ -349,6 +362,35 @@ public final class RtComposite {
 
     public boolean hasFailed() {
         return this.failed;
+    }
+
+    /**
+     * Whether the current frame must retain vanilla world rendering while RT resource state converges.
+     *
+     * <p>The composite still runs at the normal seam so it can consume the one-frame epoch gate or observe
+     * the newly uploaded atlas. This method only prevents {@code LevelRenderer} from being cancelled before
+     * a deliberately transient {@link #composite} return. Such a return is not a renderer failure and must
+     * not trip {@code VanillaRenderController}'s permanent safety latch.</p>
+     */
+    public boolean requiresVanillaWorldFallback() {
+        // Pipeline creation publishes a new material epoch and deliberately makes composite() return
+        // false once so RtTerrain can apply the matching full clear. Keep vanilla alive for that bring-up
+        // frame; otherwise LevelRenderer is cancelled before composite() discovers it must fall back and
+        // VanillaRenderController permanently latches the resulting missing replacement frame.
+        if (worldPipeline == null || !materialBindingsReady) {
+            return true;
+        }
+        if (materialEpochTraceGate) {
+            return true;
+        }
+        if (RtEntityTextures.maxTextures() > bindlessTextureCapacity) {
+            return true;
+        }
+        if (reloadRebindRequested) {
+            long atlas = blockAlbedoAtlasView();
+            return atlas == 0L || atlas == boundBlockAlbedoAtlasHandle;
+        }
+        return false;
     }
 
     /**
@@ -496,15 +538,19 @@ public final class RtComposite {
      * here every frame makes {@link #isHdrPresentActive()} false on menu frames so the SDR convert-present path
      * runs instead.
      */
-    public void beginFrame() {
+    public void beginFrame(boolean resizeTransition) {
         if (pendingTerrainGraphicsUse != 0L) {
             throw new IllegalStateException("Previous RT terrain graphics use was never completed");
         }
         RtFrameStats.FRAME.beginIfInactive();
         hdrWrittenThisFrame = false;
+        compositeProducedThisFrame = false;
         // captureFrame() runs later while renderLevel builds this frame's projection. Never let a resize,
         // minimize, or early-return frame composite with a projection captured on a previous frame.
         frameCaptured = false;
+        if (resizeTransition) {
+            resetTemporalHistory();
+        }
     }
 
     /** Record terrain retirement completion after the frame's final TLAS consumer (world overlay). */
@@ -529,6 +575,7 @@ public final class RtComposite {
 
     public boolean composite(GpuTexture nativeColor, int width, int height) {
         frameCounter++; // global frame serial used by remaining per-frame/entity rings and diagnostics
+        VulkanDiagnostics.setInFlight("graphics-latest", "frame=" + frameCounter + " size=" + width + "x" + height);
         hdrWrittenThisFrame = false; // set true again below once this frame's HDR display image is written
         if (failed) {
             return false;
@@ -542,6 +589,12 @@ public final class RtComposite {
             return false;
         }
         ctx.gpuExecutor().throwIfFailed();
+        if (mainColorIdentity != nativeColor) {
+            mainColorIdentity = nativeColor;
+            // A same-extent backing replacement is still a temporal discontinuity even though ensureOutput
+            // has no reason to resize its own images.
+            resetTemporalHistory();
+        }
         // Count-bounded terrain streaming (dispatch/drain/build kick) runs here once per render frame — before
         // the ready gate below, because it is what MAKES terrain ready during the initial fill.
         try {
@@ -569,8 +622,8 @@ public final class RtComposite {
             // leaving the handle 0 transiently). Skip RT — vanilla renders — until the handle becomes a
             // fresh, non-zero value different from what we last bound; only then rebuild against it.
             if (reloadRebindRequested) {
-                long atlas = blockAtlasView();
-                if (atlas == 0L || atlas == boundAtlasHandle) {
+                long atlas = blockAlbedoAtlasView();
+                if (atlas == 0L || atlas == boundBlockAlbedoAtlasHandle) {
                     return false;
                 }
             }
@@ -581,9 +634,15 @@ public final class RtComposite {
             exposure.ensureResources(ctx);
             refreshPipelineShapeIfNeeded(ctx);
             RtPipeline active = ensureWorld(ctx);
+            if (materialEpochTraceGate) {
+                materialEpochTraceGate = false;
+                return false;
+            }
             refreshMaterialBindingsIfNeeded(ctx);
             updateMotion();
             recordFrame(ctx, active, nativeColor);
+            compositeProducedThisFrame = true;
+            hdrWrittenThisFrame = CausticaConfig.Rt.Hdr.enabled();
             if (!loggedActive) {
                 loggedActive = true;
                 CausticaMod.LOGGER.info("RT composite active (terrain): {}x{}, RT output replaces the world target", width, height);
@@ -599,9 +658,8 @@ public final class RtComposite {
 
     /**
      * Bring the world pipeline + LabPBR atlases up as soon as we're in a world and the block atlas is
-     * loaded — <em>before</em> terrain tessellates — so per-prim material flags ({@code hasS}/{@code
-     * hasN}) resolve from the first section. That makes PBR-on-join structural rather than relying on a
-     * re-extract after the fact. Driven from the client tick ahead of {@link RtTerrain#update}. No-op once
+     * loaded — <em>before</em> terrain tessellates — so the immutable material snapshot is available to
+     * the first worker section. Driven from the client tick ahead of {@link RtTerrain#update}. No-op once
      * the pipeline exists, while a reload rebuild is pending (the reload path rebuilds against the new
      * atlas), or until we're in a world with the atlas ready. The heavy {@code _s}/{@code _n} atlases are
      * deliberately not built at the menu — only once a world is entered.
@@ -610,7 +668,7 @@ public final class RtComposite {
         if (failed || worldPipeline != null || reloadRebindRequested) {
             return;
         }
-        if (Minecraft.getInstance().level == null || blockAtlasView() == 0L) {
+        if (Minecraft.getInstance().level == null || blockAlbedoAtlasView() == 0L) {
             return;
         }
         try {
@@ -626,8 +684,8 @@ public final class RtComposite {
             bindlessTextureCapacity = RtEntityTextures.maxTextures();
             worldPipeline = RtPipeline.create(ctx, RtDeviceBringup.worldRaygenShader(),
                     new String[]{"world.rmiss.spv"}, "world.rchit.spv", "world.rahit.spv",
-                    PushAddrData.BYTE_SIZE, true, GUIDE_COUNT, bindlessTextureCapacity, true, true);
-            // Per-frame push data lives in this BDA ring; the pipeline only pushes its address.
+                    WorldPushConstantsData.BYTE_SIZE, true, GUIDE_COUNT, bindlessTextureCapacity, true);
+            // Per-frame world data lives in this BDA ring; the pipeline pushes its address and hot fields.
             if (pushRing == null) {
                 pushRing = new RtBuffer[PUSH_RING];
                 for (int i = 0; i < PUSH_RING; i++) {
@@ -664,37 +722,26 @@ public final class RtComposite {
 
     /**
      * Resolve + bind every world-pipeline texture: the block atlas (binding 2 + bindless fallback slot 0)
-     * and the LabPBR {@code _s}/{@code _n} parallel atlases (bindings 9/10). Shared by first creation and
-     * the post-reload rebind. Resets the entity bindless registry and recreates the {@code _s}/{@code _n}
-     * atlases at the current block-atlas size, then re-extracts all terrain ({@link RtTerrain#markAllDirty})
-     * so per-prim material flags are recomputed against the (re)built atlases. On first creation this runs
-     * before terrain is resident (see {@link #ensureResourcesReady}), so the re-extract is a no-op and PBR
-     * is structural; on a resource reload it refreshes the flags of the already-resident terrain.
+     * and the canonical material page bundles in reserved bindless slots. Shared by first creation and
+     * the post-reload rebind. Resets the entity bindless registry, recreates material pages, builds
+     * the shared material registry, and invalidates old-epoch geometry before tracing resumes.
      */
     private void bindWorldTextures(RtContext ctx) {
         long sampler = atlasSampler(ctx);
-        long atlasView = blockAtlasView();
-        boundAtlasHandle = atlasView; // remember what we bound so a reload can detect the new atlas
-        worldPipeline.setAtlasSampler(atlasView, sampler);
+        long atlasView = blockAlbedoAtlasView();
+        boundBlockAlbedoAtlasHandle = atlasView; // remember what we bound so a reload can detect the new atlas
+        worldPipeline.setBlockAlbedoAtlas(atlasView, sampler);
         // Bindless slot 0 = fallback texture (the block atlas) so an entity whose texture can't be
         // resolved samples something defined rather than an unbound (partially-bound) descriptor.
+        RtBlockMaterials.INSTANCE.reset();
+        RtMaterialOverrides materialOverrides = RtMaterialOverrides.load();
+        RtEmissionSemantics emissionSemantics = RtEmissionSemantics.analyze();
+        RtBlockMaterials.INSTANCE.prepareAll(ctx, bindlessTextureCapacity, emissionSemantics, materialOverrides);
         RtEntityTextures.INSTANCE.reset(bindlessTextureCapacity);
-        worldPipeline.setBindlessTexture(0, 0, atlasView, sampler); // binding 0 (albedo), slot 0 fallback
-        // LabPBR _s + _n parallel atlases. Bind the (block-atlas-sized) atlases; their pixels fill
-        // lazily as terrain extraction encounters sprites and refresh via flush(). Fall back to the block
-        // atlas view if an atlas didn't initialize so bindings 9/10 always hold a valid descriptor —
-        // the shader only samples them when a prim is flagged (mat.z/mat.w), so the fallback is never read.
-        if (worldPipeline.hasBlockMaterialAtlases()) {
-            RtBlockMaterials.INSTANCE.reset();
-            // Build the full _s/_n atlases now (parallel decode + blit), before terrain tessellates, so
-            // ensure() is a pure lookup on the build path instead of decoding each sprite's maps lazily.
-            RtBlockMaterials.INSTANCE.prepareAll();
-            long specView = RtBlockMaterials.INSTANCE.viewS();
-            long normalView = RtBlockMaterials.INSTANCE.viewN();
-            worldPipeline.setBlockSpecAtlas(specView != 0L ? specView : atlasView, sampler);
-            worldPipeline.setBlockNormalAtlas(normalView != 0L ? normalView : atlasView, sampler);
-            materialBindingsReady = true;
-        }
+        worldPipeline.setEntityAlbedoTexture(0, atlasView, sampler);
+        RtBlockMaterials.INSTANCE.bindPages(worldPipeline, sampler);
+        RtMaterialRegistry.INSTANCE.rebuild(ctx, RtBlockMaterials.INSTANCE, materialOverrides);
+        materialBindingsReady = true;
         // Sky rewrite: bind the vanilla celestials atlas (sun + moon phases) for world.rmiss. The view
         // handle is stable across frames; the shader only samples it inside the sun/moon discs (sky
         // directions), so the block-atlas fallback is never read if the celestials atlas isn't ready.
@@ -703,7 +750,10 @@ public final class RtComposite {
             worldPipeline.setSkyAtlas(celView != 0L ? celView : atlasView, sampler);
         }
         setCelestialUvAtlas(celView);
-        RtTerrain.markAllDirty();
+        // Atlas UVs and material IDs are one resource epoch. Drop old terrain as a unit rather than
+        // incrementally displaying old UVs/IDs against the new atlas/table.
+        RtTerrain.requestFullClear();
+        materialEpochTraceGate = true;
     }
 
     private void refreshMaterialBindingsIfNeeded(RtContext ctx) {
@@ -734,19 +784,22 @@ public final class RtComposite {
      * the world pipeline outright</b> — dropping every descriptor reference (block atlas binding 2 +
      * bindless set) — so MC can free its textures cleanly. The pipeline is cheap to rebuild (no terrain
      * re-upload); {@code ensureWorld} recreates it on the first world frame after the reload, once the new
-     * atlas is ready (gated in {@link #composite}). Terrain stays resident and is re-extracted via
-     * {@code markAllDirty()} so material flags pick up the new pack.
+     * atlas is ready (gated in {@link #composite}). The new material epoch clears terrain before trace.
      */
     public void onResourceReloadStart() {
         reloadRebindRequested = true;
         materialBindingsReady = false;
         setCelestialUvAtlas(0L);
+        RtEntities.INSTANCE.onResourceReload();
         RtContext ctx = RtContext.currentOrNull();
-        if (ctx != null && worldPipeline != null) {
+        if (ctx != null) {
             ctx.waitIdle();
-            worldPipeline.destroy();
-            worldPipeline = null;
-            bindlessTextureCapacity = 0;
+            if (worldPipeline != null) {
+                worldPipeline.destroy();
+                worldPipeline = null;
+                bindlessTextureCapacity = 0;
+            }
+            RtMaterialRegistry.INSTANCE.destroy();
         }
     }
 
@@ -810,6 +863,13 @@ public final class RtComposite {
         int nextRenderH = optimal != null ? optimal[1] : height;
 
         ctx.waitIdle(); // resize is rare; no in-flight frame may use the old image/descriptor
+        // Persistent sets must not retain a destroyed image generation. Allocate replacements while the
+        // previous resources are still alive so a Vulkan allocation failure leaves a usable old generation.
+        exposure.recreatePipeline(ctx);
+        displayPipeline.reallocateDescriptorSet();
+        if (worldPipeline != null) {
+            worldPipeline.reallocateDescriptorSets();
+        }
         // Release NGX before destroying resources supplied to its previous evaluate. Recreating it later in
         // recordFrame also guarantees a clean history for the new render/display extent.
         RtDlssRr.INSTANCE.releaseFeatureForReconfigure();
@@ -855,14 +915,21 @@ public final class RtComposite {
         gSpecMotion = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16_SFLOAT, "guide specular motion " + renderW + "x" + renderH);
         // Display-res RT image the display mapper reads. Always present (DLSS-RR target, or blit-upscale fallback).
         rrOutput = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "DLSS-RR output " + width + "x" + height);
+        outputResourceGeneration++;
         exposure.ensureResources(ctx);
 
         resetTemporalHistory(); // recreated images -> first MV/cloud/RR frame has no stale history
+        exposure.invalidateBindings();
         if (worldPipeline != null) {
             worldPipeline.setStorageImage(output.view);
             bindGuideImages();
         }
-        displayPipeline.setImages(displayImage.view, rrOutput.view, exposure.image().view, hdrDisplayImage.view);
+        // Generation participates in the cache key, so recycled numeric VkImageViews still force a rewrite.
+        displayPipeline.setImages(displayImage.view, rrOutput.view, exposure.image().view, hdrDisplayImage.view,
+                outputResourceGeneration);
+        if (hdrCompositePipeline != null) {
+            hdrCompositePipeline.invalidateBindings();
+        }
     }
 
     /**
@@ -1034,7 +1101,6 @@ public final class RtComposite {
                     new Float3((float) (camX - terrain.blockX), (float) (camY - terrain.blockY),
                             (float) (camZ - terrain.blockZ)),
                     terrain.tableAddress(),
-                    debugView,
                     (int) frameCounter,
                     mvPushMatrix,
                     new Float3(mvCamDeltaX, mvCamDeltaY, mvCamDeltaZ),
@@ -1065,10 +1131,6 @@ public final class RtComposite {
             ).write(push);
             // Upload any entity textures registered this frame into the bindless set before the trace.
             RtEntityTextures.INSTANCE.uploadPending(active, atlasSampler(ctx));
-            // Re-upload the LabPBR _s atlas if extraction added sprites since the last frame (the
-            // view handle is stable, so no re-bind needed). Before the trace records, like uploadPending.
-            RtBlockMaterials.INSTANCE.flush();
-            RtEntityMaterials.INSTANCE.flushAll(); // block-entity parallel _s/_n blitted during capture
             // Build the entity BLAS this frame, then the TLAS that references them (+ the already-built
             // terrain BLAS), then the trace — each separated by a barrier. The frame TLAS is retired
             // KEEP_FRAMES later (entity meshes/BLAS are retired by RtEntities on the same horizon).
@@ -1080,7 +1142,7 @@ public final class RtComposite {
             }
             RtAccel.PreparedTlas frameTlas;
             try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("frame.prepareTlas")) {
-                frameTlas = RtAccel.prepareTlas(ctx, fe.instances(), tlasRing);
+                frameTlas = RtAccel.prepareTlas(ctx, fe.baseInstances(), fe.dynamicInstances(), tlasRing);
             }
             active.setTlas(frameTlas.accel.handle);
             currentTlasHandle = frameTlas.accel.handle;
@@ -1089,15 +1151,14 @@ public final class RtComposite {
             }
             VulkanCommandEncoder.memoryBarrier(cmd, stack); // TLAS build visible to the trace
 
-            // Push the BDA ring slot's address plus the small hot subset that rchit/rahit read on every
-            // hit (tableAddr/entityTableAddr/frameIndex) as real inline push constants, so those lookups
-            // don't pay for a second global-memory dereference through pcAddr.worldPushAddr first.
-            ByteBuffer pushAddr = stack.malloc(PushAddrData.BYTE_SIZE);
-            new PushAddrData(pushBuf.deviceAddress, terrain.tableAddress(), fe.geomTableAddr(),
-                    (int) frameCounter).write(pushAddr);
+            // Push the BDA ring slot's address plus the small hot subset used directly by the shaders.
+            ByteBuffer pushConstants = stack.malloc(WorldPushConstantsData.BYTE_SIZE);
+            new WorldPushConstantsData(pushBuf.deviceAddress, terrain.tableAddress(), fe.geomTableAddr(),
+                    RtMaterialRegistry.INSTANCE.tableAddress(),
+                    (int) frameCounter, debugView).write(pushConstants);
             try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "world trace");
                  RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.trace")) {
-                active.trace(cmd, renderW, renderH, pushAddr);
+                active.trace(cmd, renderW, renderH, pushConstants);
             }
             VulkanCommandEncoder.memoryBarrier(cmd, stack); // RT writes visible to DLSS reads
             // DLSS-RR denoise + upscale. The RT pass wrote noisy color (render res) + guides;
@@ -1132,7 +1193,7 @@ public final class RtComposite {
             // regardless of SPP, keeping exposure consistent.
             try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "exposure");
                  RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.exposure")) {
-                exposure.record(ctx, cmd, stack, rrOutput);
+                exposure.record(ctx, cmd, stack, rrOutput, outputResourceGeneration);
             }
             VulkanCommandEncoder.memoryBarrier(cmd, stack); // exposure image visible to the display mapper
 
@@ -1141,7 +1202,6 @@ public final class RtComposite {
                 displayPipeline.dispatch(cmd, displayW, displayH, CausticaConfig.Rt.Hdr.enabled(),
                         CausticaConfig.Rt.Hdr.paperWhiteNits(), CausticaConfig.Rt.Hdr.headroom());
             }
-            hdrWrittenThisFrame = CausticaConfig.Rt.Hdr.enabled();
             VulkanCommandEncoder.memoryBarrier(cmd, stack);
 
             try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "copy composite to main target");
@@ -1421,6 +1481,11 @@ public final class RtComposite {
             sdrPresentImage.destroy();
             sdrPresentImage = null;
         }
+        mainColorIdentity = null;
+        outputResourceGeneration = 0L;
+        sdrPresentImageGeneration = 0L;
+        sdrPresentSourceIdentity = null;
+        sdrPresentSourceGeneration = 0L;
         for (RtImage img : fgInterp) {
             if (img != null) {
                 img.destroy();
@@ -1436,6 +1501,8 @@ public final class RtComposite {
         }
         bindlessTextureCapacity = 0;
         materialBindingsReady = false;
+        materialEpochTraceGate = false;
+        RtMaterialRegistry.INSTANCE.destroy();
         if (pushRing != null) {
             for (RtBuffer b : pushRing) {
                 if (b != null) {
@@ -1458,7 +1525,7 @@ public final class RtComposite {
             try (MemoryStack stack = MemoryStack.stackPush()) {
                 VkSamplerCreateInfo sci = VkSamplerCreateInfo.calloc(stack).sType$Default()
                         .magFilter(VK10.VK_FILTER_NEAREST).minFilter(VK10.VK_FILTER_NEAREST)
-                        .mipmapMode(VK10.VK_SAMPLER_MIPMAP_MODE_NEAREST)
+                        .mipmapMode(VK10.VK_SAMPLER_MIPMAP_MODE_LINEAR)
                         .addressModeU(VK10.VK_SAMPLER_ADDRESS_MODE_REPEAT)
                         .addressModeV(VK10.VK_SAMPLER_ADDRESS_MODE_REPEAT)
                         .addressModeW(VK10.VK_SAMPLER_ADDRESS_MODE_REPEAT)
@@ -1474,7 +1541,7 @@ public final class RtComposite {
         return atlasSampler;
     }
 
-    private static long blockAtlasView() {
+    private static long blockAlbedoAtlasView() {
         GpuTextureView view = Minecraft.getInstance().getTextureManager()
                 .getTexture(TextureAtlas.LOCATION_BLOCKS).getTextureView();
         return vkImageView(view);
@@ -1552,7 +1619,8 @@ public final class RtComposite {
             // the compute pass. A memory barrier first makes the overlay writes + the world HDR writes visible
             // to the compute; the dep1 barrier below (ALL writes -> transfer read) then covers the compute's
             // HDR write for the blit.
-            long overlayView = RtUiOverlay.populatedThisFrame() ? RtUiOverlay.overlayColorView() : 0L;
+            long overlayView = RtUiOverlay.populatedThisFrame(src.width, src.height)
+                    ? RtUiOverlay.overlayColorView() : 0L;
             if (overlayView != 0L) {
                 ensureHdrUiResources();
                 if (hdrCompositePipeline != null) {
@@ -1560,7 +1628,8 @@ public final class RtComposite {
                     pre.get(0).srcStageMask(65536L).srcAccessMask(65536L).dstStageMask(2048L).dstAccessMask(98304L);
                     VkDependencyInfo preDep = VkDependencyInfo.calloc(stack).sType$Default().pMemoryBarriers(pre);
                     KHRSynchronization2.vkCmdPipelineBarrier2KHR(cmd, preDep);
-                    hdrCompositePipeline.setImages(hdrDisplayImage.view, overlayView, hdrUiSampler);
+                    hdrCompositePipeline.setImages(hdrDisplayImage.view, overlayView, hdrUiSampler,
+                            outputResourceGeneration, RtUiOverlay.overlayGeneration());
                     hdrCompositePipeline.dispatch(cmd, src.width, src.height, CausticaConfig.Rt.Hdr.paperWhiteNits());
                 }
                 RtUiOverlay.markConsumed();
@@ -1657,7 +1726,8 @@ public final class RtComposite {
      * unavailable.
      */
     public boolean presentSdrToPq(VulkanCommandEncoder enc, long swapchainImage, int swapW, int swapH,
-            long sdrMainView, long acquireSem, long presentSem) {
+            GpuTextureView sdrMainTextureView, long acquireSem, long presentSem) {
+        long sdrMainView = vkImageView(sdrMainTextureView);
         if (sdrMainView == 0L || failed) {
             return false;
         }
@@ -1668,12 +1738,24 @@ public final class RtComposite {
         if (sdrPresentPipeline == null) {
             sdrPresentPipeline = RtSdrPresentPipeline.create(ctx);
         }
-        if (sdrPresentImage == null || sdrPresentImage.width != swapW || sdrPresentImage.height != swapH) {
+        boolean presentImageRecreated = sdrPresentImage == null
+                || sdrPresentImage.width != swapW || sdrPresentImage.height != swapH;
+        boolean sourceImageRecreated = sdrPresentSourceIdentity != sdrMainTextureView;
+        boolean priorDescriptorMayBeInFlight = sdrPresentImage != null && sdrPresentSourceIdentity != null;
+        if ((presentImageRecreated || sourceImageRecreated) && priorDescriptorMayBeInFlight) {
+            ctx.waitIdle();
+        }
+        if (presentImageRecreated) {
             if (sdrPresentImage != null) {
                 sdrPresentImage.destroy();
             }
             sdrPresentImage = ctx.createStorageImage(swapW, swapH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
                     "RT SDR->PQ present image " + swapW + "x" + swapH);
+            sdrPresentImageGeneration++;
+        }
+        if (sourceImageRecreated) {
+            sdrPresentSourceIdentity = sdrMainTextureView;
+            sdrPresentSourceGeneration++;
         }
         RtImage dst = sdrPresentImage;
         int copyW = Math.min(swapW, dst.width);
@@ -1687,7 +1769,8 @@ public final class RtComposite {
             VkDependencyInfo preDep = VkDependencyInfo.calloc(stack).sType$Default().pMemoryBarriers(pre);
             KHRSynchronization2.vkCmdPipelineBarrier2KHR(cmd, preDep);
 
-            sdrPresentPipeline.setImages(dst.view, sdrMainView, hdrUiSampler);
+            sdrPresentPipeline.setImages(dst.view, sdrPresentImageGeneration, sdrMainView,
+                    sdrPresentSourceGeneration, hdrUiSampler);
             sdrPresentPipeline.dispatch(cmd, dst.width, dst.height, CausticaConfig.Rt.Hdr.paperWhiteNits());
 
             // Swapchain UNDEFINED -> TRANSFER_DST, plus make the compute write visible to the blit read.
@@ -1758,7 +1841,8 @@ public final class RtComposite {
      * copy the ALREADY-composited backbuffer, which is useless as a distinct hudless input.
      */
     public void captureFgHudless(RenderTarget main) {
-        if (!RtDlssFg.enabled() || !RtUiOverlay.enabled() || main == null || main.getColorTexture() == null) {
+        if (!compositeProducedThisFrame || !RtDlssFg.enabled() || !RtUiOverlay.enabled()
+                || main == null || main.getColorTexture() == null) {
             return;
         }
         var color = main.getColorTexture();
@@ -1862,7 +1946,7 @@ public final class RtComposite {
      */
     public RtImage fgInterpolate(VulkanCommandEncoder enc, long backbufferView, long backbufferImage,
             int swapW, int swapH, int index, int count, boolean hdrBackbuffer) {
-        if (failed || gDepth == null || gMotion == null || !frameCaptured) {
+        if (failed || gDepth == null || gMotion == null || !frameCaptured || !compositeProducedThisFrame) {
             return null;
         }
         RtContext ctx = RtContext.currentOrNull();
@@ -1894,8 +1978,7 @@ public final class RtComposite {
         long hudlessView = hudlessReady ? hudlessSrc.view : 0L;
         long hudlessImg = hudlessReady ? hudlessSrc.image : 0L;
         int hudlessFmt = hdrBackbuffer ? VK10.VK_FORMAT_R16G16B16A16_SFLOAT : VK10.VK_FORMAT_R8G8B8A8_UNORM;
-        boolean uiReady = RtUiOverlay.populatedThisFrame()
-                && RtUiOverlay.overlayWidth() == swapW && RtUiOverlay.overlayHeight() == swapH
+        boolean uiReady = RtUiOverlay.populatedThisFrame(swapW, swapH)
                 && RtUiOverlay.overlayColorView() != 0L && RtUiOverlay.overlayColorImage() != 0L;
         long uiView = uiReady ? RtUiOverlay.overlayColorView() : 0L;
         long uiImg = uiReady ? RtUiOverlay.overlayColorImage() : 0L;

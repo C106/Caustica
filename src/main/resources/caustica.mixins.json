@@ -15,6 +15,7 @@
 		"LevelExtractorMixin",
 		"MinecraftMixin",
 		"MinecraftReloadMixin",
+		"ModelPartAccessor",
 		"OptionsMixin",
 		"OptionsSubScreenAccessor",
 		"ParticleEngineAccessor",
@@ -27,6 +28,7 @@
 		"VulkanBackendMixin",
 		"VulkanGpuSurfaceMixin",
 		"VulkanInstanceMixin",
+		"VulkanUtilsMixin",
 		"VulkanGpuTextureAccessor"
 	],
 	"injectors": {
