@@ -120,6 +120,12 @@ public final class VanillaRenderController {
 		}
 	}
 
+	/** Re-arm vanilla cancellation after an explicit render-state rebuild. */
+	public void resetFailureLatch() {
+		this.failureLatched = false;
+		this.lastLoggedInactiveReason = null;
+	}
+
 	private String findInactiveReason(RenderTarget mainTarget) {
 		if (this.failureLatched || RtComposite.INSTANCE.hasFailed()) {
 			return "RT composite failure latch is set";
@@ -135,6 +141,18 @@ public final class VanillaRenderController {
 		}
 		if (mainTarget == null || mainTarget.getColorTexture() == null || mainTarget.getDepthTexture() == null) {
 			return "main render target textures are not ready";
+		}
+		if (mainTarget.width <= 0 || mainTarget.height <= 0) {
+			return "main render target has zero extent";
+		}
+		var color = mainTarget.getColorTexture();
+		var depth = mainTarget.getDepthTexture();
+		if (color.isClosed() || depth.isClosed()) {
+			return "main render target textures are closed";
+		}
+		if (color.getWidth(0) != mainTarget.width || color.getHeight(0) != mainTarget.height
+				|| depth.getWidth(0) != mainTarget.width || depth.getHeight(0) != mainTarget.height) {
+			return "main render target resize is still in progress";
 		}
 		return null;
 	}

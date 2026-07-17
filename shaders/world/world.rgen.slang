@@ -1186,6 +1186,20 @@ void main() {
     float3 dir = normalize(farP - nearP);
     float rayConeSpread = primaryRayConeSpread(jndc, size, dir);
 
+    // Slang lowers these module statics to uninitialized function variables after inlining. Every normal
+    // bounce-0 path overwrites them, but a malformed/transient first-frame trace must still never feed
+    // undefined (especially NaN) guides into RR and poison its temporal history. Start from a valid sky
+    // guide; the first SPP sample replaces it as soon as primary visibility resolves.
+    gv_normal = float3(0.0, 0.0, 0.0);
+    gv_albedo = SKY_DIFF_ALBEDO;
+    gv_specAlb = SKY_SPEC_ALBEDO;
+    gv_rough = 1.0;
+    gv_depth = 0.0;
+    gv_hitCamRel = dir * 1.0e6;
+    gv_motionHitCamRel = gv_hitCamRel;
+    gv_motionUseRefracted = false;
+    gv_motionObjDisp = float3(0.0, 0.0, 0.0);
+
     uint seed = (uint(pix.x) * 1973u + uint(pix.y) * 9277u + 26699u) ^ (pc.frameIndex * 2654435761u);
 
     uint spp = max(pc.spp, 1u);

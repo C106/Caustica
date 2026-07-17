@@ -77,6 +77,16 @@ public final class RtDlssRr {
     }
 
     /**
+     * Release the extent-specific feature before its last input/output images are destroyed. NGX may retain
+     * Vulkan descriptors for resources supplied by the previous evaluation until the feature is released.
+     */
+    public void releaseFeatureForReconfigure() {
+        if (((GpuDeviceAccessor) RenderSystem.getDevice()).caustica$getBackend() instanceof VulkanDevice device) {
+            releaseFeature(device);
+        }
+    }
+
+    /**
      * Record a DLSS-RR evaluation: denoise + upscale the noisy path-traced color (at render res) using
      * the guide buffers, writing the display-res result into {@code out}. {@code jitterX/jitterY} is the
      * sub-pixel camera jitter applied to the primary ray this frame, in render pixels. Returns false
@@ -256,6 +266,8 @@ public final class RtDlssRr {
         featureDisplayHeight = -1;
         featureQuality = Integer.MIN_VALUE;
         featurePreset = Integer.MIN_VALUE;
+        resetHistory = true;
+        lastFrameNanos = 0L;
     }
 
     private static boolean isNull(MemorySegment segment) {

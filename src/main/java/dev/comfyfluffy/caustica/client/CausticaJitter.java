@@ -35,6 +35,13 @@ public final class CausticaJitter {
 		return this.pixelsY;
 	}
 
+	/** Restart the sequence after a resize or another temporal-history discontinuity. */
+	public void reset() {
+		this.frameIndex = 0;
+		this.pixelsX = 0.0f;
+		this.pixelsY = 0.0f;
+	}
+
 	private static int jitterPhaseCount(int renderWidth, int displayWidth) {
 		float ratio = (float) displayWidth / Math.max(1, renderWidth);
 		return Math.max(32, (int) Math.ceil(8.0f * ratio * ratio));

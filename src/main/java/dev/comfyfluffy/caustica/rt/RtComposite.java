@@ -363,6 +363,20 @@ public final class RtComposite {
         }
     }
 
+    /** Drop all cross-frame state after a world/dimension/render-state discontinuity. */
+    public void invalidateTemporalState() {
+        frameCaptured = false;
+        resetTemporalHistory();
+    }
+
+    private void resetTemporalHistory() {
+        mvHasPrev = false;
+        cloudWindHasPrev = false;
+        fgReset = true;
+        CausticaJitter.INSTANCE.reset();
+        RtDlssRr.INSTANCE.requestHistoryReset();
+    }
+
     /** Capture the frame's camera for the next composite. Called from GameRendererMixin. */
     public void captureFrame(Matrix4f projection, Matrix4fc viewRotation, double cameraX, double cameraY, double cameraZ) {
         frameProjection.set(projection);
@@ -488,6 +502,9 @@ public final class RtComposite {
         }
         RtFrameStats.FRAME.beginIfInactive();
         hdrWrittenThisFrame = false;
+        // captureFrame() runs later while renderLevel builds this frame's projection. Never let a resize,
+        // minimize, or early-return frame composite with a projection captured on a previous frame.
+        frameCaptured = false;
     }
 
     /** Record terrain retirement completion after the frame's final TLAS consumer (world overlay). */
@@ -514,6 +531,10 @@ public final class RtComposite {
         frameCounter++; // global frame serial used by remaining per-frame/entity rings and diagnostics
         hdrWrittenThisFrame = false; // set true again below once this frame's HDR display image is written
         if (failed) {
+            return false;
+        }
+        if (nativeColor == null || nativeColor.isClosed() || width <= 0 || height <= 0
+                || nativeColor.getWidth(0) != width || nativeColor.getHeight(0) != height) {
             return false;
         }
         RtContext ctx = RtContext.get();
@@ -781,15 +802,28 @@ public final class RtComposite {
                 && renderSizeRrEnabled == rrEnabled && renderSizeRrQuality == rrQuality) {
             return;
         }
+
+        // Query first, while the previous output set is still intact. A transient NGX query failure must not
+        // leave fields pointing at images that were already destroyed.
+        int[] optimal = rrEnabled ? RtDlssRr.INSTANCE.queryOptimalRenderSize(width, height) : null;
+        int nextRenderW = optimal != null ? optimal[0] : width;
+        int nextRenderH = optimal != null ? optimal[1] : height;
+
         ctx.waitIdle(); // resize is rare; no in-flight frame may use the old image/descriptor
+        // Release NGX before destroying resources supplied to its previous evaluate. Recreating it later in
+        // recordFrame also guarantees a clean history for the new render/display extent.
+        RtDlssRr.INSTANCE.releaseFeatureForReconfigure();
         if (displayImage != null) {
             displayImage.destroy();
+            displayImage = null;
         }
         if (hdrDisplayImage != null) {
             hdrDisplayImage.destroy();
+            hdrDisplayImage = null;
         }
         if (output != null) {
             output.destroy();
+            output = null;
         }
         destroyGuideImages();
 
@@ -800,9 +834,8 @@ public final class RtComposite {
         // With RR on, ask NGX what render resolution its chosen quality mode actually expects rather
         // than assuming a fixed ratio: different quality modes (and driver versions) use different
         // ratios, and DLSSD's own optimal-settings query is the source of truth for what it will accept.
-        int[] optimal = rrEnabled ? RtDlssRr.INSTANCE.queryOptimalRenderSize(width, height) : null;
-        renderW = optimal != null ? optimal[0] : width;
-        renderH = optimal != null ? optimal[1] : height;
+        renderW = nextRenderW;
+        renderH = nextRenderH;
         renderSizeRrEnabled = rrEnabled;
         renderSizeRrQuality = rrQuality;
 
@@ -824,8 +857,7 @@ public final class RtComposite {
         rrOutput = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "DLSS-RR output " + width + "x" + height);
         exposure.ensureResources(ctx);
 
-        mvHasPrev = false; // recreated images -> first MV frame is zero
-        cloudWindHasPrev = false;
+        resetTemporalHistory(); // recreated images -> first MV/cloud/RR frame has no stale history
         if (worldPipeline != null) {
             worldPipeline.setStorageImage(output.view);
             bindGuideImages();
