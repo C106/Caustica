@@ -59,7 +59,8 @@ public final class CausticaConfig {
             Rt.ENABLED, Rt.Composite.SPP, Rt.Composite.MAX_BOUNCES, Rt.Terrain.ASYNC_DISPATCH_PER_PASS, Rt.Omm.ENABLED,
             Rt.Entities.ENABLED, Rt.Entities.GLOW_ENABLED, Rt.EntityTextures.MAX_TEXTURES, Rt.DlssRr.ENABLED, Rt.Fg.ENABLED,
             Rt.Reflex.ENABLED, Rt.Exposure.MODE, Rt.FrameStats.ENABLED,
-            Rt.Hdr.ENABLED, Rt.Fog.ENABLED, Ngx.PATH,
+            Rt.Hdr.ENABLED, Rt.Fog.ENABLED, Rt.Fog.AMBIENT_DENSITY_FLOOR, Rt.Fog.AMBIENT_LIGHT_COUPLING,
+            Rt.Fog.VERTICAL_OPTICAL_DEPTH, Rt.Fog.NOISE_STRENGTH, Rt.Fog.NOISE_SCALE, Ngx.PATH,
         };
     }
 
@@ -101,11 +102,16 @@ public final class CausticaConfig {
                         + " (falls back to SDR if the surface doesn't advertise it). paper-white-nits / peak-nits\n"
                         + " drive the scene-HDR -> display mapping.");
         FILE.setComment("fog",
-                " Exponential height fog for the ray-traced world. density controls extinction at base-height;\n"
-                        + " height-falloff controls how quickly fog thins above that height. Set enabled to false\n"
-                        + " to disable the effect without losing the tuned values. atmospheric-scattering adds\n"
-                        + " directional Rayleigh/Mie scattering around the sun and moon; scattering-strength\n"
-                        + " scales that contribution independently of the height-fog extinction.");
+                " Ray-marched volumetric height fog for the ray-traced world. density controls extinction at base-height;\n"
+                        + " height-falloff controls how quickly fog thins above that height; ambient-density-floor sets\n"
+                        + " the minimum fraction of base density retained after height falloff; ambient-light-coupling\n"
+                        + " controls how much of that floor participates in directional scattering and its light path.\n"
+                        + " Set enabled to false\n"
+                        + " to disable the effect without losing the tuned values. vertical-optical-depth scales\n"
+                        + " steep upward/downward paths as an artistic control while horizontal sightlines stay at 1x.\n"
+                        + " noise-strength controls world-space density variation; noise-scale controls its frequency.\n"
+                        + " atmospheric-scattering adds directional Rayleigh/Mie scattering around the sun and moon;\n"
+                        + " scattering-strength scales that contribution independently of the height-fog extinction.");
     }
 
     private static Path resolveConfigPath() {
@@ -535,6 +541,16 @@ public final class CausticaConfig {
                     clampedInt("caustica.rt.maxBounces", "composite.max-bounces", 4, 2, 8);
             public static final BooleanSetting WATER_WAVES =
                     bool("caustica.rt.waterWaves", "composite.water-waves", true);
+            public static final BooleanSetting VOLUMETRIC_CLOUDS =
+                    bool("caustica.rt.volumetricClouds", "composite.volumetric-clouds", true);
+            public static final FloatSetting CLOUD_COVERAGE =
+                    clampedFloat("caustica.rt.cloudCoverage", "composite.cloud-coverage", 0.52f, 0.0f, 1.0f);
+            public static final FloatSetting CLOUD_DENSITY =
+                    clampedFloat("caustica.rt.cloudDensity", "composite.cloud-density", 1.0f, 0.1f, 2.0f);
+            public static final IntSetting CLOUD_HEIGHT =
+                    clampedInt("caustica.rt.cloudHeight", "composite.cloud-height", 224, 64, 384);
+            public static final IntSetting CLOUD_THICKNESS =
+                    clampedInt("caustica.rt.cloudThickness", "composite.cloud-thickness", 128, 32, 256);
             public static final FloatSetting SUN_ANGULAR_RADIUS =
                     radians("caustica.rt.sunAngularRadius", "composite.sun-angular-radius-deg", 0.6f);
             public static final FloatSetting MOON_ANGULAR_RADIUS =
@@ -758,13 +774,23 @@ public final class CausticaConfig {
             }
         }
 
-        /** Exponential height fog parameters, sampled by the ray-traced composite pass each frame. */
+        /** Ray-marched volumetric height-fog parameters, sampled by the ray-traced composite pass each frame. */
         public static final class Fog {
             public static final BooleanSetting ENABLED = bool("caustica.rt.fog", "fog.enabled", true);
             public static final FloatSetting DENSITY =
                     clampedFloat("caustica.rt.fog.density", "fog.density", 0.0025f, 0.0f, 0.02f);
+            public static final FloatSetting AMBIENT_DENSITY_FLOOR =
+                    clampedFloat("caustica.rt.fog.ambientDensityFloor", "fog.ambient-density-floor", 0.15f, 0.0f, 1.0f);
+            public static final FloatSetting AMBIENT_LIGHT_COUPLING =
+                    clampedFloat("caustica.rt.fog.ambientLightCoupling", "fog.ambient-light-coupling", 0.08f, 0.0f, 0.25f);
             public static final FloatSetting HEIGHT_FALLOFF =
                     clampedFloat("caustica.rt.fog.heightFalloff", "fog.height-falloff", 0.025f, 0.0f, 0.1f);
+            public static final FloatSetting VERTICAL_OPTICAL_DEPTH =
+                    clampedFloat("caustica.rt.fog.verticalOpticalDepth", "fog.vertical-optical-depth", 8.0f, 1.0f, 12.0f);
+            public static final FloatSetting NOISE_STRENGTH =
+                    clampedFloat("caustica.rt.fog.noiseStrength", "fog.noise-strength", 0.65f, 0.0f, 1.0f);
+            public static final FloatSetting NOISE_SCALE =
+                    clampedFloat("caustica.rt.fog.noiseScale", "fog.noise-scale", 0.012f, 0.002f, 0.04f);
             public static final IntSetting BASE_HEIGHT =
                     clampedInt("caustica.rt.fog.baseHeight", "fog.base-height", 64, -64, 320);
             public static final BooleanSetting ATMOSPHERIC_SCATTERING =

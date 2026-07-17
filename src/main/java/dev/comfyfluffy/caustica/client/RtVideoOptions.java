@@ -37,12 +37,22 @@ public final class RtVideoOptions {
             spp(),
             maxBounces(),
             sunSize(),
+            waterWaves(),
+            volumetricClouds(),
+            cloudHeight(),
+            cloudThickness(),
+            cloudCoverage(),
+            cloudDensity(),
             entities(),
             particles(),
-            waterWaves(),
             fogEnabled(),
             fogDensity(),
+            fogAmbientDensityFloor(),
+            fogAmbientLightCoupling(),
+            fogNoiseStrength(),
+            fogNoiseScale(),
             fogHeightFalloff(),
+            fogVerticalOpticalDepth(),
             fogBaseHeight(),
             atmosphericScattering(),
             scatteringStrength(),
@@ -118,6 +128,56 @@ public final class RtVideoOptions {
             tenths -> setting.set(tenths / 10.0f));
     }
 
+    private static OptionInstance<Boolean> volumetricClouds() {
+        return bool("caustica.rt.volumetricClouds", CausticaConfig.Rt.Composite.VOLUMETRIC_CLOUDS);
+    }
+
+    private static OptionInstance<Integer> cloudHeight() {
+        IntSetting setting = CausticaConfig.Rt.Composite.CLOUD_HEIGHT;
+        return new OptionInstance<>(
+            "caustica.rt.cloudHeight",
+            OptionInstance.cachedConstantTooltip(Component.translatable("caustica.rt.cloudHeight.tooltip")),
+            (caption, blocks) -> Options.genericValueLabel(caption,
+                    Component.translatable("caustica.rt.cloudHeight.value", blocks)),
+            new OptionInstance.IntRange(64, 384),
+            Math.clamp(setting.value(), 64, 384),
+            setting::set);
+    }
+
+    private static OptionInstance<Integer> cloudThickness() {
+        IntSetting setting = CausticaConfig.Rt.Composite.CLOUD_THICKNESS;
+        return new OptionInstance<>(
+            "caustica.rt.cloudThickness",
+            OptionInstance.cachedConstantTooltip(Component.translatable("caustica.rt.cloudThickness.tooltip")),
+            (caption, blocks) -> Options.genericValueLabel(caption,
+                    Component.translatable("caustica.rt.cloudThickness.value", blocks)),
+            new OptionInstance.IntRange(32, 256),
+            Math.clamp(setting.value(), 32, 256),
+            setting::set);
+    }
+
+    private static OptionInstance<Integer> cloudCoverage() {
+        FloatSetting setting = CausticaConfig.Rt.Composite.CLOUD_COVERAGE;
+        return new OptionInstance<>(
+            "caustica.rt.cloudCoverage",
+            OptionInstance.cachedConstantTooltip(Component.translatable("caustica.rt.cloudCoverage.tooltip")),
+            (caption, percent) -> Options.genericValueLabel(caption, Component.literal(percent + "%")),
+            new OptionInstance.IntRange(0, 100),
+            Math.clamp(Math.round(setting.value() * 100.0f), 0, 100),
+            percent -> setting.set(percent / 100.0f));
+    }
+
+    private static OptionInstance<Integer> cloudDensity() {
+        FloatSetting setting = CausticaConfig.Rt.Composite.CLOUD_DENSITY;
+        return new OptionInstance<>(
+            "caustica.rt.cloudDensity",
+            OptionInstance.cachedConstantTooltip(Component.translatable("caustica.rt.cloudDensity.tooltip")),
+            (caption, percent) -> Options.genericValueLabel(caption, Component.literal(percent + "%")),
+            new OptionInstance.IntRange(10, 200),
+            Math.clamp(Math.round(setting.value() * 100.0f), 10, 200),
+            percent -> setting.set(percent / 100.0f));
+    }
+
     private static OptionInstance<Boolean> entities() {
         return bool("caustica.options.rt.entities", CausticaConfig.Rt.Entities.ENABLED);
     }
@@ -157,6 +217,56 @@ public final class RtVideoOptions {
         return 0.02f * normalized * normalized;
     }
 
+    private static OptionInstance<Integer> fogAmbientDensityFloor() {
+        FloatSetting setting = CausticaConfig.Rt.Fog.AMBIENT_DENSITY_FLOOR;
+        return new OptionInstance<>(
+            "caustica.options.rt.fogAmbientDensityFloor",
+            OptionInstance.cachedConstantTooltip(
+                    Component.translatable("caustica.options.rt.fogAmbientDensityFloor.tooltip")),
+            (caption, percent) -> Options.genericValueLabel(caption, Component.literal(percent + "%")),
+            new OptionInstance.IntRange(0, 100),
+            Math.clamp(Math.round(setting.value() * 100.0f), 0, 100),
+            percent -> setting.set(percent / 100.0f));
+    }
+
+    private static OptionInstance<Integer> fogAmbientLightCoupling() {
+        FloatSetting setting = CausticaConfig.Rt.Fog.AMBIENT_LIGHT_COUPLING;
+        return new OptionInstance<>(
+            "caustica.options.rt.fogAmbientLightCoupling",
+            OptionInstance.cachedConstantTooltip(
+                    Component.translatable("caustica.options.rt.fogAmbientLightCoupling.tooltip")),
+            (caption, percent) -> Options.genericValueLabel(caption, Component.literal(percent + "%")),
+            new OptionInstance.IntRange(0, 25),
+            Math.clamp(Math.round(setting.value() * 100.0f), 0, 25),
+            percent -> setting.set(percent / 100.0f));
+    }
+
+    private static OptionInstance<Integer> fogNoiseStrength() {
+        FloatSetting setting = CausticaConfig.Rt.Fog.NOISE_STRENGTH;
+        return new OptionInstance<>(
+            "caustica.options.rt.fogNoiseStrength",
+            OptionInstance.cachedConstantTooltip(
+                    Component.translatable("caustica.options.rt.fogNoiseStrength.tooltip")),
+            (caption, percent) -> Options.genericValueLabel(caption, Component.literal(percent + "%")),
+            new OptionInstance.IntRange(0, 100),
+            Math.clamp(Math.round(setting.value() * 100.0f), 0, 100),
+            percent -> setting.set(percent / 100.0f));
+    }
+
+    private static OptionInstance<Integer> fogNoiseScale() {
+        FloatSetting setting = CausticaConfig.Rt.Fog.NOISE_SCALE;
+        int initialSize = Math.round(1.0f / Math.max(setting.value(), 1.0e-6f));
+        return new OptionInstance<>(
+            "caustica.options.rt.fogNoiseScale",
+            OptionInstance.cachedConstantTooltip(
+                    Component.translatable("caustica.options.rt.fogNoiseScale.tooltip")),
+            (caption, blocks) -> Options.genericValueLabel(caption,
+                    Component.translatable("caustica.options.rt.fogNoiseScale.value", blocks)),
+            new OptionInstance.IntRange(25, 500),
+            Math.clamp(initialSize, 25, 500),
+            blocks -> setting.set(1.0f / blocks));
+    }
+
     private static OptionInstance<Integer> fogHeightFalloff() {
         FloatSetting setting = CausticaConfig.Rt.Fog.HEIGHT_FALLOFF;
         return new OptionInstance<>(
@@ -167,6 +277,19 @@ public final class RtVideoOptions {
             new OptionInstance.IntRange(0, 1000),
             Math.clamp(Math.round(setting.value() * 10000.0f), 0, 1000),
             tenThousandths -> setting.set(tenThousandths / 10000.0f));
+    }
+
+    private static OptionInstance<Integer> fogVerticalOpticalDepth() {
+        FloatSetting setting = CausticaConfig.Rt.Fog.VERTICAL_OPTICAL_DEPTH;
+        return new OptionInstance<>(
+            "caustica.options.rt.fogVerticalOpticalDepth",
+            OptionInstance.cachedConstantTooltip(
+                    Component.translatable("caustica.options.rt.fogVerticalOpticalDepth.tooltip")),
+            (caption, tenths) -> Options.genericValueLabel(caption,
+                    Component.literal(String.format(Locale.ROOT, "%.1fx", tenths / 10.0))),
+            new OptionInstance.IntRange(10, 120),
+            Math.clamp(Math.round(setting.value() * 10.0f), 10, 120),
+            tenths -> setting.set(tenths / 10.0f));
     }
 
     private static OptionInstance<Integer> fogBaseHeight() {

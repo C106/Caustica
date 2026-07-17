@@ -1,7 +1,7 @@
 // Ray miss = sky. Per-frame sky data comes from the WorldPush BDA buffer addressed by the 8-byte push
-// constant. The shader writes full sky radiance (Rayleigh/Mie/ozone atmosphere + transmittance-tinted
-// sun/moon discs + soft horizon + starfield) into payload.albedo; raygen consumes that value for both
-// accumulated radiance and bounce-0 denoiser guides.
+// constant. The shader writes raw sky radiance (Rayleigh/Mie/ozone atmosphere + transmittance-tinted
+// sun/moon discs + soft horizon + starfield) into payload.albedo. Clouds are marched in raygen for both
+// hit and miss segments, keeping the miss payload independent of cloud integration and DLSS guide state.
 //
 // Celestial discs (sun/moon) are gated by a packed payload flag, which raygen sets per-ray from the path
 // state: true on the primary ray and after every specular/dielectric bounce (so the sun/moon show up in
@@ -34,6 +34,63 @@ static const float MOON_DISC_HALF_ANGLE = 0.19740; // atan(20/100), vanilla moon
 // Faint night-sky ambient so the night isn't pure black where the atmosphere in-scatter falls to zero.
 static const float3 NIGHT_ZENITH  = float3(0.004, 0.008, 0.022) / 2.0;
 static const float3 NIGHT_HORIZON = float3(0.015, 0.022, 0.045) / 2.0;
+
+// Preserve the captured dimension-fog hue while bounding the environment radiance so auto exposure stays
+// in the same range as the Overworld night sky. A tiny floor prevents custom dimensions with black fog from
+// becoming a numerically black environment.
+float3 boundedSkyAnchor(float3 fogColor, float3 floorColor, float maxChannel) {
+    float3 anchor = max(fogColor, floorColor);
+    float peak = max(anchor.r, max(anchor.g, anchor.b));
+    return anchor * min(1.0, maxChannel / max(peak, 1.0e-6));
+}
+
+// Enclosed, warm Nether backdrop. All variation is analytic and very low frequency: no hash cells, temporal
+// random numbers, or fixed-step volume march that could turn into noise/bands under DLSS jitter.
+float3 netherSky(float3 dir, float3 fogColor) {
+    float3 anchor = boundedSkyAnchor(fogColor, float3(0.008, 0.0010, 0.0006), 0.12);
+    float horizon = exp2(-6.0 * dir.y * dir.y);
+    float below = smoothstep(0.0, 0.85, -dir.y);
+    float ceiling = smoothstep(0.15, 1.0, dir.y);
+    float envelope = (0.18 + 0.72 * horizon) * (1.0 - 0.08 * ceiling);
+    float3 lowerGlow = float3(0.018, 0.0025, 0.0008) * below;
+    return anchor * envelope + lowerGlow;
+}
+
+// Static End void: a dark violet horizon plus a few broad spherical lobes. Low-order dot/pow fields are
+// continuous across the whole sphere, world-anchored, and contain no point stars or high-frequency noise.
+float3 endSky(float3 dir, float3 fogColor) {
+    float3 anchor = boundedSkyAnchor(fogColor, float3(0.0030, 0.0015, 0.0060), 0.075);
+    float horizon = exp2(-3.5 * dir.y * dir.y);
+    const float3 lobeDir0 = float3(0.3094, 0.7220, 0.6189);
+    const float3 lobeDir1 = float3(-0.8018, -0.2673, 0.5345);
+    const float3 lobeDir2 = float3(0.4364, -0.8729, -0.2182);
+    float lobe0 = pow(clamp(0.5 + 0.5 * dot(dir, lobeDir0), 0.0, 1.0), 4.0);
+    float lobe1 = pow(clamp(0.5 + 0.5 * dot(dir, lobeDir1), 0.0, 1.0), 5.0);
+    float lobe2 = pow(clamp(0.5 + 0.5 * dot(dir, lobeDir2), 0.0, 1.0), 6.0);
+    float broadGlow = 0.55 * lobe0 + 0.30 * lobe1 + 0.15 * lobe2;
+    return anchor * (0.24 + 0.46 * horizon)
+            + float3(0.008, 0.004, 0.016) * broadGlow;
+}
+
+// Custom dimensions with skybox=NONE retain their captured environment hue without inheriting the
+// Nether's warm lower glow or the End's violet lobes.
+float3 genericSky(float3 dir, float3 fogColor) {
+    float3 anchor = boundedSkyAnchor(fogColor, float3(0.0015, 0.0015, 0.0015), 0.08);
+    float horizon = exp2(-4.5 * dir.y * dir.y);
+    return anchor * (0.22 + 0.58 * horizon);
+}
+
+void storeSkyPayload(inout Payload payload, float3 col) {
+    payload.albedo = max(col, float3(0.0, 0.0, 0.0));
+    payload.hitT = -1.0;
+    payload.normal = float3(0.0, 0.0, 0.0);
+    payload.motionPrev = float3(0.0, 0.0, 0.0);
+    payload.f0 = float3(0.0, 0.0, 0.0);
+    payload.flags = 0u;
+    payload.roughMetal = packHalf2(float2(1.0, 0.0));
+    payload.emissionSss = packHalf2(float2(0.0, 0.0));
+    payload.rayCone = 0u;
+}
 
 // ---- Physically-based atmosphere (Nishita / O'Neil single scattering + ozone absorption). A view ray
 // is marched through the atmospheric shell; at each step the transmittance toward the sun is integrated
@@ -223,6 +280,21 @@ float3 stars(float3 dir, float starBrightness, float VdotS, float4 celestial) {
 void main(inout Payload payload) {
     WorldPush pc = ConstPtr<WorldPush>(pcAddr.worldPushAddr)[0];
     float3 dir = normalize(WorldRayDirection());
+    // Non-Overworld dimensions return before any planetary atmosphere march, star hash, or celestial-atlas
+    // sample. Their CPU-pushed directional radiance is zero, so no hidden sun/moon remains in lighting.
+    if (pc.dimensionMode == DIMENSION_MODE_NETHER) {
+        storeSkyPayload(payload, netherSky(dir, pc.fogColor.xyz));
+        return;
+    }
+    if (pc.dimensionMode == DIMENSION_MODE_END) {
+        storeSkyPayload(payload, endSky(dir, pc.fogColor.xyz));
+        return;
+    }
+    if (pc.dimensionMode == DIMENSION_MODE_GENERIC) {
+        storeSkyPayload(payload, genericSky(dir, pc.fogColor.xyz));
+        return;
+    }
+
     float day = pc.sunDir.w;
     float3 sd = pc.sunDir.xyz;
     float SdotU = sd.y;
@@ -287,13 +359,5 @@ void main(inout Payload payload) {
         }
     }
 
-    payload.albedo = max(col, float3(0.0, 0.0, 0.0)); // raygen reads this as sky radiance + bounce-0 guide
-    payload.hitT = -1.0;
-    payload.normal = float3(0.0, 0.0, 0.0);
-    payload.motionPrev = float3(0.0, 0.0, 0.0);
-    payload.f0 = float3(0.0, 0.0, 0.0);
-    payload.flags = 0u;
-    payload.roughMetal = packHalf2(float2(1.0, 0.0));
-    payload.emissionSss = packHalf2(float2(0.0, 0.0));
-    payload.rayCone = 0u;
+    storeSkyPayload(payload, col);
 }

@@ -38,8 +38,9 @@ public struct WorldPush {
     public uint     spp;
     public float2   jitter;
     public uint64_t entityTableAddr;  // entity geometry table
-    public uint     flags;            // bit0 camera submerged, bit1 PBR BRDF, bit4 water waves
+    public uint     flags;            // bit0 camera submerged, bit1 PBR BRDF, bit4 water waves, bit5 clouds
     public uint     maxBounces;
+    public uint     dimensionMode;    // 0 Overworld, 1 Nether, 2 End, 3 generic fog-colored sky
     public float4   sunDir;           // xyz true sun direction, w dayFactor 0..1
     public float4   lightDir;         // xyz active NEE light dir, w square half-angle (rad)
     public float4   lightRadiance;    // xyz HDR light radiance, w star brightness
@@ -48,9 +49,13 @@ public struct WorldPush {
     public float4   sunUv;            // vanilla sun sprite atlas rect (u0,v0,u1,v1)
     public float4   moonUv;           // vanilla current-moon-phase sprite atlas rect
     public float4   waterParams;      // xyz camera-biome water tint, w wave time (s)
-    public float4   waterAnchor;      // xy world-stable wave-domain anchor
+    public float4   waterAnchor;      // xy wrapped water anchor, zw full XZ origin for low-frequency clouds
     public float4   fogColor;         // xyz atmospheric in-scattering radiance
     public float4   fogParams;        // density, height falloff, rebased base height, sky integration distance
+    public float4   fogShapeParams;   // x vertical tau, y noise strength, z frequency/block, w sky openness
+    public float4   fogAmbientParams; // x ambient density floor ratio, y directional-scattering coupling
+    public float4   cloudParams;      // rebased bottom/top height, coverage, density
+    public float4   cloudMotion;      // xyz current cloud-field world displacement relative to previous frame
     public float4x4 curViewProj;      // forward camera-relative view-projection
     public uint     breakCount;
     public BreakEntry breaking[8];    // Java capacity and breakCount serialization are generated from this
@@ -75,6 +80,12 @@ public static const uint PAYLOAD_SHOW_CELESTIAL = 4u;
 // (PAYLOAD_SHOW_CELESTIAL) is only meaningful on a miss and this bit only on a hit, so they never need
 // to be read together, but they get distinct bits anyway to keep the two concerns unambiguous.
 public static const uint PAYLOAD_WATER_ENTERING = 8u;
+
+// Procedural sky / celestial-light modes. Keep these values in lock-step with RtComposite.dimensionMode().
+public static const uint DIMENSION_MODE_OVERWORLD = 0u;
+public static const uint DIMENSION_MODE_NETHER = 1u;
+public static const uint DIMENSION_MODE_END = 2u;
+public static const uint DIMENSION_MODE_GENERIC = 3u;
 
 // Terrain per-triangle record (48 B, stride must match RtTerrain's upload).
 // mat = {roughness, metalness, hasS, hasN} for solid/cutout; TRANSLUCENT-bucket prims repurpose it as

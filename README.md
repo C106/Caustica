@@ -22,7 +22,8 @@ changes while the renderer is being built.
 - DLSS Ray Reconstruction support
 - DLSS Frame Generation support (experimental)
 - HDR output
-- Rayleigh/Mie atmospheric scattering and exponential height fog with runtime controls
+- Rayleigh/Mie atmospheric scattering and ray-marched 3D volumetric fog with runtime controls
+- Ray-marched volumetric clouds with runtime thickness, coverage, and density controls
 - Dynamic entity rendering in the ray-traced scene
 - LabPBR-style material support
 - OMM (Opacity Micro-Map) + SER (Shader Execution Reordering) optimizations
@@ -96,7 +97,7 @@ license terms. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## TODO List
 
-- [ ] Nether/End sky, weather, volumetric clouds
+- [ ] Weather
 - [ ] NRD + FSR for non-NVIDIA GPUs
 - [ ] LOD
 - [ ] ReSTIR

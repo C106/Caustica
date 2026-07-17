@@ -18,6 +18,23 @@
 	"caustica.options.rt.sunSize": "太阳大小",
 	"caustica.options.rt.sunSize.tooltip": "太阳和月亮圆盘的角半径。圆盘越大，投射的半影越柔和。",
 
+	"caustica.rt.volumetricClouds": "体积云",
+	"caustica.rt.volumetricClouds.tooltip": "在主世界风格的天空中渲染光线步进体积云。",
+
+	"caustica.rt.cloudHeight": "云层中心高度",
+	"caustica.rt.cloudHeight.tooltip": "体积云层上下边界之间的中心高度。",
+	"caustica.rt.cloudHeight.value": "%s 格",
+
+	"caustica.rt.cloudThickness": "云层厚度",
+	"caustica.rt.cloudThickness.tooltip": "实际体积云层的垂直厚度。数值越高，云体越深，从云层内部观察时也能保持明显的体积感。",
+	"caustica.rt.cloudThickness.value": "%s 格",
+
+	"caustica.rt.cloudCoverage": "云层覆盖率",
+	"caustica.rt.cloudCoverage.tooltip": "体积云覆盖天空的比例。数值越高，云层分布范围越广。",
+
+	"caustica.rt.cloudDensity": "云层密度",
+	"caustica.rt.cloudDensity.tooltip": "体积云的光学密度。100% 为默认值；数值越高，云层越不透明、越暗。",
+
 	"caustica.options.rt.entities": "光追实体",
 	"caustica.options.rt.entities.tooltip": "将实体和方块实体加入光追场景。",
 
@@ -30,20 +47,35 @@
 	"caustica.options.rt.waterWaves": "动态水面",
 	"caustica.options.rt.waterWaves.tooltip": "对水面法线进行动画处理，以显示移动波浪高光。",
 
-	"caustica.options.rt.fog": "高度雾",
-	"caustica.options.rt.fog.tooltip": "在光线追踪世界中启用指数高度雾。",
+	"caustica.options.rt.fog": "体积雾",
+	"caustica.options.rt.fog.tooltip": "在光线追踪世界中启用带指数高度衰减的三维光线步进体积雾。",
 
 	"caustica.options.rt.fogDensity": "雾密度",
 	"caustica.options.rt.fogDensity.tooltip": "基准高度处的消光密度。数值越高，雾越浓，可见距离越短。",
 
+	"caustica.options.rt.fogAmbientDensityFloor": "环境基础雾",
+	"caustica.options.rt.fogAmbientDensityFloor.tooltip": "高空仍保留的最低雾密度，以基准高度处雾密度的百分比表示，防止指数高度包络衰减为零。",
+	"caustica.options.rt.fogAmbientLightCoupling": "基础雾太阳散射参与度",
+	"caustica.options.rt.fogAmbientLightCoupling.tooltip": "控制环境基础雾参与方向散射源以及太阳和月亮光路消光的比例。0% 时方向散射只使用高度雾。",
+
+	"caustica.options.rt.fogNoiseStrength": "雾噪声强度",
+	"caustica.options.rt.fogNoiseStrength.tooltip": "控制三维世界空间中的密度变化量。0% 为均匀雾；数值越高，雾团与缕状结构越明显，同时保持平均密度不变。",
+
+	"caustica.options.rt.fogNoiseScale": "雾噪声尺度",
+	"caustica.options.rt.fogNoiseScale.tooltip": "三维密度结构在世界空间中的近似尺寸。数值越大，雾团范围越宽、变化越平缓。",
+	"caustica.options.rt.fogNoiseScale.value": "%s 格",
+
 	"caustica.options.rt.fogHeightFalloff": "雾高度衰减",
-	"caustica.options.rt.fogHeightFalloff.tooltip": "雾密度随海拔升高而降低的速率。数值越高，雾越集中在基准高度附近。",
+	"caustica.options.rt.fogHeightFalloff.tooltip": "雾密度随海拔升高向环境基础雾收敛的速率。数值越高，较浓的雾层越集中在基准高度附近。",
+
+	"caustica.options.rt.fogVerticalOpticalDepth": "雾垂直光学厚度",
+	"caustica.options.rt.fogVerticalOpticalDepth.tooltip": "用于方向性艺术调整：增强陡角俯视或仰视穿过雾层时的光学厚度；水平视线始终保持 1.0x。",
 
 	"caustica.options.rt.fogBaseHeight": "雾基准高度",
 	"caustica.options.rt.fogBaseHeight.tooltip": "采用设定雾密度的世界高度。",
 
 	"caustica.options.rt.atmosphericScattering": "大气散射",
-	"caustica.options.rt.atmosphericScattering.tooltip": "启用太阳和月亮穿过高度雾时产生的方向性瑞利散射与米氏散射。",
+	"caustica.options.rt.atmosphericScattering.tooltip": "启用太阳和月亮穿过体积雾时产生的方向性瑞利散射与米氏散射。",
 
 	"caustica.options.rt.scatteringStrength": "散射强度",
 	"caustica.options.rt.scatteringStrength.tooltip": "缩放太阳和月亮产生的方向性瑞利散射与米氏散射贡献。",

@@ -30,6 +30,7 @@ import net.minecraft.resources.Identifier;
 import net.minecraft.tags.FluidTags;
 import net.minecraft.util.Mth;
 import net.minecraft.world.attribute.EnvironmentAttributes;
+import net.minecraft.world.level.Level;
 import net.minecraft.world.level.LightLayer;
 import net.minecraft.world.level.MoonPhase;
 import net.minecraft.world.level.material.FluidState;
@@ -122,7 +123,9 @@ public final class RtComposite {
     // Finite sun/moon angular sizes let NEE shadow rays sample the light disk (soft, contact-hardening
     // penumbrae). Radii in degrees; the real sun/moon are ~0.27°, but a touch larger reads pleasantly.
     private static final int WATER_ANCHOR_MASK = 4095;
-    private static final float FOG_SKY_DISTANCE = 10_000f;
+    // The ambient density floor is nonzero, so an arbitrary 10 km miss distance would force every sky ray
+    // opaque. Match the bounded volumetric integration range while retaining a long atmospheric horizon.
+    private static final float FOG_SKY_DISTANCE = 1_536f;
     private static final float DEFAULT_FOG_SRGB_R = 0.75f;
     private static final float DEFAULT_FOG_SRGB_G = 0.85f;
     private static final float DEFAULT_FOG_SRGB_B = 1.0f;
@@ -133,6 +136,10 @@ public final class RtComposite {
     private static final double FOG_OPENNESS_RESET_DISTANCE_SQ = 32.0 * 32.0;
     private static final float FOG_INDOOR_LOCAL_DENSITY_SCALE = 0.20f;
     private static final float FOG_INDOOR_AMBIENT_SCALE = 0.10f;
+    private static final int DIMENSION_MODE_OVERWORLD = 0;
+    private static final int DIMENSION_MODE_NETHER = 1;
+    private static final int DIMENSION_MODE_END = 2;
+    private static final int DIMENSION_MODE_GENERIC = 3;
     private static final Float4 DEFAULT_FOG_COLOR = new Float4(
             srgbToLinear(DEFAULT_FOG_SRGB_R),
             srgbToLinear(DEFAULT_FOG_SRGB_G),
@@ -275,6 +282,9 @@ public final class RtComposite {
     private float mvCamDeltaY;
     private float mvCamDeltaZ;
     private boolean mvHasPrev;
+    private float prevCloudWindX;
+    private float prevCloudWindZ;
+    private boolean cloudWindHasPrev;
     private long atlasSampler;
     private boolean failed;
     private boolean loggedActive;
@@ -384,6 +394,29 @@ public final class RtComposite {
         return value <= 0.04045f
                 ? value / 12.92f
                 : (float) Math.pow((value + 0.055f) / 1.055f, 2.4);
+    }
+
+    private static int dimensionMode(ClientLevel level) {
+        if (level == null) {
+            return DIMENSION_MODE_OVERWORLD;
+        }
+        if (Level.OVERWORLD.equals(level.dimension())) {
+            return DIMENSION_MODE_OVERWORLD;
+        }
+        if (Level.NETHER.equals(level.dimension())) {
+            return DIMENSION_MODE_NETHER;
+        }
+        if (Level.END.equals(level.dimension())) {
+            return DIMENSION_MODE_END;
+        }
+
+        // Respect the dimension type's declared skybox; NONE gets a neutral fog-colored sky rather than
+        // being guessed as Nether/End from unrelated properties such as ceiling or skylight behavior.
+        return switch (level.dimensionType().skybox()) {
+            case OVERWORLD -> DIMENSION_MODE_OVERWORLD;
+            case END -> DIMENSION_MODE_END;
+            case NONE -> DIMENSION_MODE_GENERIC;
+        };
     }
 
     /** Camera-local sky openness, smoothed independently of frame rate to avoid whole-view fog pops. */
@@ -792,6 +825,7 @@ public final class RtComposite {
         exposure.ensureResources(ctx);
 
         mvHasPrev = false; // recreated images -> first MV frame is zero
+        cloudWindHasPrev = false;
         if (worldPipeline != null) {
             worldPipeline.setStorageImage(output.view);
             bindGuideImages();
@@ -854,6 +888,7 @@ public final class RtComposite {
             // medium when the eye is submerged, fixing the air→water first-segment orientation).
             int flags = 0b10;
             var level = Minecraft.getInstance().level;
+            int dimensionMode = dimensionMode(level);
             if (level != null) {
                 cameraBlockPos.set(Mth.floor(camX), Mth.floor(camY), Mth.floor(camZ));
                 // Height-aware, mirroring vanilla's own Camera.getFluidInCamera(): a plain block-granular
@@ -868,6 +903,10 @@ public final class RtComposite {
             if (waterWaves()) {
                 flags |= 0b10000; // W1: animated water wave normals
             }
+            if (dimensionMode == DIMENSION_MODE_OVERWORLD
+                    && CausticaConfig.Rt.Composite.VOLUMETRIC_CLOUDS.value()) {
+                flags |= 0b100000;
+            }
 
             // W1/W2 water parameters: camera-biome tint plus wrapped animation time. Per-water-body tint
             // comes from the primitive; this is the fallback for a camera already inside the medium.
@@ -878,13 +917,24 @@ public final class RtComposite {
                 wtg = ((wc >> 8) & 0xFF) / 255f;
                 wtb = (wc & 0xFF) / 255f;
             }
-            Float4 waterParams = new Float4(wtr, wtg, wtb,
-                    (float) (System.nanoTime() / 1.0e9 % 3600.0));
-            // W1 wave-domain anchor: the terrain rebase origin reduced mod 4096 (kept small for shader
-            // float precision). hitPos.xz (rebased) + anchor reconstructs a world-pinned coordinate, so the
-            // ripple pattern stays fixed in the world as the player moves and the rebase origin shifts.
+            float animationTime = (float) (System.nanoTime() / 1.0e9 % 3600.0);
+            Float4 waterParams = new Float4(wtr, wtg, wtb, animationTime);
+            // Keep this in lock-step with world_clouds.slang. The density field samples worldXZ + wind,
+            // so its physical displacement is the negative change in wind. The circular path is continuous
+            // across the wrapped 3600-second animation time.
+            double cloudWindAngle = animationTime * (Math.PI * 2.0 / 3600.0);
+            float cloudWindX = (float) Math.cos(cloudWindAngle) * 600f;
+            float cloudWindZ = (float) Math.sin(cloudWindAngle) * 600f;
+            Float4 cloudMotion = cloudWindHasPrev
+                    ? new Float4(prevCloudWindX - cloudWindX, 0f, prevCloudWindZ - cloudWindZ, 0f)
+                    : new Float4(0f, 0f, 0f, 0f);
+            prevCloudWindX = cloudWindX;
+            prevCloudWindZ = cloudWindZ;
+            cloudWindHasPrev = true;
+            // xy: wave-domain anchor reduced mod 4096 for float precision. zw: full terrain XZ origin for
+            // the much lower-frequency cloud field, avoiding a visible wrap when xy crosses 4096 blocks.
             Float4 waterAnchor = new Float4(terrain.blockX & WATER_ANCHOR_MASK,
-                    terrain.blockZ & WATER_ANCHOR_MASK, 0f, 0f);
+                    terrain.blockZ & WATER_ANCHOR_MASK, terrain.blockX, terrain.blockZ);
             boolean fogEnabled = CausticaConfig.Rt.Fog.ENABLED.value();
             float configuredDensity = CausticaConfig.Rt.Fog.DENSITY.value();
             float heightFalloff = CausticaConfig.Rt.Fog.HEIGHT_FALLOFF.value();
@@ -902,7 +952,8 @@ public final class RtComposite {
             float densityScale = indoorDensityScale + (1f - indoorDensityScale) * openness;
             float effectiveDensity = fogEnabled ? configuredDensity * densityScale : 0f;
             Float4 capturedFogColor = fogColor;
-            float atmosphericScattering = CausticaConfig.Rt.Fog.ATMOSPHERIC_SCATTERING.value()
+            float atmosphericScattering = dimensionMode == DIMENSION_MODE_OVERWORLD
+                    && CausticaConfig.Rt.Fog.ATMOSPHERIC_SCATTERING.value()
                     ? CausticaConfig.Rt.Fog.SCATTERING_STRENGTH.value()
                     : 0f;
             Float4 frameFogColor = new Float4(
@@ -915,6 +966,21 @@ public final class RtComposite {
                     heightFalloff,
                     baseHeight - terrain.blockY,
                     FOG_SKY_DISTANCE);
+            Float4 fogShapeParams = new Float4(
+                    CausticaConfig.Rt.Fog.VERTICAL_OPTICAL_DEPTH.value(),
+                    CausticaConfig.Rt.Fog.NOISE_STRENGTH.value(),
+                    CausticaConfig.Rt.Fog.NOISE_SCALE.value(),
+                    openness);
+            Float4 fogAmbientParams = new Float4(
+                    CausticaConfig.Rt.Fog.AMBIENT_DENSITY_FLOOR.value(),
+                    CausticaConfig.Rt.Fog.AMBIENT_LIGHT_COUPLING.value(), 0f, 0f);
+            float cloudCenterY = CausticaConfig.Rt.Composite.CLOUD_HEIGHT.value();
+            float cloudHalfThickness = CausticaConfig.Rt.Composite.CLOUD_THICKNESS.value() * 0.5f;
+            Float4 cloudParams = new Float4(
+                    cloudCenterY - cloudHalfThickness - terrain.blockY,
+                    cloudCenterY + cloudHalfThickness - terrain.blockY,
+                    CausticaConfig.Rt.Composite.CLOUD_COVERAGE.value(),
+                    CausticaConfig.Rt.Composite.CLOUD_DENSITY.value());
 
             // Rebuild the TLAS this frame from static section instances merged with dynamic entity
             // instances, bind it into the pipeline's descriptor ring, record the build, then barrier so
@@ -930,7 +996,7 @@ public final class RtComposite {
             // not a block-atlas sprite — see ModelBakery.BREAKING_LOCATIONS/DESTROY_TYPES), so any newly
             // resolved slot rides along with the uploadPending() call right below.
             BreakEntry[] breaking = breakingEntries(terrain);
-            SkyPush sky = skyPush();
+            SkyPush sky = skyPush(dimensionMode);
             new WorldPushData(
                     frameInvViewProj,
                     new Float3((float) (camX - terrain.blockX), (float) (camY - terrain.blockY),
@@ -945,6 +1011,7 @@ public final class RtComposite {
                     fe.geomTableAddr(),
                     flags,
                     maxBounces(),
+                    dimensionMode,
                     sky.sunDir(),
                     sky.lightDir(),
                     sky.lightRadiance(),
@@ -956,6 +1023,10 @@ public final class RtComposite {
                     waterAnchor,
                     frameFogColor,
                     fogParams,
+                    fogShapeParams,
+                    fogAmbientParams,
+                    cloudParams,
+                    cloudMotion,
                     mvCurProjView,
                     breaking.length,
                     breaking
@@ -1103,7 +1174,19 @@ public final class RtComposite {
      * interpolated). {@code caustica.rt.sunNoonSouthDeg} tilts the east-west arc toward south (+Z) at
      * noon.
      */
-    private SkyPush skyPush() {
+    private SkyPush skyPush(int dimensionMode) {
+        if (dimensionMode != DIMENSION_MODE_OVERWORLD) {
+            Float4 fullUv = new Float4(0f, 0f, 1f, 1f);
+            return new SkyPush(
+                    new Float4(0f, -1f, 0f, 0f),
+                    new Float4(0f, 1f, 0f, 0f),
+                    new Float4(0f, 0f, 0f, 0f),
+                    new Float4(0f, -1f, 0f, 4f),
+                    new Float4(0f, 0f, 1f, 0f),
+                    fullUv,
+                    fullUv);
+        }
+
         float sunX, sunY, sunZ, dayFactor, lx, ly, lz, rr, rg, rb, lightRadius;
         float moonX, moonY, moonZ, moonPhase, starAngle, starBrightness;
         Minecraft mc = Minecraft.getInstance();

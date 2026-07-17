@@ -18,6 +18,23 @@
 	"caustica.options.rt.sunSize": "Sun Size",
 	"caustica.options.rt.sunSize.tooltip": "Angular radius of the sun and moon disk. Larger discs cast softer shadow penumbrae.",
 
+	"caustica.rt.volumetricClouds": "Volumetric Clouds",
+	"caustica.rt.volumetricClouds.tooltip": "Render ray-marched volumetric clouds in Overworld-style skies.",
+
+	"caustica.rt.cloudHeight": "Cloud Center Height",
+	"caustica.rt.cloudHeight.tooltip": "Center height between the upper and lower boundaries of the volumetric cloud layer.",
+	"caustica.rt.cloudHeight.value": "%s blocks",
+
+	"caustica.rt.cloudThickness": "Cloud Thickness",
+	"caustica.rt.cloudThickness.tooltip": "Vertical thickness of the actual volumetric cloud layer. Higher values create deeper clouds that retain visible volume when viewed from within the layer.",
+	"caustica.rt.cloudThickness.value": "%s blocks",
+
+	"caustica.rt.cloudCoverage": "Cloud Coverage",
+	"caustica.rt.cloudCoverage.tooltip": "Fraction of the sky covered by volumetric clouds. Higher values create broader cloud fields.",
+
+	"caustica.rt.cloudDensity": "Cloud Density",
+	"caustica.rt.cloudDensity.tooltip": "Optical density of volumetric clouds. 100% is the default; higher values make clouds more opaque and darker.",
+
 	"caustica.options.rt.entities": "Ray-Traced Entities",
 	"caustica.options.rt.entities.tooltip": "Include entities and block entities in the ray-traced scene.",
 
@@ -30,20 +47,35 @@
 	"caustica.options.rt.waterWaves": "Animated Water",
 	"caustica.options.rt.waterWaves.tooltip": "Animate water-surface normals for moving wave highlights.",
 
-	"caustica.options.rt.fog": "Height Fog",
-	"caustica.options.rt.fog.tooltip": "Enable exponential height fog in the ray-traced world.",
+	"caustica.options.rt.fog": "Volumetric Fog",
+	"caustica.options.rt.fog.tooltip": "Enable ray-marched 3D volumetric fog with exponential height falloff in the ray-traced world.",
 
 	"caustica.options.rt.fogDensity": "Fog Density",
 	"caustica.options.rt.fogDensity.tooltip": "Extinction density at the base height. Higher values produce thicker fog and reduce visibility.",
 
+	"caustica.options.rt.fogAmbientDensityFloor": "Ambient Fog Floor",
+	"caustica.options.rt.fogAmbientDensityFloor.tooltip": "Minimum fog density retained at high altitude, as a percentage of the density at the base height. This prevents the exponential height envelope from fading to zero.",
+	"caustica.options.rt.fogAmbientLightCoupling": "Ambient Fog Solar Coupling",
+	"caustica.options.rt.fogAmbientLightCoupling.tooltip": "How much ambient fog participates in directional scattering and sun/moon light-path extinction. At 0%, directional scattering uses only height fog.",
+
+	"caustica.options.rt.fogNoiseStrength": "Fog Noise Strength",
+	"caustica.options.rt.fogNoiseStrength.tooltip": "Amount of 3D world-space density variation. 0% is smooth fog; higher values create more distinct pockets and wisps while preserving the average density.",
+
+	"caustica.options.rt.fogNoiseScale": "Fog Noise Size",
+	"caustica.options.rt.fogNoiseScale.tooltip": "Approximate world-space size of the 3D density features. Larger values create broader, slower-changing fog structures.",
+	"caustica.options.rt.fogNoiseScale.value": "%s blocks",
+
 	"caustica.options.rt.fogHeightFalloff": "Fog Height Falloff",
-	"caustica.options.rt.fogHeightFalloff.tooltip": "How quickly fog density decreases with altitude. Higher values keep fog closer to the base height.",
+	"caustica.options.rt.fogHeightFalloff.tooltip": "How quickly fog density decreases toward the ambient fog floor with altitude. Higher values keep the denser layer closer to the base height.",
+
+	"caustica.options.rt.fogVerticalOpticalDepth": "Fog Vertical Optical Depth",
+	"caustica.options.rt.fogVerticalOpticalDepth.tooltip": "Directional artistic control that increases optical thickness for steep downward and upward views through the fog layer; horizontal sightlines remain at 1.0x.",
 
 	"caustica.options.rt.fogBaseHeight": "Fog Base Height",
 	"caustica.options.rt.fogBaseHeight.tooltip": "World height where the configured fog density applies.",
 
 	"caustica.options.rt.atmosphericScattering": "Atmospheric Scattering",
-	"caustica.options.rt.atmosphericScattering.tooltip": "Enable directional Rayleigh and Mie scattering from the sun and moon through the height fog.",
+	"caustica.options.rt.atmosphericScattering.tooltip": "Enable directional Rayleigh and Mie scattering from the sun and moon through the volumetric fog.",
 
 	"caustica.options.rt.scatteringStrength": "Scattering Strength",
 	"caustica.options.rt.scatteringStrength.tooltip": "Scale the sun and moon's directional Rayleigh and Mie scattering contribution.",
