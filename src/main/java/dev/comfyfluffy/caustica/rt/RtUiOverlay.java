@@ -55,6 +55,9 @@ public final class RtUiOverlay {
             .build();
 
     private static TextureTarget overlay;
+    // Kept separate from usedThisFrame: HDR consumes the pending composite before DLSS-FG evaluates, but FG
+    // still needs to know that the UI resource was freshly rendered during this frame.
+    private static boolean populatedThisFrame;
     private static boolean usedThisFrame;
     private static boolean compositeFailed;
     // The overlay is cleared once per frame, before the first thing that renders into it (RT world overlays,
@@ -77,9 +80,9 @@ public final class RtUiOverlay {
         return !compositeFailed && Minecraft.getInstance().isGameLoadFinished();
     }
 
-    /** Whether the overlay holds this frame's UI (for the HDR present path to composite + consume). */
+    /** Whether the overlay was freshly populated this frame (for HDR present and DLSS-FG UI input). */
     public static boolean populatedThisFrame() {
-        return usedThisFrame && overlay != null;
+        return populatedThisFrame && overlay != null;
     }
 
     /** Mark the overlay consumed by the HDR present composite (so it isn't reused next frame). */
@@ -137,6 +140,8 @@ public final class RtUiOverlay {
 
     /** Reset the per-frame clear latch. Called at the start of {@code GameRenderer.render} (every frame). */
     public static void beginFrame() {
+        populatedThisFrame = false;
+        usedThisFrame = false;
         overlayClearedThisFrame = false;
     }
 
@@ -156,6 +161,7 @@ public final class RtUiOverlay {
             }
             overlayClearedThisFrame = true;
         }
+        populatedThisFrame = true;
         usedThisFrame = true;
         return target;
     }
@@ -195,7 +201,8 @@ public final class RtUiOverlay {
         }
         usedThisFrame = false;
         RenderTarget main = Minecraft.getInstance().gameRenderer.mainRenderTarget();
-        if (main == null || main.getColorTextureView() == null) {
+        if (main == null || main.getColorTextureView() == null
+                || main.width != overlay.width || main.height != overlay.height) {
             return;
         }
         CommandEncoder enc = RenderSystem.getDevice().createCommandEncoder();
@@ -216,6 +223,11 @@ public final class RtUiOverlay {
         if (overlay == null) {
             overlay = new TextureTarget("caustica UI overlay", main.width, main.height, true, GpuFormat.RGBA8_UNORM);
         } else if (overlay.width != main.width || overlay.height != main.height) {
+            // resize() replaces the color/depth textures. Even if another contributor prepared the old target
+            // earlier in this frame, the new allocation has no valid contents and must be cleared before use.
+            populatedThisFrame = false;
+            usedThisFrame = false;
+            overlayClearedThisFrame = false;
             overlay.resize(main.width, main.height);
         }
         return overlay;
@@ -224,6 +236,7 @@ public final class RtUiOverlay {
     public static void destroy() {
         RenderSystem.outputColorTextureOverride = null;
         RenderSystem.outputDepthTextureOverride = null;
+        populatedThisFrame = false;
         usedThisFrame = false;
         overlayClearedThisFrame = false;
         if (overlay != null) {

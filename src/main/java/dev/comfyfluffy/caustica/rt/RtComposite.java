@@ -1761,13 +1761,18 @@ public final class RtComposite {
         if (!RtDlssFg.enabled() || !RtUiOverlay.enabled() || main == null || main.getColorTexture() == null) {
             return;
         }
+        var color = main.getColorTexture();
+        if (main.width <= 0 || main.height <= 0 || color.isClosed()
+                || color.getWidth(0) != main.width || color.getHeight(0) != main.height) {
+            return; // the main target and its backing image can disagree for a transition frame during resize
+        }
         RtContext ctx = RtContext.currentOrNull();
         if (ctx == null) {
             return;
         }
         long srcImage;
         try {
-            srcImage = vkImage(main.getColorTexture());
+            srcImage = vkImage(color);
         } catch (IllegalStateException e) {
             return; // not a Vulkan-backed texture (shouldn't happen on this backend)
         }
@@ -1889,7 +1894,8 @@ public final class RtComposite {
         long hudlessView = hudlessReady ? hudlessSrc.view : 0L;
         long hudlessImg = hudlessReady ? hudlessSrc.image : 0L;
         int hudlessFmt = hdrBackbuffer ? VK10.VK_FORMAT_R16G16B16A16_SFLOAT : VK10.VK_FORMAT_R8G8B8A8_UNORM;
-        boolean uiReady = RtUiOverlay.overlayWidth() == swapW && RtUiOverlay.overlayHeight() == swapH
+        boolean uiReady = RtUiOverlay.populatedThisFrame()
+                && RtUiOverlay.overlayWidth() == swapW && RtUiOverlay.overlayHeight() == swapH
                 && RtUiOverlay.overlayColorView() != 0L && RtUiOverlay.overlayColorImage() != 0L;
         long uiView = uiReady ? RtUiOverlay.overlayColorView() : 0L;
         long uiImg = uiReady ? RtUiOverlay.overlayColorImage() : 0L;
