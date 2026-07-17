@@ -90,7 +90,7 @@ public static const uint MATERIAL_GLASS = 3u;
 
 // Entity per-triangle record (48 B). The final lane mirrors TerrainPrim's integer material metadata.
 public struct Prim {
-    public float4 normal;
+    public float4 normal; // xyz = geometric normal, w = per-primitive emission strength
     public float4 tint;
     public uint materialId;
     public uint flags;

@@ -227,7 +227,7 @@ public final class RtEntityCapture implements VertexConsumer {
     }
 
     private void emitQuad() {
-        appendQuad(qx, qy, qz, null, qu, qv, qnx[0], qny[0], qnz[0], qcol[0], false);
+        appendQuad(qx, qy, qz, null, qu, qv, qnx[0], qny[0], qnz[0], qcol[0], false, 0f);
     }
 
     /**
@@ -237,7 +237,13 @@ public final class RtEntityCapture implements VertexConsumer {
      */
     void addDirectQuad(float[] x, float[] y, float[] z, float[] u, float[] v,
                        float nx, float ny, float nz, int color) {
-        appendQuad(x, y, z, null, u, v, nx, ny, nz, color, uvRemap);
+        addDirectQuad(x, y, z, u, v, nx, ny, nz, color, 0f);
+    }
+
+    /** Append a direct quad with an explicit per-primitive emission strength. */
+    void addDirectQuad(float[] x, float[] y, float[] z, float[] u, float[] v,
+                       float nx, float ny, float nz, int color, float emission) {
+        appendQuad(x, y, z, null, u, v, nx, ny, nz, color, uvRemap, emission);
     }
 
     /** Fail fast before a later submission can accidentally complete a malformed custom-geometry quad. */
@@ -252,11 +258,11 @@ public final class RtEntityCapture implements VertexConsumer {
     /** Append a face whose positions reference a transformed eight-corner cube template. */
     void addIndexedDirectQuad(float[] x, float[] y, float[] z, int[] corners, float[] u, float[] v,
                               float nx, float ny, float nz, int color) {
-        appendQuad(x, y, z, corners, u, v, nx, ny, nz, color, uvRemap);
+        appendQuad(x, y, z, corners, u, v, nx, ny, nz, color, uvRemap, 0f);
     }
 
     private void appendQuad(float[] x, float[] y, float[] z, int[] corners, float[] u, float[] v,
-                            float nx, float ny, float nz, int color, boolean remapUv) {
+                            float nx, float ny, float nz, int color, boolean remapUv, float emission) {
         // Authored model normal (pose-transformed by compile); planar quad, so vertex 0's normal is the
         // face normal. Baked quads (items/blocks) pass no normal → fall back to a geometric one from the
         // quad edges. The closest-hit flips it toward the viewer, as for terrain. Computed BEFORE the
@@ -310,7 +316,7 @@ public final class RtEntityCapture implements VertexConsumer {
             prim.add(nx);
             prim.add(ny);
             prim.add(nz);
-            prim.add(0f); // normal.w reserved; alpha semantics live in MaterialHeader.features
+            prim.add(emission);
             prim.add(tr);
             prim.add(tg);
             prim.add(tb);

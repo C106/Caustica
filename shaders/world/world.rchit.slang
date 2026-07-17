@@ -295,7 +295,7 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
                 ? lerp(float3(1.0, 1.0, 1.0), baseAlbedo, entityTexel.a) : baseAlbedo;
         Surface surface = evaluateMaterial(header, euvCoord, entityLod, albedo, n,
                 ep0, ep1, ep2, euv[e0], euv[e1], euv[e2], vdir,
-                header.params.x, header.params.y, 0.0, material == MATERIAL_OPAQUE);
+                header.params.x, header.params.y, pr.normal.w, material == MATERIAL_OPAQUE);
         n = surface.normal;
 
         payload.albedo = albedo * surface.ao;
