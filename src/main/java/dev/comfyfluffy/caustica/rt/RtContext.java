@@ -65,7 +65,8 @@ public final class RtContext {
         this.vk = device.vkDevice();
         this.vma = vma;
         this.graphicsQueue = device.graphicsQueue();
-        this.computeQueue = device.computeQueue();
+        this.computeQueue = new VulkanQueue(device, RtDeviceBringup.computeQueueFamilyIndex(),
+                RtDeviceBringup.computeQueueIndex());
         this.shaderGroupHandleSize = handleSize;
         this.shaderGroupBaseAlignment = baseAlign;
         this.accelerationStructureScratchAlignment = scratchAlign;
@@ -87,9 +88,9 @@ public final class RtContext {
         if (instance != null || unavailable) {
             return instance;
         }
-        if (device.computeQueue().vkQueue().address() == device.graphicsQueue().vkQueue().address()) {
+        if (!RtDeviceBringup.computeQueueReserved()) {
             unavailable = true;
-            CausticaMod.LOGGER.warn("Caustica RT disabled: Vulkan compute queue aliases graphics queue");
+            CausticaMod.LOGGER.warn("Caustica RT disabled: no dedicated compute queue was reserved at device creation");
             return null;
         }
         instance = create(device);
@@ -145,6 +146,10 @@ public final class RtContext {
 
     public RtGpuExecutor gpuExecutor() {
         return gpuExecutor;
+    }
+
+    VulkanQueue computeQueue() {
+        return computeQueue;
     }
 
     public int shaderGroupHandleSize() {

@@ -31,9 +31,9 @@ import static org.lwjgl.vulkan.KHRSynchronization2.VK_PIPELINE_STAGE_2_ALL_COMMA
 import static org.lwjgl.vulkan.KHRSynchronization2.VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
 
 /**
- * Single-owner asynchronous GPU submission lane on vanilla's otherwise-unused distinct compute queue.
- * Devices where that queue aliases graphics are rejected: cross-thread use of one VkQueue is invalid,
- * and render-thread submission would violate this executor's fully asynchronous contract.
+ * Single-owner asynchronous GPU submission lane on a queue reserved by Caustica at device creation.
+ * Minecraft never fetches or submits to this queue index, so the executor can satisfy Vulkan's external
+ * queue-synchronization rule without coordinating a host mutex with Blaze3D.
  */
 public final class RtGpuExecutor {
     private static final int MAX_BUILD_BATCH = 32;
@@ -60,10 +60,7 @@ public final class RtGpuExecutor {
 
     RtGpuExecutor(RtContext ctx) {
         this.ctx = ctx;
-        this.computeQueue = ctx.device().computeQueue();
-        if (computeQueue.vkQueue().address() == ctx.device().graphicsQueue().vkQueue().address()) {
-            throw new IllegalStateException("Caustica RT terrain requires a compute queue distinct from graphics");
-        }
+        this.computeQueue = ctx.computeQueue();
         this.buildTimeline = createTimeline("RT terrain build timeline");
         this.graphicsTimeline = createTimeline("RT graphics-use timeline");
         createCommandPool();
@@ -371,7 +368,7 @@ public final class RtGpuExecutor {
                     .stageMask(VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR);
             VkSubmitInfo2.Buffer submit = VkSubmitInfo2.calloc(1, stack).sType$Default()
                     .pCommandBufferInfos(command).pSignalSemaphoreInfos(signal);
-            VulkanDiagnostics.noteQueueSubmission(computeQueue.vkQueue(), "async-compute terrain builds");
+            VulkanDiagnostics.noteQueueSubmission(computeQueue.vkQueue(), "Caustica compute queue");
             RtContext.check(org.lwjgl.vulkan.KHRSynchronization2.vkQueueSubmit2KHR(
                     computeQueue.vkQueue(), submit, 0L), "vkQueueSubmit2KHR(RT GPU executor)");
             submitted = true;

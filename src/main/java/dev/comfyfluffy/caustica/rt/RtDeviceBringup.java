@@ -11,6 +11,8 @@ import org.lwjgl.vulkan.VKCapabilitiesDevice;
 import org.lwjgl.vulkan.VK10;
 import org.lwjgl.vulkan.VK12;
 import org.lwjgl.vulkan.VkDevice;
+import org.lwjgl.vulkan.VkDeviceCreateInfo;
+import org.lwjgl.vulkan.VkDeviceQueueCreateInfo;
 import org.lwjgl.vulkan.VkPhysicalDeviceAccelerationStructureFeaturesKHR;
 import org.lwjgl.vulkan.VkPhysicalDeviceAccelerationStructurePropertiesKHR;
 import org.lwjgl.vulkan.VkPhysicalDeviceProperties2;
@@ -25,6 +27,7 @@ import org.lwjgl.vulkan.VkPhysicalDeviceVulkan12Features;
 import org.lwjgl.vulkan.VkPhysicalDeviceOpacityMicromapFeaturesEXT;
 import org.lwjgl.vulkan.VkPhysicalDeviceOpacityMicromapPropertiesEXT;
 import org.lwjgl.vulkan.VkPhysicalDevicePresentIdFeaturesKHR;
+import org.lwjgl.vulkan.VkQueueFamilyProperties;
 import org.spongepowered.asm.mixin.injection.invoke.arg.Args;
 
 import java.util.ArrayList;
@@ -129,6 +132,8 @@ public final class RtDeviceBringup {
     private static volatile float maxLineWidth = 1.0f; // device's lineWidthRange[1]; 1.0 unless wideLinesEnabled
     private static volatile int overlayMsaaSamples = VK10.VK_SAMPLE_COUNT_1_BIT; // capped to the device's framebufferColorSampleCounts
     private static volatile int maxOpacity4StateSubdivisionLevel;
+    private static volatile int computeQueueFamilyIndex = -1;
+    private static volatile int computeQueueIndex = -1;
     private static boolean loggedUnavailable;
 
     private enum SerBackend {
@@ -206,6 +211,129 @@ public final class RtDeviceBringup {
      *  {@code rasterizationSamples}. */
     public static int overlayMsaaSamples() {
         return overlayMsaaSamples;
+    }
+
+    /** Whether device creation reserved a queue handle exclusively for Caustica terrain work. */
+    public static boolean computeQueueReserved() {
+        return computeQueueFamilyIndex >= 0 && computeQueueIndex >= 0;
+    }
+
+    public static int computeQueueFamilyIndex() {
+        if (!computeQueueReserved()) {
+            throw new IllegalStateException("Caustica compute queue was not reserved");
+        }
+        return computeQueueFamilyIndex;
+    }
+
+    public static int computeQueueIndex() {
+        if (!computeQueueReserved()) {
+            throw new IllegalStateException("Caustica compute queue was not reserved");
+        }
+        return computeQueueIndex;
+    }
+
+    /**
+     * Reserve one additional physical queue at device-creation time. Minecraft's queue-family map only
+     * requests handles for its graphics/compute/transfer queues; fetching a higher queue index without first
+     * increasing the matching {@link VkDeviceQueueCreateInfo#queueCount()} would be invalid. Prefer a
+     * compute-only family, but add a previously-unused compute family when that leaves the Minecraft queues
+     * untouched and has a free physical slot.
+     */
+    public static void reserveComputeQueue(VkDeviceCreateInfo deviceCreateInfo,
+                                           VulkanPhysicalDevice physicalDevice, MemoryStack stack) {
+        computeQueueFamilyIndex = -1;
+        computeQueueIndex = -1;
+        if (!rtRequested) {
+            return;
+        }
+
+        VkDeviceQueueCreateInfo.Buffer requestedQueues = deviceCreateInfo.pQueueCreateInfos();
+        if (requestedQueues == null) {
+            CausticaMod.LOGGER.warn("Caustica RT disabled: Vulkan device creation has no queue requests");
+            return;
+        }
+
+        var count = stack.callocInt(1);
+        VK10.vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice.vkPhysicalDevice(), count, null);
+        VkQueueFamilyProperties.Buffer families = VkQueueFamilyProperties.calloc(count.get(0), stack);
+        VK10.vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice.vkPhysicalDevice(), count, families);
+
+        int[] requestedCounts = new int[families.capacity()];
+        for (int i = 0; i < requestedQueues.capacity(); i++) {
+            VkDeviceQueueCreateInfo request = requestedQueues.get(i);
+            int family = request.queueFamilyIndex();
+            if (family >= 0 && family < requestedCounts.length) {
+                requestedCounts[family] = request.queueCount();
+            }
+        }
+
+        int selectedFamily = -1;
+        int selectedScore = Integer.MAX_VALUE;
+        for (int family = 0; family < families.capacity(); family++) {
+            VkQueueFamilyProperties properties = families.get(family);
+            int flags = properties.queueFlags();
+            if ((flags & VK10.VK_QUEUE_COMPUTE_BIT) == 0
+                    || requestedCounts[family] >= properties.queueCount()) {
+                continue;
+            }
+            // Compute-only families win; fewer capabilities then fewer already-requested handles break ties.
+            int score = ((flags & VK10.VK_QUEUE_GRAPHICS_BIT) != 0 ? 1_000 : 0)
+                    + Integer.bitCount(flags) * 10 + requestedCounts[family];
+            if (score < selectedScore) {
+                selectedFamily = family;
+                selectedScore = score;
+            }
+        }
+
+        if (selectedFamily < 0) {
+            CausticaMod.LOGGER.warn(
+                    "Caustica RT disabled: no spare compute-capable Vulkan queue is available");
+            return;
+        }
+
+        int queueIndex = requestedCounts[selectedFamily];
+        VkDeviceQueueCreateInfo matchingRequest = null;
+        for (int i = 0; i < requestedQueues.capacity(); i++) {
+            VkDeviceQueueCreateInfo request = requestedQueues.get(i);
+            if (request.queueFamilyIndex() == selectedFamily) {
+                matchingRequest = request;
+                break;
+            }
+        }
+
+        if (matchingRequest != null) {
+            var oldPriorities = matchingRequest.pQueuePriorities();
+            var priorities = stack.callocFloat(queueIndex + 1);
+            if (oldPriorities != null) {
+                for (int i = 0; i < queueIndex; i++) {
+                    priorities.put(i, oldPriorities.get(i));
+                }
+            }
+            matchingRequest.pQueuePriorities(priorities);
+        } else {
+            VkDeviceQueueCreateInfo.Buffer expanded = VkDeviceQueueCreateInfo.calloc(requestedQueues.capacity() + 1, stack);
+            for (int i = 0; i < requestedQueues.capacity(); i++) {
+                VkDeviceQueueCreateInfo source = requestedQueues.get(i);
+                expanded.get(i)
+                        .sType(source.sType())
+                        .pNext(source.pNext())
+                        .flags(source.flags())
+                        .queueFamilyIndex(source.queueFamilyIndex())
+                        .pQueuePriorities(source.pQueuePriorities());
+            }
+            expanded.get(requestedQueues.capacity())
+                    .sType$Default()
+                    .queueFamilyIndex(selectedFamily)
+                    .pQueuePriorities(stack.callocFloat(1));
+            deviceCreateInfo.pQueueCreateInfos(expanded);
+        }
+
+        computeQueueFamilyIndex = selectedFamily;
+        computeQueueIndex = queueIndex;
+        VkQueueFamilyProperties selected = families.get(selectedFamily);
+        CausticaMod.LOGGER.info(
+                "Reserved Caustica compute queue family={} index={} (family queues={}, flags=0x{})",
+                selectedFamily, queueIndex, selected.queueCount(), Integer.toHexString(selected.queueFlags()));
     }
 
     /** Optional extensions the gate wants AND the device supports — added but never required. */
