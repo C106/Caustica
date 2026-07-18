@@ -544,24 +544,24 @@ public final class CausticaConfig {
             public static final BooleanSetting VOLUMETRIC_CLOUDS =
                     bool("caustica.rt.volumetricClouds", "composite.volumetric-clouds", true);
             public static final FloatSetting CLOUD_COVERAGE =
-                    clampedFloat("caustica.rt.cloudCoverage", "composite.cloud-coverage", 0.52f, 0.0f, 1.0f);
+                    clampedFloat("caustica.rt.cloudCoverage", "composite.cloud-coverage", 0.5f, 0.0f, 1.0f);
             public static final FloatSetting CLOUD_DENSITY =
-                    clampedFloat("caustica.rt.cloudDensity", "composite.cloud-density", 1.0f, 0.1f, 2.0f);
+                    clampedFloat("caustica.rt.cloudDensity", "composite.cloud-density", 0.24f, 0.1f, 2.0f);
             public static final IntSetting CLOUD_HEIGHT =
-                    clampedInt("caustica.rt.cloudHeight", "composite.cloud-height", 224, 64, 384);
+                    clampedInt("caustica.rt.cloudHeight", "composite.cloud-height", 233, 64, 384);
             public static final IntSetting CLOUD_THICKNESS =
-                    clampedInt("caustica.rt.cloudThickness", "composite.cloud-thickness", 128, 32, 256);
+                    clampedInt("caustica.rt.cloudThickness", "composite.cloud-thickness", 256, 32, 256);
             public static final FloatSetting CLOUD_SHAPE =
-                    clampedFloat("caustica.rt.cloudShape", "composite.cloud-shape", 1.0f, 0.0f, 2.0f);
+                    clampedFloat("caustica.rt.cloudShape", "composite.cloud-shape", 0.15f, 0.0f, 2.0f);
             public static final FloatSetting CLOUD_BOTTOM_VARIATION =
                     clampedFloat("caustica.rt.cloudBottomVariation", "composite.cloud-bottom-variation",
-                            1.0f, 0.0f, 2.0f);
+                            0.43f, 0.0f, 2.0f);
             public static final FloatSetting CLOUD_DETAIL_STRENGTH =
                     clampedFloat("caustica.rt.cloudDetailStrength", "composite.cloud-detail-strength",
-                            1.0f, 0.0f, 2.0f);
+                            1.65f, 0.0f, 2.0f);
             public static final FloatSetting CLOUD_EDGE_EROSION =
                     clampedFloat("caustica.rt.cloudEdgeErosion", "composite.cloud-edge-erosion",
-                            1.0f, 0.0f, 2.0f);
+                            1.34f, 0.0f, 2.0f);
             public static final FloatSetting SUN_ANGULAR_RADIUS =
                     radians("caustica.rt.sunAngularRadius", "composite.sun-angular-radius-deg", 0.6f);
             public static final FloatSetting MOON_ANGULAR_RADIUS =
@@ -813,21 +813,21 @@ public final class CausticaConfig {
         public static final class Fog {
             public static final BooleanSetting ENABLED = bool("caustica.rt.fog", "fog.enabled", true);
             public static final FloatSetting DENSITY =
-                    clampedFloat("caustica.rt.fog.density", "fog.density", 0.0025f, 0.0f, 0.02f);
+                    clampedFloat("caustica.rt.fog.density", "fog.density", 9.856799e-4f, 0.0f, 0.02f);
             public static final FloatSetting AMBIENT_DENSITY_FLOOR =
-                    clampedFloat("caustica.rt.fog.ambientDensityFloor", "fog.ambient-density-floor", 0.15f, 0.0f, 1.0f);
+                    clampedFloat("caustica.rt.fog.ambientDensityFloor", "fog.ambient-density-floor", 0.04f, 0.0f, 1.0f);
             public static final FloatSetting AMBIENT_LIGHT_COUPLING =
-                    clampedFloat("caustica.rt.fog.ambientLightCoupling", "fog.ambient-light-coupling", 0.08f, 0.0f, 0.25f);
+                    clampedFloat("caustica.rt.fog.ambientLightCoupling", "fog.ambient-light-coupling", 0.01f, 0.0f, 0.25f);
             public static final FloatSetting HEIGHT_FALLOFF =
-                    clampedFloat("caustica.rt.fog.heightFalloff", "fog.height-falloff", 0.025f, 0.0f, 0.1f);
+                    clampedFloat("caustica.rt.fog.heightFalloff", "fog.height-falloff", 0.0253f, 0.0f, 0.1f);
             public static final FloatSetting VERTICAL_OPTICAL_DEPTH =
-                    clampedFloat("caustica.rt.fog.verticalOpticalDepth", "fog.vertical-optical-depth", 8.0f, 1.0f, 12.0f);
+                    clampedFloat("caustica.rt.fog.verticalOpticalDepth", "fog.vertical-optical-depth", 2.0f, 1.0f, 12.0f);
             public static final FloatSetting NOISE_STRENGTH =
-                    clampedFloat("caustica.rt.fog.noiseStrength", "fog.noise-strength", 0.65f, 0.0f, 1.0f);
+                    clampedFloat("caustica.rt.fog.noiseStrength", "fog.noise-strength", 0.94f, 0.0f, 1.0f);
             public static final FloatSetting NOISE_SCALE =
-                    clampedFloat("caustica.rt.fog.noiseScale", "fog.noise-scale", 0.012f, 0.002f, 0.04f);
+                    clampedFloat("caustica.rt.fog.noiseScale", "fog.noise-scale", 0.04f, 0.002f, 0.04f);
             public static final IntSetting BASE_HEIGHT =
-                    clampedInt("caustica.rt.fog.baseHeight", "fog.base-height", 64, -64, 320);
+                    clampedInt("caustica.rt.fog.baseHeight", "fog.base-height", 56, -64, 320);
             public static final BooleanSetting ATMOSPHERIC_SCATTERING =
                     bool("caustica.rt.fog.atmosphericScattering", "fog.atmospheric-scattering", true);
             public static final FloatSetting SCATTERING_STRENGTH =
