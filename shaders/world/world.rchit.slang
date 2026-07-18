@@ -420,6 +420,9 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
     payloadSetPacked(payload, material, surface.roughness, surface.metalness,
             surface.emission, surface.sss, materialHeader.params.z, materialHeader.params.w,
             materialEmissionSource(materialHeader, surface.emission));
+    if (material == MATERIAL_OPAQUE) {
+        payload.flags |= PAYLOAD_WETTABLE;
+    }
     if (material == MATERIAL_WATER && entering) {
         payload.flags |= PAYLOAD_WATER_ENTERING;
     }

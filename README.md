@@ -23,7 +23,9 @@ changes while the renderer is being built.
 - DLSS Frame Generation support (experimental)
 - HDR output
 - Rayleigh/Mie atmospheric scattering and ray-marched 3D volumetric fog with runtime controls
-- Ray-marched volumetric clouds with runtime thickness, coverage, and density controls
+- Ray-marched volumetric clouds with dedicated runtime shape, lighting, and coverage controls
+- Dimension-aware Overworld, Nether, and End skies and fog
+- Clear, rain, and thunder lighting profiles with rain-driven surface wetness
 - Dynamic entity rendering in the ray-traced scene
 - LabPBR-style material support
 - OMM (Opacity Micro-Map) + SER (Shader Execution Reordering) optimizations
@@ -98,6 +100,8 @@ license terms. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 ## TODO List
 
 - [ ] Weather
+- [ ] Optimize volumetric rendering performance
+- [ ] Optimize weather effects
 - [ ] NRD + FSR for non-NVIDIA GPUs
 - [ ] LOD
 - [ ] ReSTIR

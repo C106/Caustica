@@ -64,9 +64,11 @@ prepare_vulkan_sdk() {
 		return
 	fi
 
-	local install_root="${THIRD_PARTY_DIR}/vulkan-sdk"
+	# Keep the 1.7 GiB SDK outside the repository and in persistent user storage. VULKAN_SDK still
+	# takes precedence, while this default is shared by manual Gradle invocations and future clones.
+	local install_root="${HOME}/VulkanSDK"
 	local sdk_root="${install_root}/${VULKAN_SDK_VERSION}/x86_64"
-	local archive="${DOWNLOAD_DIR}/${VULKAN_ARCHIVE}"
+	local archive="${install_root}/${VULKAN_ARCHIVE}"
 
 	if [[ ! -x "${sdk_root}/bin/slangc" ]]; then
 		log "Downloading Vulkan SDK ${VULKAN_SDK_VERSION}" >&2

@@ -1,12 +1,17 @@
 package dev.comfyfluffy.caustica.mixin;
 
 import dev.comfyfluffy.caustica.CausticaConfig;
+import dev.comfyfluffy.caustica.client.RtCloudSettingsScreen;
 import dev.comfyfluffy.caustica.client.RtVideoOptions;
 import java.util.ArrayList;
 import java.util.List;
+import net.minecraft.client.Minecraft;
 import net.minecraft.client.OptionInstance;
 import net.minecraft.client.Options;
+import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.components.OptionsList;
+import net.minecraft.client.gui.components.Tooltip;
+import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.gui.screens.options.VideoSettingsScreen;
 import net.minecraft.network.chat.Component;
 import org.spongepowered.asm.mixin.Mixin;
@@ -68,6 +73,14 @@ public abstract class VideoSettingsScreenMixin {
             return;
         }
         list.addHeader(CAUSTICA$RT_HEADER);
+        list.addBig(Button.builder(
+                Component.translatable("caustica.options.rt.cloudSettings"),
+                button -> {
+                    Minecraft minecraft = Minecraft.getInstance();
+                    minecraft.gui.setScreen(new RtCloudSettingsScreen((Screen) (Object) this, minecraft.options));
+                })
+                .tooltip(Tooltip.create(Component.translatable("caustica.options.rt.cloudSettings.tooltip")))
+                .build());
         list.addSmall(RtVideoOptions.runtimeOptions());
     }
 

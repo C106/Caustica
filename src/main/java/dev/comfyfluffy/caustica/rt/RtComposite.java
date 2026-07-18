@@ -190,6 +190,8 @@ public final class RtComposite {
     }
 
     private RtPipeline worldPipeline;
+    private PipelineVariant worldPipelineVariant;
+    private boolean pipelineResourceRebindPending;
     // Set at the HEAD of Minecraft.reloadResourcePacks() (mixin): a resource reload recreates the block
     // atlas + entity textures. We tear down the world pipeline there (drops all descriptor references) and
     // rebuild it once the NEW atlas is in place — detected by the atlas view handle changing away from
@@ -298,9 +300,30 @@ public final class RtComposite {
     private float prevCloudWindX;
     private float prevCloudWindZ;
     private boolean cloudWindHasPrev;
+    private boolean cloudConfigHasPrev;
+    private boolean prevCloudsEnabled;
+    private int prevCloudHeight;
+    private int prevCloudThickness;
+    private float prevCloudCoverage;
+    private float prevCloudDensity;
+    private float prevCloudShape;
+    private float prevCloudBottomVariation;
+    private float prevCloudDetailStrength;
+    private float prevCloudEdgeErosion;
     private long atlasSampler;
     private boolean failed;
     private boolean loggedActive;
+
+    private enum PipelineVariant {
+        FULL(true),
+        LEAN(false);
+
+        final boolean volumetrics;
+
+        PipelineVariant(boolean volumetrics) {
+            this.volumetrics = volumetrics;
+        }
+    }
 
     // Camera captured each frame from GameRenderer (unjittered level projection + camera rotation + pos).
     private final Matrix4f frameProjection = new Matrix4f();
@@ -386,6 +409,9 @@ public final class RtComposite {
         if (RtEntityTextures.maxTextures() > bindlessTextureCapacity) {
             return true;
         }
+        if (worldPipelineVariant != desiredPipelineVariant()) {
+            return true;
+        }
         if (reloadRebindRequested) {
             long atlas = blockAlbedoAtlasView();
             return atlas == 0L || atlas == boundBlockAlbedoAtlasHandle;
@@ -414,9 +440,39 @@ public final class RtComposite {
     private void resetTemporalHistory() {
         mvHasPrev = false;
         cloudWindHasPrev = false;
+        cloudConfigHasPrev = false;
         fgReset = true;
         CausticaJitter.INSTANCE.reset();
         RtDlssRr.INSTANCE.requestHistoryReset();
+    }
+
+    private void updateCloudHistory(boolean enabled, int height, int thickness,
+                                    float coverage, float density, float shape,
+                                    float bottomVariation, float detailStrength, float edgeErosion) {
+        boolean changed = cloudConfigHasPrev
+                && (enabled != prevCloudsEnabled
+                || height != prevCloudHeight
+                || thickness != prevCloudThickness
+                || Float.compare(coverage, prevCloudCoverage) != 0
+                || Float.compare(density, prevCloudDensity) != 0
+                || Float.compare(shape, prevCloudShape) != 0
+                || Float.compare(bottomVariation, prevCloudBottomVariation) != 0
+                || Float.compare(detailStrength, prevCloudDetailStrength) != 0
+                || Float.compare(edgeErosion, prevCloudEdgeErosion) != 0);
+        if (changed) {
+            fgReset = true;
+            RtDlssRr.INSTANCE.requestHistoryReset();
+        }
+        prevCloudsEnabled = enabled;
+        prevCloudHeight = height;
+        prevCloudThickness = thickness;
+        prevCloudCoverage = coverage;
+        prevCloudDensity = density;
+        prevCloudShape = shape;
+        prevCloudBottomVariation = bottomVariation;
+        prevCloudDetailStrength = detailStrength;
+        prevCloudEdgeErosion = edgeErosion;
+        cloudConfigHasPrev = true;
     }
 
     /** Capture the frame's camera for the next composite. Called from GameRendererMixin. */
@@ -473,6 +529,15 @@ public final class RtComposite {
             case END -> DIMENSION_MODE_END;
             case NONE -> DIMENSION_MODE_GENERIC;
         };
+    }
+
+    private static PipelineVariant desiredPipelineVariant() {
+        boolean volumetrics = CausticaConfig.Rt.Fog.ENABLED.value();
+        ClientLevel level = Minecraft.getInstance().level;
+        if (!volumetrics && level != null && dimensionMode(level) == DIMENSION_MODE_OVERWORLD) {
+            volumetrics = CausticaConfig.Rt.Composite.VOLUMETRIC_CLOUDS.value();
+        }
+        return volumetrics ? PipelineVariant.FULL : PipelineVariant.LEAN;
     }
 
     /** Camera-local sky openness, smoothed independently of frame rate to avoid whole-view fog pops. */
@@ -681,10 +746,16 @@ public final class RtComposite {
 
     private RtPipeline ensureWorld(RtContext ctx) {
         if (worldPipeline == null) {
-            bindlessTextureCapacity = RtEntityTextures.maxTextures();
-            worldPipeline = RtPipeline.create(ctx, RtDeviceBringup.worldRaygenShader(),
+            PipelineVariant variant = desiredPipelineVariant();
+            // An ABI-only variant swap retains the old descriptor capacity so every existing bindless slot
+            // remains valid even if the user lowered the soft texture limit before switching the variant.
+            if (!pipelineResourceRebindPending) {
+                bindlessTextureCapacity = RtEntityTextures.maxTextures();
+            }
+            worldPipeline = RtPipeline.create(ctx, RtDeviceBringup.worldRaygenShader(variant.volumetrics),
                     new String[]{"world.rmiss.spv"}, "world.rchit.spv", "world.rahit.spv",
                     WorldPushConstantsData.BYTE_SIZE, true, GUIDE_COUNT, bindlessTextureCapacity, true);
+            worldPipelineVariant = variant;
             // Per-frame world data lives in this BDA ring; the pipeline pushes its address and hot fields.
             if (pushRing == null) {
                 pushRing = new RtBuffer[PUSH_RING];
@@ -697,7 +768,12 @@ public final class RtComposite {
                 worldPipeline.setStorageImage(output.view);
                 bindGuideImages();
             }
-            bindWorldTextures(ctx);
+            if (pipelineResourceRebindPending) {
+                rebindWorldPipelineResources(ctx);
+                pipelineResourceRebindPending = false;
+            } else {
+                bindWorldTextures(ctx);
+            }
             reloadRebindRequested = false;
         }
         // The TLAS is rebuilt and bound per frame in recordFrame since dynamic entity content animates
@@ -710,14 +786,25 @@ public final class RtComposite {
             return;
         }
         int desiredBindlessCapacity = RtEntityTextures.maxTextures();
-        if (desiredBindlessCapacity <= bindlessTextureCapacity) {
+        PipelineVariant desiredVariant = desiredPipelineVariant();
+        boolean variantChanged = desiredVariant != worldPipelineVariant;
+        if (desiredBindlessCapacity <= bindlessTextureCapacity && !variantChanged) {
             return;
         }
         ctx.waitIdle();
         worldPipeline.destroy();
         worldPipeline = null;
-        bindlessTextureCapacity = 0;
+        worldPipelineVariant = null;
+        pipelineResourceRebindPending = variantChanged
+                && desiredBindlessCapacity <= bindlessTextureCapacity
+                && materialBindingsReady;
+        if (!pipelineResourceRebindPending) {
+            bindlessTextureCapacity = 0;
+        }
         materialBindingsReady = false;
+        if (variantChanged) {
+            resetTemporalHistory();
+        }
     }
 
     /**
@@ -754,6 +841,23 @@ public final class RtComposite {
         // incrementally displaying old UVs/IDs against the new atlas/table.
         RtTerrain.requestFullClear();
         materialEpochTraceGate = true;
+    }
+
+    /** Bind an ABI-compatible replacement pipeline without rebuilding material pages or terrain epochs. */
+    private void rebindWorldPipelineResources(RtContext ctx) {
+        long sampler = atlasSampler(ctx);
+        long atlasView = blockAlbedoAtlasView();
+        boundBlockAlbedoAtlasHandle = atlasView;
+        worldPipeline.setBlockAlbedoAtlas(atlasView, sampler);
+        worldPipeline.setEntityAlbedoTexture(0, atlasView, sampler);
+        RtBlockMaterials.INSTANCE.bindPages(worldPipeline, sampler);
+        RtEntityTextures.INSTANCE.rebindAll(worldPipeline, sampler);
+        long celView = celestialsAtlasView();
+        if (worldPipeline.hasSkyAtlas()) {
+            worldPipeline.setSkyAtlas(celView != 0L ? celView : atlasView, sampler);
+        }
+        setCelestialUvAtlas(celView);
+        materialBindingsReady = true;
     }
 
     private void refreshMaterialBindingsIfNeeded(RtContext ctx) {
@@ -797,6 +901,8 @@ public final class RtComposite {
             if (worldPipeline != null) {
                 worldPipeline.destroy();
                 worldPipeline = null;
+                worldPipelineVariant = null;
+                pipelineResourceRebindPending = false;
                 bindlessTextureCapacity = 0;
             }
             RtMaterialRegistry.INSTANCE.destroy();
@@ -986,8 +1092,32 @@ public final class RtComposite {
             // flags: PBR BRDF (bit 1, always on) + camera-in-water (so the path tracer starts in the water
             // medium when the eye is submerged, fixing the air→water first-segment orientation).
             int flags = 0b10;
-            var level = Minecraft.getInstance().level;
+            Minecraft mc = Minecraft.getInstance();
+            var level = mc.level;
             int dimensionMode = dimensionMode(level);
+            float rainLevel = 0f;
+            float thunderLevel = 0f;
+            boolean rainActive = false;
+            if (level != null && dimensionMode == DIMENSION_MODE_OVERWORLD) {
+                float partial = mc.getDeltaTracker().getGameTimeDeltaPartialTick(false);
+                rainLevel = Mth.clamp(level.getRainLevel(partial), 0f, 1f);
+                // Minecraft's public thunder level already includes rain intensity; retain that continuous
+                // convention rather than converting it back into a binary thunderstorm state.
+                thunderLevel = Mth.clamp(level.getThunderLevel(partial), 0f, rainLevel);
+                rainActive = level.isRaining();
+            }
+            boolean cloudsEnabled = dimensionMode == DIMENSION_MODE_OVERWORLD
+                    && CausticaConfig.Rt.Composite.VOLUMETRIC_CLOUDS.value();
+            int cloudHeight = CausticaConfig.Rt.Composite.CLOUD_HEIGHT.value();
+            int cloudThickness = CausticaConfig.Rt.Composite.CLOUD_THICKNESS.value();
+            float cloudCoverage = CausticaConfig.Rt.Composite.CLOUD_COVERAGE.value();
+            float cloudDensity = CausticaConfig.Rt.Composite.CLOUD_DENSITY.value();
+            float cloudShape = CausticaConfig.Rt.Composite.CLOUD_SHAPE.value();
+            float cloudBottomVariation = CausticaConfig.Rt.Composite.CLOUD_BOTTOM_VARIATION.value();
+            float cloudDetailStrength = CausticaConfig.Rt.Composite.CLOUD_DETAIL_STRENGTH.value();
+            float cloudEdgeErosion = CausticaConfig.Rt.Composite.CLOUD_EDGE_EROSION.value();
+            updateCloudHistory(cloudsEnabled, cloudHeight, cloudThickness, cloudCoverage, cloudDensity,
+                    cloudShape, cloudBottomVariation, cloudDetailStrength, cloudEdgeErosion);
             if (level != null) {
                 cameraBlockPos.set(Mth.floor(camX), Mth.floor(camY), Mth.floor(camZ));
                 // Height-aware, mirroring vanilla's own Camera.getFluidInCamera(): a plain block-granular
@@ -1002,8 +1132,7 @@ public final class RtComposite {
             if (waterWaves()) {
                 flags |= 0b10000; // W1: animated water wave normals
             }
-            if (dimensionMode == DIMENSION_MODE_OVERWORLD
-                    && CausticaConfig.Rt.Composite.VOLUMETRIC_CLOUDS.value()) {
+            if (cloudsEnabled) {
                 flags |= 0b100000;
             }
 
@@ -1024,9 +1153,11 @@ public final class RtComposite {
             double cloudWindAngle = animationTime * (Math.PI * 2.0 / 3600.0);
             float cloudWindX = (float) Math.cos(cloudWindAngle) * 600f;
             float cloudWindZ = (float) Math.sin(cloudWindAngle) * 600f;
-            Float4 cloudMotion = cloudWindHasPrev
-                    ? new Float4(prevCloudWindX - cloudWindX, 0f, prevCloudWindZ - cloudWindZ, 0f)
-                    : new Float4(0f, 0f, 0f, 0f);
+            float cloudMotionX = cloudWindHasPrev ? prevCloudWindX - cloudWindX : 0f;
+            float cloudMotionZ = cloudWindHasPrev ? prevCloudWindZ - cloudWindZ : 0f;
+            // xy stores previous-frame physical displacement in world XZ; zw stores the current wind
+            // offset sampled by every density probe, avoiding per-ray sin/cos in the cloud marcher.
+            Float4 cloudMotion = new Float4(cloudMotionX, cloudMotionZ, cloudWindX, cloudWindZ);
             prevCloudWindX = cloudWindX;
             prevCloudWindZ = cloudWindZ;
             cloudWindHasPrev = true;
@@ -1073,13 +1204,16 @@ public final class RtComposite {
             Float4 fogAmbientParams = new Float4(
                     CausticaConfig.Rt.Fog.AMBIENT_DENSITY_FLOOR.value(),
                     CausticaConfig.Rt.Fog.AMBIENT_LIGHT_COUPLING.value(), 0f, 0f);
-            float cloudCenterY = CausticaConfig.Rt.Composite.CLOUD_HEIGHT.value();
-            float cloudHalfThickness = CausticaConfig.Rt.Composite.CLOUD_THICKNESS.value() * 0.5f;
+            float cloudCenterY = cloudHeight;
+            float cloudHalfThickness = cloudThickness * 0.5f;
             Float4 cloudParams = new Float4(
                     cloudCenterY - cloudHalfThickness - terrain.blockY,
                     cloudCenterY + cloudHalfThickness - terrain.blockY,
-                    CausticaConfig.Rt.Composite.CLOUD_COVERAGE.value(),
-                    CausticaConfig.Rt.Composite.CLOUD_DENSITY.value());
+                    cloudCoverage,
+                    cloudDensity);
+            Float4 cloudShapeParams = new Float4(
+                    cloudShape, cloudBottomVariation, cloudDetailStrength, cloudEdgeErosion);
+            Float4 weatherParams = new Float4(rainLevel, thunderLevel, rainActive ? 1f : 0f, 0f);
 
             // Rebuild the TLAS this frame from static section instances merged with dynamic entity
             // instances, bind it into the pipeline's descriptor ring, record the build, then barrier so
@@ -1095,7 +1229,7 @@ public final class RtComposite {
             // not a block-atlas sprite — see ModelBakery.BREAKING_LOCATIONS/DESTROY_TYPES), so any newly
             // resolved slot rides along with the uploadPending() call right below.
             BreakEntry[] breaking = breakingEntries(terrain);
-            SkyPush sky = skyPush(dimensionMode);
+            SkyPush sky = skyPush(dimensionMode, rainLevel, thunderLevel);
             new WorldPushData(
                     frameInvViewProj,
                     new Float3((float) (camX - terrain.blockX), (float) (camY - terrain.blockY),
@@ -1124,6 +1258,8 @@ public final class RtComposite {
                     fogShapeParams,
                     fogAmbientParams,
                     cloudParams,
+                    cloudShapeParams,
+                    weatherParams,
                     cloudMotion,
                     mvCurProjView,
                     breaking.length,
@@ -1267,7 +1403,7 @@ public final class RtComposite {
      * interpolated). {@code caustica.rt.sunNoonSouthDeg} tilts the east-west arc toward south (+Z) at
      * noon.
      */
-    private SkyPush skyPush(int dimensionMode) {
+    private SkyPush skyPush(int dimensionMode, float rainLevel, float thunderLevel) {
         if (dimensionMode != DIMENSION_MODE_OVERWORLD) {
             Float4 fullUv = new Float4(0f, 0f, 1f, 1f);
             return new SkyPush(
@@ -1330,6 +1466,18 @@ public final class RtComposite {
             rb = 0.55f * moonPeak * moonStrength * trans[2];
             lightRadius = CausticaConfig.Rt.Composite.MOON_ANGULAR_RADIUS.value();
         }
+        // Keep NEE consistent with the weathered sky. Minecraft's thunder level already includes rain, so
+        // split clear/rain/storm into disjoint weights instead of attenuating the storm twice. Full rain keeps
+        // a dim cool 22/25/28% RGB direct component and full thunder about 5.3/6.0/6.8%. Both inputs are
+        // interpolated client levels, so this evolves continuously without invalidating history every frame.
+        float rain = Mth.clamp(rainLevel, 0f, 1f);
+        float thunder = Mth.clamp(thunderLevel, 0f, rain);
+        float sunnyWeight = 1f - rain;
+        float rainyWeight = Math.max(rain - thunder, 0f);
+        float weatherTransmission = sunnyWeight + 0.27f * rainyWeight + 0.065f * thunder;
+        rr *= weatherTransmission * (1f - 0.18f * rain);
+        rg *= weatherTransmission * (1f - 0.08f * rain);
+        rb *= weatherTransmission * (1f + 0.04f * rain);
         CelestialUv uv = celestialUv(moonPhase);
         return new SkyPush(
                 new Float4(sunX, sunY, sunZ, dayFactor),
@@ -1500,6 +1648,8 @@ public final class RtComposite {
             worldPipeline.destroy();
             worldPipeline = null;
         }
+        worldPipelineVariant = null;
+        pipelineResourceRebindPending = false;
         bindlessTextureCapacity = 0;
         materialBindingsReady = false;
         materialEpochTraceGate = false;

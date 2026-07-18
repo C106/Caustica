@@ -18,6 +18,10 @@
 	"caustica.options.rt.sunSize": "Sun Size",
 	"caustica.options.rt.sunSize.tooltip": "Angular radius of the sun and moon disk. Larger discs cast softer shadow penumbrae.",
 
+	"caustica.options.rt.cloudSettings": "Cloud Settings",
+	"caustica.options.rt.cloudSettings.tooltip": "Configure the ray-marched volumetric cloud layer.",
+	"caustica.options.rt.cloudSettings.title": "Volumetric Cloud Settings",
+
 	"caustica.rt.volumetricClouds": "Volumetric Clouds",
 	"caustica.rt.volumetricClouds.tooltip": "Render ray-marched volumetric clouds in Overworld-style skies.",
 
@@ -34,6 +38,18 @@
 
 	"caustica.rt.cloudDensity": "Cloud Density",
 	"caustica.rt.cloudDensity.tooltip": "Optical density of volumetric clouds. 100% is the default; higher values make clouds more opaque and darker.",
+
+	"caustica.rt.cloudShape": "Cloud Shape",
+	"caustica.rt.cloudShape.tooltip": "Strength of the large-scale cumulus body and tower shaping. 100% is the default.",
+
+	"caustica.rt.cloudBottomVariation": "Cloud Base Variation",
+	"caustica.rt.cloudBottomVariation.tooltip": "Variation and carving along cloud undersides. 0% produces calmer bases; 200% produces more irregular bases.",
+
+	"caustica.rt.cloudDetailStrength": "Cloud Detail",
+	"caustica.rt.cloudDetailStrength.tooltip": "Strength of medium-scale billows and density detail. 100% is the default.",
+
+	"caustica.rt.cloudEdgeErosion": "Cloud Edge Erosion",
+	"caustica.rt.cloudEdgeErosion.tooltip": "Strength of fine turbulent erosion along cloud boundaries. 0% disables fine erosion; 200% doubles it.",
 
 	"caustica.options.rt.entities": "Ray-Traced Entities",
 	"caustica.options.rt.entities.tooltip": "Include entities and block entities in the ray-traced scene.",

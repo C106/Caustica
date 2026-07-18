@@ -44,6 +44,32 @@ float3 boundedSkyAnchor(float3 fogColor, float3 floorColor, float maxChannel) {
     return anchor * min(1.0, maxChannel / max(peak, 1.0e-6));
 }
 
+// Replace the high-contrast clear atmosphere with a luminance-bounded cold-grey dome as precipitation
+// builds. The fog colour supplies biome/time exposure context, while fixed luminance-normalised tints keep
+// rain neutral-cool and push thunder farther toward blue without creating a saturated one-note sky.
+float3 applyOverworldWeatherSky(float3 clearSky, float3 dir, float downFade, WorldPush pc) {
+    float2 weather = weatherAmounts(pc);
+    float rain = weather.x;
+    float thunder = weather.y;
+    if (rain <= 0.0 && thunder <= 0.0) return clearSky;
+
+    float day = clamp(pc.sunDir.w, 0.0, 1.0);
+    const float3 luminanceWeights = float3(0.2126, 0.7152, 0.0722);
+    float fogLuminance = dot(max(pc.fogColor.xyz, float3(0.0, 0.0, 0.0)), luminanceWeights);
+    float anchorLuminance = clamp(fogLuminance, lerp(0.018, 0.090, day),
+                                  lerp(0.080, 0.340, day));
+    float horizon = exp2(-3.5 * dir.y * dir.y);
+    float rainProfile = lerp(0.78, 1.05, horizon) * downFade;
+    float thunderProfile = lerp(0.34, 0.48, horizon) * downFade;
+    const float3 rainTint = float3(0.927, 1.011, 1.117);
+    const float3 thunderTint = float3(0.877, 1.012, 1.237);
+    float3 rainSky = anchorLuminance * rainProfile * rainTint;
+    float3 thunderSky = anchorLuminance * thunderProfile * thunderTint;
+    float clearWeight = 1.0 - rain;
+    float rainWeight = max(rain - thunder, 0.0);
+    return clearSky * clearWeight + rainSky * rainWeight + thunderSky * thunder;
+}
+
 // Enclosed, warm Nether backdrop. All variation is analytic and very low frequency: no hash cells, temporal
 // random numbers, or fixed-step volume march that could turn into noise/bands under DLSS jitter.
 float3 netherSky(float3 dir, float3 fogColor) {
@@ -301,7 +327,8 @@ void main(inout Payload payload) {
     float SdotU = sd.y;
     float VdotS = dot(dir, sd);
     float sunUp = clamp((SdotU + 0.0625) / 0.125, 0.0, 1.0); // 0 well below horizon .. 1 above
-    float starBrightness = worldPush.lightRadiance.w;
+    float celestialVisibility = weatherCelestialVisibility(worldPush);
+    float starBrightness = worldPush.lightRadiance.w * celestialVisibility;
     bool showCelestial = (payload.flags & PAYLOAD_SHOW_CELESTIAL) != 0u;
 
     // Physically-based in-scattering: blue zenith, bright/desaturated horizon, warm Mie halo + red
@@ -328,6 +355,7 @@ void main(inout Payload payload) {
     float3 nightAmbient = lerp(NIGHT_HORIZON, NIGHT_ZENITH, up);
     col += nightAmbient * (1.0 - day);
     col *= downFade;
+    col = applyOverworldWeatherSky(col, dir, downFade, worldPush);
     col += stars(dir, starBrightness, VdotS, worldPush.celestial);
 
     // Sun & moon discs — sampled from the vanilla celestials atlas, gated to rays that haven't already
@@ -344,7 +372,8 @@ void main(inout Payload payload) {
             // survives, the halo collapses to ~0.
             float core = pow(clamp(dot(t, t) * 0.45, 0.0, 1.0), 6.0);
             // transmittanceToSpace reddens+dims the disc through the sunset on the sky's own curve.
-            col += SUN_DISC_RADIANCE * transmittanceToSpace(dir) * core * sunUp;
+            col += SUN_DISC_RADIANCE * transmittanceToSpace(dir) * core * sunUp
+                 * celestialVisibility;
         }
         // Same horizon gate as the sun: with the soft-horizon change, below-horizon rays no longer clip
         // at the planet, so without this the moon disc would stay visible after it set.
@@ -356,7 +385,8 @@ void main(inout Payload payload) {
             // Moon: a smoothstep contrast ramp suppresses the faint halo while keeping the lit phase
             // shape from the texture. The transmittance tint gives a warm amber moon at moonrise/set.
             float m = smoothstep(0.0, 1.0, min(length(t), 1.0)) * 1.3;
-            col += MOON_DISC_RADIANCE * transmittanceToSpace(dir) * t * m * pow2(1.0 - day) * moonUp;
+            col += MOON_DISC_RADIANCE * transmittanceToSpace(dir) * t * m
+                 * pow2(1.0 - day) * moonUp * celestialVisibility;
         }
     }
 

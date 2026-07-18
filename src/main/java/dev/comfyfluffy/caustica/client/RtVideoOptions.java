@@ -38,11 +38,6 @@ public final class RtVideoOptions {
             maxBounces(),
             sunSize(),
             waterWaves(),
-            volumetricClouds(),
-            cloudHeight(),
-            cloudThickness(),
-            cloudCoverage(),
-            cloudDensity(),
             entities(),
             particles(),
             fogEnabled(),
@@ -61,6 +56,21 @@ public final class RtVideoOptions {
             hdrPaperWhite(),
             hdrPeak(),
             debugView(),
+        };
+    }
+
+    /** Runtime-tunable volumetric cloud options shown on the dedicated cloud settings screen. */
+    public static OptionInstance<?>[] cloudOptions() {
+        return new OptionInstance<?>[] {
+            volumetricClouds(),
+            cloudHeight(),
+            cloudThickness(),
+            cloudCoverage(),
+            cloudDensity(),
+            cloudShape(),
+            cloudBottomVariation(),
+            cloudDetailStrength(),
+            cloudEdgeErosion(),
         };
     }
 
@@ -175,6 +185,35 @@ public final class RtVideoOptions {
             (caption, percent) -> Options.genericValueLabel(caption, Component.literal(percent + "%")),
             new OptionInstance.IntRange(10, 200),
             Math.clamp(Math.round(setting.value() * 100.0f), 10, 200),
+            percent -> setting.set(percent / 100.0f));
+    }
+
+    private static OptionInstance<Integer> cloudShape() {
+        return cloudPercent("caustica.rt.cloudShape", CausticaConfig.Rt.Composite.CLOUD_SHAPE);
+    }
+
+    private static OptionInstance<Integer> cloudBottomVariation() {
+        return cloudPercent("caustica.rt.cloudBottomVariation",
+                CausticaConfig.Rt.Composite.CLOUD_BOTTOM_VARIATION);
+    }
+
+    private static OptionInstance<Integer> cloudDetailStrength() {
+        return cloudPercent("caustica.rt.cloudDetailStrength",
+                CausticaConfig.Rt.Composite.CLOUD_DETAIL_STRENGTH);
+    }
+
+    private static OptionInstance<Integer> cloudEdgeErosion() {
+        return cloudPercent("caustica.rt.cloudEdgeErosion",
+                CausticaConfig.Rt.Composite.CLOUD_EDGE_EROSION);
+    }
+
+    private static OptionInstance<Integer> cloudPercent(String key, FloatSetting setting) {
+        return new OptionInstance<>(
+            key,
+            OptionInstance.cachedConstantTooltip(Component.translatable(key + ".tooltip")),
+            (caption, percent) -> Options.genericValueLabel(caption, Component.literal(percent + "%")),
+            new OptionInstance.IntRange(0, 200),
+            Math.clamp(Math.round(setting.value() * 100.0f), 0, 200),
             percent -> setting.set(percent / 100.0f));
     }
 

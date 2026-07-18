@@ -18,6 +18,10 @@
 	"caustica.options.rt.sunSize": "太阳大小",
 	"caustica.options.rt.sunSize.tooltip": "太阳和月亮圆盘的角半径。圆盘越大，投射的半影越柔和。",
 
+	"caustica.options.rt.cloudSettings": "云层设置",
+	"caustica.options.rt.cloudSettings.tooltip": "配置使用光线步进渲染的体积云层。",
+	"caustica.options.rt.cloudSettings.title": "体积云设置",
+
 	"caustica.rt.volumetricClouds": "体积云",
 	"caustica.rt.volumetricClouds.tooltip": "在主世界风格的天空中渲染光线步进体积云。",
 
@@ -34,6 +38,18 @@
 
 	"caustica.rt.cloudDensity": "云层密度",
 	"caustica.rt.cloudDensity.tooltip": "体积云的光学密度。100% 为默认值；数值越高，云层越不透明、越暗。",
+
+	"caustica.rt.cloudShape": "云体形状",
+	"caustica.rt.cloudShape.tooltip": "控制大尺度积云主体和云塔的塑形强度。100% 为默认值。",
+
+	"caustica.rt.cloudBottomVariation": "云底变化",
+	"caustica.rt.cloudBottomVariation.tooltip": "控制云底的起伏和侵蚀。0% 会生成更平缓的云底；200% 会生成更不规则的云底。",
+
+	"caustica.rt.cloudDetailStrength": "云体细节",
+	"caustica.rt.cloudDetailStrength.tooltip": "控制中尺度云团和密度细节的强度。100% 为默认值。",
+
+	"caustica.rt.cloudEdgeErosion": "云缘侵蚀",
+	"caustica.rt.cloudEdgeErosion.tooltip": "控制云体边缘的细微湍流侵蚀。0% 会关闭细微侵蚀；200% 会将其加倍。",
 
 	"caustica.options.rt.entities": "光追实体",
 	"caustica.options.rt.entities.tooltip": "将实体和方块实体加入光追场景。",

@@ -27,23 +27,9 @@ static const float ENTITY_ALPHA_CUTOFF = 0.1; // entities: only discard near-ful
 static const float TRANSLUCENT_NEUTRAL_EXTINCTION = 0.15;
 static const float WATER_SHADOW_TINT = 0.5;
 
-// Progressive 8x8 blue-noise-style alpha threshold pattern, with a golden-ratio temporal rotation. This keeps
-// translucent entity hits stochastic, but trades per-pixel white noise for a stable spatial distribution
-// that temporal upscaling can integrate with less sparkle.
-static const float ALPHA_DITHER_8X8[64] = {
-    0.281250, 0.968750, 0.375000, 0.859375, 0.250000, 0.937500, 0.406250, 0.812500,
-    0.593750, 0.187500, 0.734375, 0.046875, 0.578125, 0.218750, 0.703125, 0.015625,
-    0.453125, 0.765625, 0.328125, 0.921875, 0.484375, 0.796875, 0.343750, 0.890625,
-    0.640625, 0.093750, 0.546875, 0.156250, 0.671875, 0.078125, 0.515625, 0.125000,
-    0.265625, 0.953125, 0.421875, 0.828125, 0.296875, 0.984375, 0.390625, 0.843750,
-    0.562500, 0.234375, 0.687500, 0.000000, 0.609375, 0.203125, 0.718750, 0.031250,
-    0.468750, 0.781250, 0.359375, 0.875000, 0.437500, 0.750000, 0.312500, 0.906250,
-    0.656250, 0.062500, 0.500000, 0.140625, 0.625000, 0.109375, 0.531250, 0.171875
-};
-
 float alphaDitherThreshold(uint salt) {
-    uint2 p = (DispatchRaysIndex().xy + uint2(salt * 3u, salt * 5u)) & uint2(7u, 7u);
-    float base = ALPHA_DITHER_8X8[int(p.y * 8u + p.x)];
+    uint2 p = DispatchRaysIndex().xy + uint2(salt * 3u, salt * 5u);
+    float base = orderedDither8x8(p);
     return frac(base + float((pc.frameIndex + salt) & 255u) * 0.61803398875);
 }
 
@@ -52,7 +38,6 @@ void main(inout float4 shadowVis, in BuiltInTriangleIntersectionAttributes attr)
     uint pid = PrimitiveIndex();
     float2 attribs = attr.barycentrics;
     float3 bary = float3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
-
     uint instanceKind = InstanceID() & (ENTITY_BIT | PARTICLE_BIT);
     if (instanceKind != 0u) {
         EntityGeom g = ConstPtr<EntityGeom>(pc.entityTableAddr)[InstanceID() & IDX_MASK];
@@ -87,12 +72,14 @@ void main(inout float4 shadowVis, in BuiltInTriangleIntersectionAttributes attr)
         // model here so entity dielectrics transmit instead of becoming opaque shadow blockers.
         bool shadowRay = (RayFlags() & RAY_FLAG_SKIP_CLOSEST_HIT_SHADER) != 0u;
         if (instanceKind == ENTITY_BIT && shadowRay && materialHeader.model == MATERIAL_GLASS) {
+            if (shadowVis.a < -1.5) return;
             float3 tint = lerp(float3(1.0, 1.0, 1.0),
                     srgbToLinear(texel.rgb) * epr.tint.rgb, texel.a);
             shadowVis.rgb *= tint * clamp(materialHeader.params.w, 0.0, 1.0);
             IgnoreHit();
         }
         if (instanceKind == ENTITY_BIT && shadowRay && materialHeader.model == MATERIAL_WATER) {
+            if (shadowVis.a < -1.5) return;
             float3 tint = srgbToLinear(texel.rgb) * epr.tint.rgb;
             shadowVis.rgb *= lerp(float3(1.0, 1.0, 1.0), tint, WATER_SHADOW_TINT)
                     * clamp(materialHeader.params.w, 0.0, 1.0);
@@ -109,6 +96,7 @@ void main(inout float4 shadowVis, in BuiltInTriangleIntersectionAttributes attr)
     // Water radiance rays use a closest-hit-only SBT record. Shadow rays run this record: tint sunlight by
     // the biome water color, then keep walking so submerged terrain is lit by colored transmission.
     if (bucket == BUCKET_WATER) {
+        if (shadowVis.a < -1.5) return;
         TerrainPrim pr = ConstPtr<TerrainPrim>(sec.primAddr)[tri];
         shadowVis.rgb *= lerp(float3(1.0, 1.0, 1.0), pr.tint.rgb, WATER_SHADOW_TINT);
         // Record the NEAREST water crossing (any-hit order is arbitrary) in the otherwise-unused alpha
@@ -128,6 +116,7 @@ void main(inout float4 shadowVis, in BuiltInTriangleIntersectionAttributes attr)
     // sprite is glass-colorant vs. see-through frame), so saturated panes darken transmitted light
     // non-linearly. Multiplying into shadowVis.rgb compounds correctly across stacked panes.
     if (bucket == BUCKET_TRANSLUCENT) {
+        if (shadowVis.a < -1.5) return;
         TerrainPrim pr = ConstPtr<TerrainPrim>(sec.primAddr)[tri];
         MaterialHeader materialHeader = ConstPtr<MaterialHeader>(pc.materialTableAddr)[pr.materialId];
         float3 avgColor = max(materialHeader.average.rgb * pr.tint.rgb,

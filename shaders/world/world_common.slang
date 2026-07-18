@@ -55,11 +55,48 @@ public struct WorldPush {
     public float4   fogShapeParams;   // x vertical tau, y noise strength, z frequency/block, w sky openness
     public float4   fogAmbientParams; // x ambient density floor ratio, y directional-scattering coupling
     public float4   cloudParams;      // rebased bottom/top height, coverage, density
-    public float4   cloudMotion;      // xyz current cloud-field world displacement relative to previous frame
+    public float4   cloudShapeParams; // cluster amount, bottom variation, detail strength, edge erosion
+    public float4   weatherParams;    // x rain 0..1, y thunder 0..1, z vanilla rain-active state, w reserved
+    public float4   cloudMotion;      // xy previous displacement in XZ, zw current density-field wind XZ
     public float4x4 curViewProj;      // forward camera-relative view-projection
     public uint     breakCount;
     public BreakEntry breaking[8];    // Java capacity and breakCount serialization are generated from this
 };
+
+// Weather is deliberately interpreted in one shared place so the sky disc, local fog, terrain NEE and
+// cloud lighting cannot drift to different storm intensities. Both channels remain continuous during
+// vanilla's interpolation, and zero weather is an exact identity for the existing clear-sky render.
+public float2 weatherAmounts(WorldPush pc) {
+    return pc.dimensionMode == DIMENSION_MODE_OVERWORLD
+            ? clamp(pc.weatherParams.xy, 0.0, 1.0)
+            : float2(0.0, 0.0);
+}
+
+public float weatherCelestialVisibility(WorldPush pc) {
+    float2 weather = weatherAmounts(pc);
+    return (1.0 - 0.88 * weather.x) * (1.0 - 0.82 * weather.y);
+}
+
+// Exact 6-bit packing of the established progressive 8x8 threshold pattern. A dynamically indexed
+// float[64] is lowered by Slang to per-invocation Function storage; selecting one packed row keeps the
+// same DLSS-friendly ordering without generating 256 bytes of local memory at every inlined call site.
+public float orderedDither8x8(uint2 pixel) {
+    uint2 packed;
+    switch (pixel.y & 7u) {
+        case 0u: packed = uint2(0xDD8F92u, 0xD1AF10u); break;
+        case 1u: packed = uint2(0x0EF326u, 0x06D3A5u); break;
+        case 2u: packed = uint2(0xED5C5Du, 0xE56CDFu); break;
+        case 3u: packed = uint2(0x2A31A9u, 0x22116Bu); break;
+        case 4u: packed = uint2(0xD5BF51u, 0xD99FD3u); break;
+        case 5u: packed = uint2(0x02C3E4u, 0x0AE367u); break;
+        case 6u: packed = uint2(0xE17C9Eu, 0xE94C1Cu); break;
+        default: packed = uint2(0x26012Au, 0x2E21E8u); break;
+    }
+    uint x = pixel.x & 7u;
+    uint word = x < 4u ? packed.x : packed.y;
+    uint rank = (word >> ((x & 3u) * 6u)) & 63u;
+    return float(rank) * (1.0 / 64.0);
+}
 
 // Radiance-ray payload (location 0). Member order and types are a cross-stage ABI.
 public struct Payload {
@@ -68,7 +105,7 @@ public struct Payload {
     public float  hitT;        // >= 0 on hit, < 0 on miss.
     public float3 motionPrev;  // per-vertex world displacement since last frame.
     public float3 f0;          // specular F0.
-    public uint   flags;       // bits 0..1 material, bit 2 celestial, bit 3 water-entering, bits 4..6 emission source.
+    public uint   flags;       // bits 0..1 material, bit2 celestial, bit3 water, bits4..6 emission, bit7 wettable.
     public uint   roughMetal;  // packHalf2x16(roughness, metalness)
     public uint   emissionSss; // packHalf2x16(emission, sss)
     public uint   iorTransmission; // packHalf2x16(IOR, transmission factor)
@@ -81,6 +118,7 @@ public static const uint PAYLOAD_SHOW_CELESTIAL = 4u;
 // (PAYLOAD_SHOW_CELESTIAL) is only meaningful on a miss and this bit only on a hit, so they never need
 // to be read together, but they get distinct bits anyway to keep the two concerns unambiguous.
 public static const uint PAYLOAD_WATER_ENTERING = 8u;
+public static const uint PAYLOAD_WETTABLE = 128u; // static terrain substrate; never dynamic entities/particles
 public static const uint PAYLOAD_EMISSION_SOURCE_SHIFT = 4u;
 public static const uint PAYLOAD_EMISSION_SOURCE_MASK = 7u;
 public static const uint EMISSION_SOURCE_NONE = 0u;

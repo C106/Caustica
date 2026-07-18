@@ -186,6 +186,14 @@ public final class RtEntityTextures {
         pending.clear();
     }
 
+    /** Rebind every allocated slot after replacing a pipeline with an ABI-compatible shader variant. */
+    public void rebindAll(RtPipeline pipeline, long sampler) {
+        for (Map.Entry<Long, Integer> entry : viewSlotCache.entrySet()) {
+            pipeline.setEntityAlbedoTexture(entry.getValue(), entry.getKey(), sampler);
+        }
+        pending.clear();
+    }
+
     /** Drop the registry (call when the world pipeline / bindless set is recreated, or textures reload). */
     public void reset() {
         reset(maxTextures());

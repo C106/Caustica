@@ -216,18 +216,22 @@ public final class RtDeviceBringup {
             RAY_QUERY_FEATURE);
 
     private enum SerBackend {
-        NONE("none", null, "world.rgen.spv"),
-        NV("NV", VK_NV_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME, "world_nv.rgen.spv"),
-        EXT("EXT", VK_EXT_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME, "world.rgen.spv");
+        NONE("none", null, "world.rgen.spv", "world_lean.rgen.spv"),
+        NV("NV", VK_NV_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME,
+                "world_nv.rgen.spv", "world_lean_nv.rgen.spv"),
+        EXT("EXT", VK_EXT_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME,
+                "world.rgen.spv", "world_lean.rgen.spv");
 
         final String label;
         final String extensionName;
-        final String worldRaygenShader;
+        final String fullWorldRaygenShader;
+        final String leanWorldRaygenShader;
 
-        SerBackend(String label, String extensionName, String worldRaygenShader) {
+        SerBackend(String label, String extensionName, String fullWorldRaygenShader, String leanWorldRaygenShader) {
             this.label = label;
             this.extensionName = extensionName;
-            this.worldRaygenShader = worldRaygenShader;
+            this.fullWorldRaygenShader = fullWorldRaygenShader;
+            this.leanWorldRaygenShader = leanWorldRaygenShader;
         }
     }
 
@@ -246,8 +250,8 @@ public final class RtDeviceBringup {
         return rtRequested;
     }
 
-    public static String worldRaygenShader() {
-        return serBackend.worldRaygenShader;
+    public static String worldRaygenShader(boolean volumetrics) {
+        return volumetrics ? serBackend.fullWorldRaygenShader : serBackend.leanWorldRaygenShader;
     }
 
     public static boolean serNvEnabled() {

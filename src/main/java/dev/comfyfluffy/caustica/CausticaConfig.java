@@ -551,6 +551,17 @@ public final class CausticaConfig {
                     clampedInt("caustica.rt.cloudHeight", "composite.cloud-height", 224, 64, 384);
             public static final IntSetting CLOUD_THICKNESS =
                     clampedInt("caustica.rt.cloudThickness", "composite.cloud-thickness", 128, 32, 256);
+            public static final FloatSetting CLOUD_SHAPE =
+                    clampedFloat("caustica.rt.cloudShape", "composite.cloud-shape", 1.0f, 0.0f, 2.0f);
+            public static final FloatSetting CLOUD_BOTTOM_VARIATION =
+                    clampedFloat("caustica.rt.cloudBottomVariation", "composite.cloud-bottom-variation",
+                            1.0f, 0.0f, 2.0f);
+            public static final FloatSetting CLOUD_DETAIL_STRENGTH =
+                    clampedFloat("caustica.rt.cloudDetailStrength", "composite.cloud-detail-strength",
+                            1.0f, 0.0f, 2.0f);
+            public static final FloatSetting CLOUD_EDGE_EROSION =
+                    clampedFloat("caustica.rt.cloudEdgeErosion", "composite.cloud-edge-erosion",
+                            1.0f, 0.0f, 2.0f);
             public static final FloatSetting SUN_ANGULAR_RADIUS =
                     radians("caustica.rt.sunAngularRadius", "composite.sun-angular-radius-deg", 0.6f);
             public static final FloatSetting MOON_ANGULAR_RADIUS =
