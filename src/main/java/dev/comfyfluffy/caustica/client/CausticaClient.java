@@ -79,16 +79,20 @@ public final class CausticaClient implements ClientModInitializer {
 
 	private static void shutdownRt() {
 		WorldRenderScaler.INSTANCE.destroy();
-		RtWorkerPool.INSTANCE.shutdown(); // no-op if never started; stops worker threads on teardown
 		RtUiOverlay.destroy(); // GUI redirect is not gated by rtInitDone; always release its TextureTarget
 		if (!rtInitDone) {
+			RtWorkerPool.INSTANCE.shutdown();
 			return;
 		}
 
 		RtContext ctx = RtContext.currentOrNull();
 		if (ctx != null) {
-			ctx.waitIdle();
+			// Let the terrain epoch cancel queued work and release every active-task token before
+			// shutdownNow(): discarded worker Runnables cannot deliver their terminal callbacks.
 			RtTerrain.shutdown(ctx);
+		}
+		RtWorkerPool.INSTANCE.shutdown();
+		if (ctx != null) {
 			RtEntities.INSTANCE.shutdown();
 		}
 		RtComposite.INSTANCE.destroy();

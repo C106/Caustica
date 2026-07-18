@@ -105,6 +105,8 @@ final class RtGlowOutlineFeature implements RtOverlayFeature {
         ibo = pool.acquireIndex(ctx, (long) mergedIdx.length * Integer.BYTES, "glow ibo");
         MemoryUtil.memFloatBuffer(vbo.mapped, mergedVerts.length).put(mergedVerts);
         MemoryUtil.memIntBuffer(ibo.mapped, mergedIdx.length).put(mergedIdx);
+        vbo.flush(0L, (long) mergedVerts.length * Float.BYTES);
+        ibo.flush(0L, (long) mergedIdx.length * Integer.BYTES);
 
         viewProj.set(RtComposite.INSTANCE.currentViewProjection());
         camOffX = RtEntities.INSTANCE.glowCamOffsetX();

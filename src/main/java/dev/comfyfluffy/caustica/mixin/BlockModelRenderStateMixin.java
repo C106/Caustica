@@ -53,9 +53,9 @@ public abstract class BlockModelRenderStateMixin implements ContainedBlockSource
         if (this.caustica$containedState == null || !(submitNodeCollector instanceof RtEntityCollector rt)) {
             return;
         }
-        // Apply whichever display transform the resolve set (normal vs special path), then re-mesh from the
-        // world model set — the same source falling blocks use, which yields real parts for blocks the
-        // display set hands off to a special renderer. Replaces the original submit during RT capture only.
+        // Apply whichever display transform the resolve set (normal vs special path), then re-emit the
+        // world model through FRAPI so custom geometry and wrapper transforms are retained even when the
+        // display set hands the block to a special renderer. Replaces only the RT-capture submission.
         Matrix4fc transform = this.transformation != null ? this.transformation : this.specialRendererTransformation;
         rt.captureBlockState(this.caustica$containedState, transform, poseStack);
         ci.cancel();

@@ -103,7 +103,7 @@ public static const uint MATERIAL_GLASS = 3u;
 
 // Entity per-triangle record (48 B). The final lane mirrors TerrainPrim's integer material metadata.
 public struct Prim {
-    public float4 normal;
+    public float4 normal; // xyz = geometric normal, w = per-primitive emission strength
     public float4 tint;
     public uint materialId;
     public uint flags;
@@ -155,14 +155,16 @@ public struct Section {
     public uint triBase[4]; // fixed bucket order: solid/cutout/translucent/water
 };
 
-// Entity geometry record: {prim, index, uv} buffer addresses (same per-prim layout as terrain) + a
-// per-vertex world-space displacement buffer for motion vectors (dispAddr == 0 ⇒ rigidDisp.xyz).
+// Entity geometry record: packed buffer addresses, motion, and per-geometry triangle bases. Entity BLAS
+// geometry order is opaque/any-hit; PrimitiveIndex restarts at zero for each geometry.
 public struct EntityGeom {
     public uint64_t primAddr;
     public uint64_t idxAddr;
     public uint64_t uvAddr;
     public uint64_t dispAddr;
     public float4 rigidDisp;
+    public uint triBase[2];
+    public uint2 reserved;
 };
 
 // TLAS instance-custom-index encoding + terrain geometry buckets (shared by rahit/rchit).

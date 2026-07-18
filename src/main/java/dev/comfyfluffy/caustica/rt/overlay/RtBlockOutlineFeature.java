@@ -142,6 +142,7 @@ final class RtBlockOutlineFeature implements RtOverlayFeature {
         float[] data = verts.toFloatArray();
         vbo = pool.acquireVertex(ctx, (long) data.length * Float.BYTES, "block outline vbo");
         MemoryUtil.memFloatBuffer(vbo.mapped, data.length).put(data);
+        vbo.flush(0L, (long) data.length * Float.BYTES);
 
         viewProj.set(RtComposite.INSTANCE.currentViewProjection());
         boundSet = accelSet.bind(ctx, tlas);
@@ -242,7 +243,9 @@ final class RtBlockOutlineFeature implements RtOverlayFeature {
                         stack.longs(boundSet), null);
                 VK10.vkCmdBindVertexBuffers(cmd, 0, stack.longs(vbo.handle), stack.longs(0L));
                 float desiredWidthPx = LINE_WIDTH_PX_AT_REFERENCE * (height / REFERENCE_HEIGHT);
-                VK10.vkCmdSetLineWidth(cmd, Math.min(desiredWidthPx, RtDeviceBringup.maxLineWidth()));
+                float lineWidth = RtDeviceBringup.wideLinesEnabled()
+                        ? Math.min(desiredWidthPx, RtDeviceBringup.maxLineWidth()) : 1.0f;
+                VK10.vkCmdSetLineWidth(cmd, lineWidth);
                 ByteBuffer push = stack.malloc(PUSH_BYTES);
                 viewProj.get(0, push);
                 RtEntities entities = RtEntities.INSTANCE;

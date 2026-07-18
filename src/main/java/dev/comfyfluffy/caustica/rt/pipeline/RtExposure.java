@@ -143,6 +143,7 @@ public final class RtExposure {
         }
         MemoryUtil.memPutFloat(state.mapped, manualExposureScale());
         MemoryUtil.memPutInt(state.mapped + 4, 0);
+        state.flush(0L, 2L * Integer.BYTES);
         lastFrameNanos = 0L;
     }
 

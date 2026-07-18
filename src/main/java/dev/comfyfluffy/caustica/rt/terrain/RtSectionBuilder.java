@@ -13,9 +13,9 @@ import org.lwjgl.vulkan.VkCommandBuffer;
 import org.lwjgl.vulkan.VkDependencyInfo;
 import org.lwjgl.vulkan.VkMemoryBarrier2;
 
-import static org.lwjgl.vulkan.KHRSynchronization2.VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR;
 import static org.lwjgl.vulkan.KHRSynchronization2.VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
 import static org.lwjgl.vulkan.KHRSynchronization2.vkCmdPipelineBarrier2KHR;
+import static org.lwjgl.vulkan.VK13.VK_ACCESS_2_SHADER_READ_BIT;
 import static org.lwjgl.vulkan.VK13.VK_ACCESS_2_TRANSFER_WRITE_BIT;
 import static org.lwjgl.vulkan.VK13.VK_PIPELINE_STAGE_2_TRANSFER_BIT;
 
@@ -105,7 +105,9 @@ final class RtSectionBuilder {
                     .srcStageMask(VK_PIPELINE_STAGE_2_TRANSFER_BIT)
                     .srcAccessMask(VK_ACCESS_2_TRANSFER_WRITE_BIT)
                     .dstStageMask(VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR)
-                    .dstAccessMask(VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR);
+                    // Vertex/index build inputs are shader reads at the AS-build stage. The
+                    // ACCELERATION_STRUCTURE_READ access class is for reading AS objects themselves.
+                    .dstAccessMask(VK_ACCESS_2_SHADER_READ_BIT);
             VkDependencyInfo dependency = VkDependencyInfo.calloc(stack).sType$Default().pMemoryBarriers(barrier);
             vkCmdPipelineBarrier2KHR(cmd, dependency);
         }

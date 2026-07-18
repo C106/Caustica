@@ -8,9 +8,11 @@ import dev.comfyfluffy.caustica.mixin.RenderSetupAccessor;
 import dev.comfyfluffy.caustica.mixin.RenderTypeAccessor;
 import dev.comfyfluffy.caustica.rt.material.RtMaterialRegistry;
 import dev.comfyfluffy.caustica.rt.pipeline.RtPipeline;
+import com.mojang.blaze3d.platform.NativeImage;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.rendertype.PreparedRenderType;
 import net.minecraft.client.renderer.rendertype.RenderType;
+import net.minecraft.client.renderer.texture.DynamicTexture;
 import net.minecraft.client.renderer.texture.TextureAtlas;
 import net.minecraft.resources.Identifier;
 
@@ -72,6 +74,9 @@ public final class RtEntityTextures {
     private int nextSlot = 1;
     private boolean loggedFailure;
     private boolean loggedMaterialFailure;
+    // 1x1 solid-white DynamicTexture for untextured geometry (leash/line ribbons); see whiteSlot().
+    private static final Identifier WHITE_LOCATION = Identifier.fromNamespaceAndPath("caustica", "rt_white");
+    private boolean whiteRegistered;
 
     // Cached RenderSetup.TextureBinding#location() (the class is package-private, the method public).
     private Method locationMethod;
@@ -126,6 +131,25 @@ public final class RtEntityTextures {
         int slot = slotForView(view);
         atlasSlotCache.put(atlasLocation, slot);
         return slot;
+    }
+
+    /**
+     * Bindless slot of a solid-white 1x1 texture, for untextured geometry (leashes, custom line
+     * ribbons) whose colour comes entirely from the per-prim tint. Slot 0 (the block atlas) is NOT a
+     * substitute: the hit shader multiplies albedo by the sampled texel, and UV (0,0) lands on
+     * whatever sprite is stitched at the atlas origin. The texture is registered with the
+     * TextureManager on first use and then resolved/cached by the ordinary atlas-slot path, so it
+     * survives {@link #reset} like any other atlas. Falls back to slot 0 if registration fails.
+     */
+    public int whiteSlot() {
+        if (!whiteRegistered) {
+            whiteRegistered = true; // one attempt; on failure slotForAtlas caches the slot-0 fallback
+            NativeImage image = new NativeImage(1, 1, false);
+            image.setPixel(0, 0, 0xFFFFFFFF);
+            Minecraft.getInstance().getTextureManager()
+                    .register(WHITE_LOCATION, new DynamicTexture(() -> "caustica RT white", image));
+        }
+        return slotForAtlas(WHITE_LOCATION);
     }
 
     /**

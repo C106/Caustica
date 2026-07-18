@@ -4,6 +4,7 @@ import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vulkan.VulkanDevice;
 import dev.comfyfluffy.caustica.CausticaConfig;
 import dev.comfyfluffy.caustica.CausticaMod;
+import dev.comfyfluffy.caustica.rt.RtContext;
 import dev.comfyfluffy.caustica.rt.accel.RtImage;
 import dev.comfyfluffy.caustica.mixin.GpuDeviceAccessor;
 import dev.comfyfluffy.caustica.ngx.NgxLibrary;
@@ -256,7 +257,12 @@ public final class RtDlssRr {
 
     private void releaseFeature(VulkanDevice device) {
         if (!isNull(feature)) {
-            VK10.vkDeviceWaitIdle(device.vkDevice());
+            RtContext ctx = RtContext.currentOrNull();
+            if (ctx != null && ctx.device() == device) {
+                ctx.waitIdle();
+            } else {
+                VK10.vkDeviceWaitIdle(device.vkDevice());
+            }
             lib.release(feature);
             feature = MemorySegment.NULL;
         }

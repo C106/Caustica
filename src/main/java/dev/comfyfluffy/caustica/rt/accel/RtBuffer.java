@@ -54,6 +54,10 @@ public final class RtBuffer {
         if (!hostVisible) {
             throw new IllegalStateException("Cannot flush a non-host-visible buffer");
         }
+        if (offset < 0L || length < 0L || offset > size || length > size - offset) {
+            throw new IndexOutOfBoundsException("Flush range " + offset + ".." + (offset + length)
+                    + " exceeds buffer size " + size);
+        }
         Vma.vmaFlushAllocation(vma, allocation, offset, length);
     }
 }

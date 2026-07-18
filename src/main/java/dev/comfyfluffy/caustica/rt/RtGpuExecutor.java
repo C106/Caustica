@@ -21,9 +21,11 @@ import java.nio.LongBuffer;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiConsumer;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 
 import static org.lwjgl.vulkan.KHRSynchronization2.VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
@@ -31,14 +33,14 @@ import static org.lwjgl.vulkan.KHRSynchronization2.VK_PIPELINE_STAGE_2_ALL_COMMA
 import static org.lwjgl.vulkan.KHRSynchronization2.VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
 
 /**
- * Single-owner asynchronous GPU submission lane on vanilla's otherwise-unused distinct compute queue.
- * Devices where that queue aliases graphics are rejected: cross-thread use of one VkQueue is invalid,
- * and render-thread submission would violate this executor's fully asynchronous contract.
+ * Single-owner asynchronous GPU submission lane on a queue reserved by Caustica at device creation.
+ * Minecraft never fetches or submits to this queue index, so the executor can satisfy Vulkan's external
+ * queue-synchronization rule without coordinating a host mutex with Blaze3D.
  */
 public final class RtGpuExecutor {
     private static final int MAX_BUILD_BATCH = 32;
-    private static final Job STOP = new Job(null, null, null, null);
-    private static final Job WAKE = new Job(null, null, null, null);
+    private static final Job STOP = new Job(null, null, null, null, null);
+    private static final Job WAKE = new Job(null, null, null, null, null);
     private static final long TERRAIN_READ_STAGES =
             VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR
                     | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
@@ -60,10 +62,7 @@ public final class RtGpuExecutor {
 
     RtGpuExecutor(RtContext ctx) {
         this.ctx = ctx;
-        this.computeQueue = ctx.device().computeQueue();
-        if (computeQueue.vkQueue().address() == ctx.device().graphicsQueue().vkQueue().address()) {
-            throw new IllegalStateException("Caustica RT terrain requires a compute queue distinct from graphics");
-        }
+        this.computeQueue = ctx.computeQueue();
         this.buildTimeline = createTimeline("RT terrain build timeline");
         this.graphicsTimeline = createTimeline("RT graphics-use timeline");
         createCommandPool();
@@ -76,15 +75,24 @@ public final class RtGpuExecutor {
      * Enqueue GPU recording. On success, {@code afterSuccess} runs after timeline completion; then
      * {@code finished} receives exactly one terminal success/failure notification on this thread.
      */
-    public synchronized Build submit(Consumer<VkCommandBuffer> record, Runnable afterSuccess,
-                                     BiConsumer<Build, Throwable> finished) {
+    public Build submit(Consumer<VkCommandBuffer> record, Runnable afterSuccess,
+                        BiConsumer<Build, Throwable> finished) {
+        return submit(() -> false, record, afterSuccess, finished);
+    }
+
+    /**
+     * Enqueue cancellable GPU recording. Cancellation is sampled immediately before a queued job enters
+     * a command-buffer batch; already-recording or submitted work still completes normally.
+     */
+    public synchronized Build submit(BooleanSupplier cancelled, Consumer<VkCommandBuffer> record,
+                                     Runnable afterSuccess, BiConsumer<Build, Throwable> finished) {
         checkExecutorFailure();
         if (closed) {
             throw new IllegalStateException("RT GPU executor is closed");
         }
         long value = nextBuildValue.incrementAndGet();
         Build build = new Build(value);
-        jobs.add(new Job(record, afterSuccess, finished, build));
+        jobs.add(new Job(cancelled, record, afterSuccess, finished, build));
         return build;
     }
 
@@ -145,17 +153,6 @@ public final class RtGpuExecutor {
         }
     }
 
-    /** Wait only for terrain's latest graphics use, then execute every now-safe retirement. */
-    public void waitForLatestGraphicsAndFlush() {
-        checkExecutorFailure();
-        long target = latestGraphicsUseValue();
-        if (target != 0L) {
-            waitTimeline(graphicsTimeline, target);
-        }
-        processDestroyJobs();
-        checkExecutorFailure();
-    }
-
     /** Caller has made the device idle; all queued destruction is now unconditionally safe. */
     public void flushDestroysAfterDeviceIdle() {
         Throwable failure = executorFailure;
@@ -193,7 +190,7 @@ public final class RtGpuExecutor {
         // Stop and join first: waiting idle before the executor stops leaves a race where it can
         // submit immediately after vkDeviceWaitIdle returns. The idle wait also makes graphics-side
         // timeline semaphore use complete before those semaphores are destroyed below.
-        RtContext.check(VK10.vkDeviceWaitIdle(ctx.vk()), "vkDeviceWaitIdle(RT GPU executor shutdown)");
+        ctx.waitIdle();
         Throwable failure = null;
         try {
             flushDestroysAfterDeviceIdle();
@@ -246,14 +243,25 @@ public final class RtGpuExecutor {
                 }
                 batch.add(next);
             }
-            try {
-                execute(batch);
-                for (Job job : batch) {
-                    finishJob(job, null);
+
+            ArrayList<Job> executable = new ArrayList<>(batch.size());
+            for (Job job : batch) {
+                if (job.cancelled.getAsBoolean()) {
+                    finishJob(job, new CancellationException("RT GPU job epoch is stale"));
+                } else {
+                    executable.add(job);
                 }
-            } catch (Throwable t) {
-                for (Job job : batch) {
-                    finishJob(job, t);
+            }
+            if (!executable.isEmpty()) {
+                try {
+                    execute(executable);
+                    for (Job job : executable) {
+                        finishJob(job, null);
+                    }
+                } catch (Throwable t) {
+                    for (Job job : executable) {
+                        finishJob(job, t);
+                    }
                 }
             }
             if (!processDestroyJobsSafely()) {
@@ -371,9 +379,11 @@ public final class RtGpuExecutor {
                     .stageMask(VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR);
             VkSubmitInfo2.Buffer submit = VkSubmitInfo2.calloc(1, stack).sType$Default()
                     .pCommandBufferInfos(command).pSignalSemaphoreInfos(signal);
-            VulkanDiagnostics.noteQueueSubmission(computeQueue.vkQueue(), "async-compute terrain builds");
-            RtContext.check(org.lwjgl.vulkan.KHRSynchronization2.vkQueueSubmit2KHR(
-                    computeQueue.vkQueue(), submit, 0L), "vkQueueSubmit2KHR(RT GPU executor)");
+            VulkanDiagnostics.noteQueueSubmission(computeQueue.vkQueue(), "Caustica compute queue");
+            synchronized (ctx.deviceQueueHostLock()) {
+                RtContext.check(org.lwjgl.vulkan.KHRSynchronization2.vkQueueSubmit2KHR(
+                        computeQueue.vkQueue(), submit, 0L), "vkQueueSubmit2KHR(RT GPU executor)");
+            }
             submitted = true;
             VulkanDiagnostics.setInFlight("async-compute",
                     "submitted builds=" + firstValue + ".." + signalValue + " batch=" + batch.size());
@@ -450,7 +460,7 @@ public final class RtGpuExecutor {
         }
     }
 
-    private record Job(Consumer<VkCommandBuffer> record, Runnable afterSuccess,
+    private record Job(BooleanSupplier cancelled, Consumer<VkCommandBuffer> record, Runnable afterSuccess,
                        BiConsumer<Build, Throwable> finished, Build build) {
     }
 

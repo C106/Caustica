@@ -136,6 +136,7 @@ final class RtNameTagFeature implements RtOverlayFeature {
                 buf.putFloat(posUv[o + 3]).putFloat(posUv[o + 4]);
                 buf.putInt(ARGB.toABGR(b.colors.getInt(v))); // R8G8B8A8_UNORM memory order = ABGR-packed int
             }
+            vbo.flush(0L, (long) vertexCount * VERTEX_STRIDE);
             drawPages.add(new DrawPage(e.getKey(), vbo, vertexCount));
         }
         if (drawPages.isEmpty()) {

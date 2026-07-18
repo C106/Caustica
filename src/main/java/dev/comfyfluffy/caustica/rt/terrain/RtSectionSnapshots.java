@@ -5,6 +5,7 @@ import it.unimi.dsi.fastutil.longs.Long2ObjectLinkedOpenHashMap;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.block.BlockAndTintGetter;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Holder;
 import net.minecraft.core.SectionPos;
 import net.minecraft.world.level.CardinalLighting;
 import net.minecraft.world.level.ColorResolver;
@@ -18,6 +19,7 @@ import net.minecraft.world.level.chunk.PalettedContainer;
 import net.minecraft.world.level.levelgen.DebugLevelSource;
 import net.minecraft.world.level.lighting.LevelLightEngine;
 import net.minecraft.world.level.material.FluidState;
+import net.minecraft.world.level.biome.Biome;
 
 /**
  * Persistent, render-thread-only cache of per-section palette snapshots for RT tessellation, replacing
@@ -175,6 +177,16 @@ final class RtSectionSnapshots {
         @Override
         public int getBlockTint(BlockPos pos, ColorResolver resolver) {
             return level.getBlockTint(pos, resolver);
+        }
+
+        @Override
+        public boolean hasBiomes() {
+            return level.hasBiomes();
+        }
+
+        @Override
+        public Holder<Biome> getBiomeFabric(BlockPos pos) {
+            return level.getBiomeFabric(pos);
         }
 
         @Override
